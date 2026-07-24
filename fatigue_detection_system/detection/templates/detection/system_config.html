@@ -43,13 +43,27 @@
                                     <div class="form-text">用于判断打哈欠的阈值，建议值：0.6</div>
                                 </div>
                             </div>
-                            
+                        </div>
+
+                        <div class="mb-4">
+                            <h6 class="border-bottom pb-2">检测频率</h6>
+                            <p class="small text-muted">请先在实时页「性能监视」查看各步骤平均耗时，再按「建议间隔 ≈ 平均 × 1.5」调整。EAR 需分辨 100–250ms 眨眼时，设定不宜大于约 100–150ms。</p>
+
                             <div class="row mb-3">
-                                <label class="col-md-4 col-form-label">检测间隔（毫秒）</label>
+                                <label class="col-md-4 col-form-label">疲劳 EAR 采样间隔（毫秒）</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="10" min="50" max="500" name="config_ear_sample_interval_ms"
+                                           class="form-control" value="{{ configs.ear_sample_interval_ms|default:'100' }}">
+                                    <div class="form-text">仅工业相机（MVS）独立线程采样；浏览器源与行为检测同周期</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">行为检测间隔（毫秒）</label>
                                 <div class="col-md-8">
                                     <input type="number" step="50" min="50" max="2000" name="config_detection_interval" 
                                            class="form-control" value="{{ configs.detection_interval|default:'500' }}">
-                                    <div class="form-text">YOLO/落库周期。工业相机 EAR 另有独立采样；浏览器源建议 ≤150ms 以分辨眨眼</div>
+                                    <div class="form-text">YOLO 行为检测 + 落库周期；浏览器源即整帧上传周期</div>
                                 </div>
                             </div>
                         </div>
@@ -92,15 +106,6 @@
                                     <div class="form-text">窗口内闭眼累计占比达到该值触发正式疲劳警报（常用 15–30%）</div>
                                 </div>
                             </div>
-
-                            <div class="row mb-3">
-                                <label class="col-md-4 col-form-label">EAR 采样间隔（毫秒）</label>
-                                <div class="col-md-8">
-                                    <input type="number" step="10" min="50" max="500" name="config_ear_sample_interval_ms"
-                                           class="form-control" value="{{ configs.ear_sample_interval_ms|default:'100' }}">
-                                    <div class="form-text">仅工业相机（MVS）生效：独立于 YOLO 周期的 EAR 采样，建议 100ms</div>
-                                </div>
-                            </div>
                         </div>
 
                         <div class="mb-4">
@@ -113,10 +118,10 @@
                                         <input type="hidden" name="config_mono_camera_mode" value="false">
                                         <input class="form-check-input" type="checkbox" name="config_mono_camera_mode"
                                                value="true" id="monoCameraMode"
-                                               {% if configs.mono_camera_mode != 'false' %}checked{% endif %}>
+                                               {% if configs.mono_camera_mode == 'true' %}checked{% endif %}>
                                         <label class="form-check-label" for="monoCameraMode">YOLO 前对灰度图做 CLAHE 增强</label>
                                     </div>
-                                    <div class="form-text">工业黑白相机建议开启；真彩色摄像头可关闭</div>
+                                    <div class="form-text">默认关闭。行为漏检（只剩人脸框）时请保持关闭；仅在确认黑白成像对比度不足时再开启</div>
                                 </div>
                             </div>
 

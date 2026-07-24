@@ -226,6 +226,33 @@
                     </div>
                 </div>
             </div>
+
+            <div class="stats-card mt-4">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-tachometer-alt me-2"></i>性能监视</h5>
+                </div>
+                <div class="card-body">
+                    <p class="small text-muted mb-2" id="perf-config-hint">
+                        当前设定：EAR {{ ear_sample_interval_ms|default:100 }} ms /
+                        行为 {{ detection_interval|default:500 }} ms。建议间隔 ≈ 平均耗时 × 1.5
+                    </p>
+                    <div class="table-responsive">
+                        <table class="table table-sm mb-0" id="perf-timing-table">
+                            <thead>
+                                <tr>
+                                    <th>步骤</th>
+                                    <th>最近(ms)</th>
+                                    <th>平均(ms)</th>
+                                    <th>建议间隔</th>
+                                </tr>
+                            </thead>
+                            <tbody id="perf-timing-body">
+                                <tr><td colspan="4" class="text-muted text-center">等待检测…</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
         </div>
         
         <!-- 检测结果区域 -->
@@ -299,7 +326,8 @@
 <script>
     // 会话ID
     const sessionId = {{ session.id }};
-    const detectionIntervalMs = {{ detection_interval|default:1000 }};
+    const detectionIntervalMs = {{ detection_interval|default:500 }};
+    const earSampleIntervalMs = {{ ear_sample_interval_ms|default:100 }};
     
     // DOM元素
     const videoElement = document.getElementById('video-stream');
@@ -314,6 +342,7 @@
     const alertSound = document.getElementById('alert-sound');
     const warningModal = new bootstrap.Modal(document.getElementById('warning-modal'));
     const detectionAlert = document.getElementById('detection-alert');
+    const perfTimingBody = document.getElementById('perf-timing-body');
     
     // 统计元素
     const faceCountElement = document.getElementById('face-count');
@@ -331,6 +360,51 @@
         fatigueValues: [],
         behaviorValues: []
     };
+
+    const PERF_ROWS = [
+        { key: 'ear', label: 'EAR 采样', cfg: earSampleIntervalMs },
+        { key: 'mono', label: 'Mono CLAHE', cfg: null },
+        { key: 'yolo', label: 'YOLO 行为', cfg: detectionIntervalMs },
+        { key: 'dlib', label: 'dlib 关键点', cfg: null },
+        { key: 'draw', label: '绘制标注', cfg: null },
+        { key: 'save', label: '存图写库', cfg: null },
+        { key: 'total', label: '全流程', cfg: detectionIntervalMs },
+        { key: 'detect_loop', label: '检测环', cfg: detectionIntervalMs },
+    ];
+
+    let clientTimingAvg = {};
+
+    function suggestIntervalMs(avgMs) {
+        if (avgMs == null || isNaN(avgMs) || avgMs <= 0) return '—';
+        return Math.ceil((avgMs * 1.5) / 10) * 10;
+    }
+
+    function updateTimingPanel(timing) {
+        if (!perfTimingBody || !timing) return;
+        let html = '';
+        PERF_ROWS.forEach(row => {
+            const last = timing[row.key + '_ms'];
+            let avg = timing[row.key + '_avg_ms'];
+            if (avg == null && last != null) {
+                const prev = clientTimingAvg[row.key];
+                clientTimingAvg[row.key] = prev == null ? Number(last) : (0.2 * Number(last) + 0.8 * prev);
+                avg = clientTimingAvg[row.key];
+            } else if (avg != null) {
+                clientTimingAvg[row.key] = Number(avg);
+            }
+            const suggest = suggestIntervalMs(avg != null ? avg : last);
+            let warn = false;
+            if (row.cfg != null && avg != null && avg > row.cfg * 0.8) warn = true;
+            const cls = warn ? 'table-warning' : '';
+            html += `<tr class="${cls}">
+                <td>${row.label}${warn ? ' <span class="badge bg-warning text-dark">可能积压</span>' : ''}</td>
+                <td>${last != null ? Number(last).toFixed(1) : '—'}</td>
+                <td>${avg != null ? Number(avg).toFixed(1) : '—'}</td>
+                <td>${suggest === '—' ? '—' : ('≥ ' + suggest + ' ms')}</td>
+            </tr>`;
+        });
+        perfTimingBody.innerHTML = html || '<tr><td colspan="4" class="text-muted text-center">暂无数据</td></tr>';
+    }
     
     // 图表
     let statsChart = null;
@@ -843,44 +917,48 @@
     
     // 更新检测结果
     function updateDetectionResults(result) {
-        console.log('检测结果:', result);  // 添加调试输出
-        
-        // 更新统计数据
-        if (result.face_detected) {
-            statsData.faceCount++;
+        console.log('检测结果:', result);
+
+        if (result.timing) {
+            updateTimingPanel(result.timing);
         }
-        if (result.fatigue_level >= 2) {
-            statsData.fatigueCount++;
+
+        const soft = !!result._softUpdate;
+
+        // 更新统计数据（软刷新不累计计数，避免 EAR 高频 poll 虚增）
+        if (!soft) {
+            if (result.face_detected) {
+                statsData.faceCount++;
+            }
+            if (result.fatigue_level >= 2) {
+                statsData.fatigueCount++;
+            }
+            if (result.yawn_detected) {
+                statsData.yawnCount++;
+            }
+            if (result.smoking_detected || result.phone_detected || result.drinking_detected) {
+                statsData.behaviorCount++;
+            }
+
+            const now = new Date();
+            const timeLabel = now.getHours() + ':' + now.getMinutes() + ':' + now.getSeconds();
+            statsData.timeLabels.push(timeLabel);
+            statsData.fatigueValues.push(result.fatigue_level);
+
+            const behaviorValue = (result.smoking_detected ? 1 : 0) +
+                                 (result.phone_detected ? 1 : 0) +
+                                 (result.drinking_detected ? 1 : 0) +
+                                 (result.yawn_detected ? 1 : 0);
+            statsData.behaviorValues.push(behaviorValue);
+
+            if (statsData.timeLabels.length > 10) {
+                statsData.timeLabels.shift();
+                statsData.fatigueValues.shift();
+                statsData.behaviorValues.shift();
+            }
+
+            updateStatsDisplay();
         }
-        if (result.yawn_detected) {
-            statsData.yawnCount++;
-        }
-        if (result.smoking_detected || result.phone_detected || result.drinking_detected) {
-            statsData.behaviorCount++;
-        }
-        
-        // 添加图表数据点
-        const now = new Date();
-        const timeLabel = now.getHours() + ':' + now.getMinutes() + ':' + now.getSeconds();
-        statsData.timeLabels.push(timeLabel);
-        statsData.fatigueValues.push(result.fatigue_level);
-        
-        // 不良行为数据点
-        const behaviorValue = (result.smoking_detected ? 1 : 0) + 
-                             (result.phone_detected ? 1 : 0) + 
-                             (result.drinking_detected ? 1 : 0) +
-                             (result.yawn_detected ? 1 : 0);
-        statsData.behaviorValues.push(behaviorValue);
-        
-        // 限制数据点数量
-        if (statsData.timeLabels.length > 10) {
-            statsData.timeLabels.shift();
-            statsData.fatigueValues.shift();
-            statsData.behaviorValues.shift();
-        }
-        
-        // 更新统计显示
-        updateStatsDisplay();
         
         // 更新疲劳等级
         const level = result.fatigue_level;
@@ -1001,8 +1079,7 @@
             smokingText = result.smoking_detected ? '是' : '否';
             smokingWarning = result.smoking_detected;
             
-            // 如果检测到抽烟且启用了声音提醒
-            if (result.smoking_detected && alertSound.checked) {
+            if (!soft && result.smoking_detected && alertSound.checked) {
                 playAlertSound('smoking');
             }
         }
@@ -1022,8 +1099,7 @@
             phoneText = result.phone_detected ? '是' : '否';
             phoneWarning = result.phone_detected;
             
-            // 如果检测到打电话且启用了声音提醒
-            if (result.phone_detected && alertSound.checked) {
+            if (!soft && result.phone_detected && alertSound.checked) {
                 playAlertSound('phone');
             }
         }
