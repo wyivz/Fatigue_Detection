@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
 from django.db import connection
 
 from .camera import HikCamera
+
+_EMA_ALPHA = 0.2
+
+
+def _ema(prev: Optional[float], value: float, alpha: float = _EMA_ALPHA) -> float:
+    if prev is None:
+        return float(value)
+    return float(alpha * value + (1.0 - alpha) * prev)
 
 
 class MvsGrabber:
@@ -30,8 +38,10 @@ class MvsGrabber:
         self._preview_max_width = 960
         self._preview_jpeg_quality = 70
         self._latest_bgr: Optional[np.ndarray] = None
+        self._latest_face_bbox: Optional[List[int]] = None
         self._frame_seq = 0
         self._detect_busy = False
+        self._timing_avg: Dict[str, float] = {}
         self.latest_jpeg: Optional[bytes] = None
         self.latest_meta: Dict[str, Any] = {}
         self.error: Optional[str] = None
@@ -58,9 +68,11 @@ class MvsGrabber:
             self._stop.clear()
             self.error = None
             self.latest_jpeg = None
-            self.latest_meta = {}
+            self.latest_meta = {"timing": {}}
             self._latest_bgr = None
+            self._latest_face_bbox = None
             self._frame_seq = 0
+            self._timing_avg = {}
             self._session_id = session_id
             self._user_id = user_id
             self._interval_ms = max(50, int(interval_ms or 500))
@@ -119,6 +131,7 @@ class MvsGrabber:
             self._ear_thread = None
             self._detect_thread = None
             self._detect_busy = False
+            self._latest_face_bbox = None
             session_id = self._session_id
             self._session_id = None
         if session_id is not None:
@@ -145,6 +158,27 @@ class MvsGrabber:
     def get_jpeg(self) -> Optional[bytes]:
         with self._lock:
             return self.latest_jpeg
+
+    def _merge_timing(self, patch: Dict[str, float]) -> Dict[str, Any]:
+        """Update EMA averages and return a timing dict for meta."""
+        out: Dict[str, Any] = {}
+        for key, value in patch.items():
+            if value is None:
+                continue
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                continue
+            out[key] = round(v, 1)
+            avg_key = key if key.endswith("_avg_ms") else key.replace("_ms", "_avg_ms")
+            if key.endswith("_avg_ms"):
+                continue
+            prev = self._timing_avg.get(avg_key)
+            self._timing_avg[avg_key] = _ema(prev, v)
+            out[avg_key] = round(self._timing_avg[avg_key], 1)
+        for avg_key, avg_val in self._timing_avg.items():
+            out.setdefault(avg_key, round(avg_val, 1))
+        return out
 
     def _complete_session(self, session_id: int) -> None:
         try:
@@ -184,7 +218,6 @@ class MvsGrabber:
         return buf.tobytes()
 
     def _grab_loop(self) -> None:
-        """Pull frames continuously for smooth MJPEG preview."""
         while not self._stop.is_set():
             try:
                 frame = self._camera.get_bgr_frame(timeout_ms=500)
@@ -202,18 +235,21 @@ class MvsGrabber:
                     break
 
     def _ear_loop(self) -> None:
-        """High-rate EAR sampling for blink / microsleep / PERCLOS (no DB writes)."""
+        """High-rate EAR sampling using shared YOLO face bbox when available."""
         from detection.views import dlib_detector
         from detection.utils.fatigue_tracker import fatigue_tracker
 
         last_seq = -1
         while not self._stop.is_set():
-            loop_start = time.time()
+            loop_start = time.perf_counter()
             with self._lock:
                 frame = None if self._latest_bgr is None else self._latest_bgr.copy()
                 seq = self._frame_seq
                 session_id = self._session_id
                 ear_ms = self._ear_interval_ms
+                face_bbox = (
+                    None if self._latest_face_bbox is None else list(self._latest_face_bbox)
+                )
 
             if frame is None or session_id is None or seq == last_seq:
                 if self._stop.wait(0.02):
@@ -224,17 +260,49 @@ class MvsGrabber:
             try:
                 if dlib_detector is not None:
                     sample = self._resize_for_preview(frame)
-                    dlib_results = dlib_detector.detect_fatigue(sample, face_bbox=None)
+                    # Scale face_bbox if full-res frame was resized for sample
+                    scaled_bbox = face_bbox
+                    if face_bbox is not None and sample is not frame:
+                        fh, fw = frame.shape[:2]
+                        sh, sw = sample.shape[:2]
+                        if fw > 0 and fh > 0 and (sw != fw or sh != fh):
+                            sx = sw / float(fw)
+                            sy = sh / float(fh)
+                            scaled_bbox = [
+                                int(face_bbox[0] * sx),
+                                int(face_bbox[1] * sy),
+                                int(face_bbox[2] * sx),
+                                int(face_bbox[3] * sy),
+                            ]
+
+                    t_ear = time.perf_counter()
+                    dlib_results = dlib_detector.detect_fatigue(
+                        sample, face_bbox=scaled_bbox
+                    )
+                    ear_cost = (time.perf_counter() - t_ear) * 1000.0
+
+                    faces_n = int(dlib_results.get("faces_detected") or 0)
+                    if faces_n <= 0 and scaled_bbox is not None:
+                        faces_n = 1 if dlib_results.get("landmarks") is not None else 0
+
                     snap = fatigue_tracker.update(
                         session_id,
                         ear=dlib_results.get("eye_aspect_ratio"),
                         yawn_detected=None,
-                        faces_detected=int(dlib_results.get("faces_detected") or 0),
+                        faces_detected=faces_n,
                         landmarks=dlib_results.get("landmarks"),
                     )
                     with self._lock:
-                        # Lightweight live metrics between full detections
                         meta = dict(self.latest_meta)
+                        timing = dict(meta.get("timing") or {})
+                        timing.update(
+                            self._merge_timing(
+                                {
+                                    "ear_ms": ear_cost,
+                                }
+                            )
+                        )
+                        meta["timing"] = timing
                         meta.update(
                             {
                                 "eye_aspect_ratio": snap.eye_aspect_ratio,
@@ -243,6 +311,7 @@ class MvsGrabber:
                                 "is_microsleep": snap.is_microsleep,
                                 "fatigue_level": snap.fatigue_level,
                                 "yawn_detected": snap.yawn_detected,
+                                "has_landmarks": dlib_results.get("landmarks") is not None,
                             }
                         )
                         self.latest_meta = meta
@@ -255,19 +324,19 @@ class MvsGrabber:
                 except Exception:  # noqa: BLE001
                     pass
 
-            elapsed_ms = (time.time() - loop_start) * 1000.0
+            elapsed_ms = (time.perf_counter() - loop_start) * 1000.0
             sleep_ms = max(0.0, ear_ms - elapsed_ms)
             if sleep_ms > 0 and self._stop.wait(sleep_ms / 1000.0):
                 break
 
     def _detect_loop(self) -> None:
-        """Run YOLO/dlib at detection_interval only; does not drive preview FPS."""
+        """Run YOLO/dlib at detection_interval; publish face_bbox for EAR loop."""
         from detection.models import DetectionSession
         from detection.views import process_image
 
         last_seq = -1
         while not self._stop.is_set():
-            loop_start = time.time()
+            loop_start = time.perf_counter()
             if self._detect_busy:
                 if self._stop.wait(0.02):
                     break
@@ -292,9 +361,13 @@ class MvsGrabber:
                         self.error = "Session not found"
                     break
                 det_frame = self._resize_for_preview(frame)
-                result = process_image(
-                    det_frame, session, True, True
-                )
+                result = process_image(det_frame, session, True, True)
+                detect_loop_ms = (time.perf_counter() - loop_start) * 1000.0
+
+                face_bbox = result.get("face_bbox")
+                timing_src = dict(result.get("timing") or {})
+                timing_src["detect_loop_ms"] = detect_loop_ms
+
                 meta = {
                     "face_detected": result.get("face_detected"),
                     "smoking_detected": result.get("smoking_detected"),
@@ -306,9 +379,32 @@ class MvsGrabber:
                     "perclos": result.get("perclos"),
                     "eye_closed_ms": result.get("eye_closed_ms"),
                     "is_microsleep": result.get("is_microsleep"),
+                    "has_landmarks": result.get("has_landmarks"),
                     "detection_id": result.get("detection_id"),
                 }
                 with self._lock:
+                    if face_bbox is not None:
+                        # Map bbox from resized det_frame coords to full-res frame
+                        fh, fw = frame.shape[:2]
+                        dh, dw = det_frame.shape[:2]
+                        if dw > 0 and dh > 0 and (dw != fw or dh != fh):
+                            sx = fw / float(dw)
+                            sy = fh / float(dh)
+                            self._latest_face_bbox = [
+                                int(face_bbox[0] * sx),
+                                int(face_bbox[1] * sy),
+                                int(face_bbox[2] * sx),
+                                int(face_bbox[3] * sy),
+                            ]
+                        else:
+                            self._latest_face_bbox = [int(v) for v in face_bbox]
+                    prev_timing = dict((self.latest_meta or {}).get("timing") or {})
+                    merged = self._merge_timing(timing_src)
+                    # Keep ear averages from ear loop
+                    for k, v in prev_timing.items():
+                        if k.startswith("ear"):
+                            merged.setdefault(k, v)
+                    meta["timing"] = merged
                     self.latest_meta = meta
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
@@ -320,7 +416,7 @@ class MvsGrabber:
                 except Exception:  # noqa: BLE001
                     pass
 
-            elapsed_ms = (time.time() - loop_start) * 1000.0
+            elapsed_ms = (time.perf_counter() - loop_start) * 1000.0
             sleep_ms = max(0.0, self._interval_ms - elapsed_ms)
             if sleep_ms > 0 and self._stop.wait(sleep_ms / 1000.0):
                 break

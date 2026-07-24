@@ -40,7 +40,7 @@ def load_mono_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
             configs = {}
 
     return {
-        "enabled": _cfg_bool(configs, "mono_camera_mode", True),
+        "enabled": _cfg_bool(configs, "mono_camera_mode", False),
         "clahe_clip": _cfg_float(configs, "mono_clahe_clip", 2.0),
         "clahe_tile": max(2, _cfg_int(configs, "mono_clahe_tile", 8)),
     }
