@@ -1,0 +1,52 @@
+# Python / Django
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local env
+venv/
+.venv/
+env/
+.env
+.env.*
+
+# macOS / junk
+.DS_Store
+__MACOSX/
+
+# Django local runtime
+*.sqlite3
+fatigue_detection_system/db.sqlite3
+fatigue_detection_system/media/results/*
+!fatigue_detection_system/media/results/.gitkeep
+fatigue_detection_system/media/uploads/*
+!fatigue_detection_system/media/uploads/.gitkeep
+
+# Training / duplicate weights
+runs/
+fatigue_detection_system/weights/*.bz2
+fatigue_detection_system/weights/last.pt
+
+# Bulky installers (keep paths documented in deploy/)
+*.exe
+!deploy/*.bat
+
+# Agent temp scratch (should not exist)
+_patch_*.py
+_dump_*.py
+**/_patch_*.py
+**/_dump_*.py
+**/_fix_*.py
+**/_test_fatigue_*.py
+**/_process_image_snippet.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
