@@ -682,6 +682,17 @@
                 if (data.meta && data.meta.timing) {
                     updateTimingPanel(data.meta.timing);
                 }
+                if (data.meta && data.meta.scheduler) {
+                    const s = data.meta.scheduler;
+                    const hint = document.getElementById('perf-config-hint');
+                    if (hint) {
+                        hint.textContent =
+                            '调度: ' + (s.use_cuda ? ('CUDA ' + s.device) : 'CPU') +
+                            ' | YOLO线程 ' + s.yolo_threads + ' / EAR线程 ' + s.ear_threads +
+                            ' | EAR {{ ear_sample_interval_ms|default:100 }} ms / 行为 {{ detection_interval|default:500 }} ms' +
+                            (s.use_cuda && s.cuda_half ? ' | FP16' : '');
+                    }
+                }
                 if (data.meta) {
                     const did = data.meta.detection_id;
                     const behaviorChanged = (

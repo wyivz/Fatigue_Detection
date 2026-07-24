@@ -51,6 +51,7 @@ class YOLODetector:
 
     def load_config(self):
         from detection.models import SystemConfig
+        from detection.utils.compute_scheduler import compute_scheduler
 
         self.conf_thresh = 0.5
         self.iou_thresh = 0.5
@@ -67,6 +68,7 @@ class YOLODetector:
 
         try:
             configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+            compute_scheduler.configure(configs)
             self.conf_thresh = _cfg_float(configs, "yolo_conf_thresh", 0.5)
             self.iou_thresh = _cfg_float(configs, "yolo_iou_thresh", 0.5)
             if "yolo_imgsz" in configs and str(configs.get("yolo_imgsz", "")).strip():
@@ -98,6 +100,12 @@ class YOLODetector:
             self._apply_runtime_params()
 
     def _apply_runtime_params(self) -> None:
+        from detection.utils.compute_scheduler import compute_scheduler
+
+        plan = compute_scheduler.ensure_configured()
+        # Prefer scheduler device (auto-falls back to cpu if CUDA unavailable)
+        if plan.use_cuda:
+            self.device = plan.device
         try:
             self.model.conf = self.conf_thresh
             self.model.iou = self.iou_thresh
@@ -108,18 +116,22 @@ class YOLODetector:
                 self.model.to(self.device)
             except Exception as e:  # noqa: BLE001
                 print(f"无法在设备 {self.device} 上运行模型: {e}")
+                self.device = "cpu"
 
     def detect(self, image):
-        """Run inference.
+        """Run inference under YOLO thread quota; CUDA uses FP16 when enabled."""
+        from detection.utils.compute_scheduler import compute_scheduler
 
-        Keep call style close to the original (model(image, verbose=False)) so we do not
-        force a heavier letterbox/imgsz path than before. conf/iou live on the model object.
-        """
         kwargs = {"verbose": False}
-        # Only override imgsz when user explicitly configured it in DB
         if getattr(self, "_imgsz_from_config", False):
             kwargs["imgsz"] = int(self.imgsz)
-        results = self.model(image, **kwargs)
+
+        with compute_scheduler.yolo_context() as plan:
+            if plan.use_cuda:
+                kwargs["device"] = plan.device
+                if plan.cuda_half:
+                    kwargs["half"] = True
+            results = self.model(image, **kwargs)
         return results[0]
 
     def _class_conf_floor(self, cls_id: int) -> float:

@@ -363,7 +363,7 @@ def system_config(request):
         messages.error(request, '您没有访问此页面的权限')
         return redirect('detection:dashboard')
     
-    bool_keys = {'enable_voice', 'mono_camera_mode', 'yolo_spatial_filter'}
+    bool_keys = {'enable_voice', 'mono_camera_mode', 'yolo_spatial_filter', 'cuda_half'}
 
     if request.method == 'POST':
         # 先收集 POST（同名 hidden+checkbox 取最后一个）
@@ -419,6 +419,9 @@ def start_detection(request):
             fatigue_tracker.configure(session.id, configs)
             behavior_tracker.configure(session.id, configs)
             try:
+                from .utils.compute_scheduler import compute_scheduler
+
+                compute_scheduler.configure(configs)
                 if yolo_detector is not None:
                     yolo_detector.load_config()
                 if dlib_detector is not None:

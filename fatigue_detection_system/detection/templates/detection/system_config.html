@@ -316,7 +316,45 @@
                                         <option value="cpu" {% if configs.device == 'cpu' or not configs.device %}selected{% endif %}>CPU</option>
                                         <option value="cuda:0" {% if configs.device == 'cuda:0' %}selected{% endif %}>GPU (CUDA)</option>
                                     </select>
-                                    <div class="form-text">检测模型运行的硬件设备</div>
+                                    <div class="form-text">有 NVIDIA GPU 且已装 CUDA 版 PyTorch 时选 GPU；YOLO 上 GPU，EAR/dlib 仍在 CPU 并行</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">CUDA FP16</label>
+                                <div class="col-md-8">
+                                    <div class="form-check form-switch mt-2">
+                                        <input class="form-check-input" type="checkbox" name="config_cuda_half"
+                                               value="true" id="cudaHalf" {% if configs.cuda_half != 'false' %}checked{% endif %}>
+                                        <label class="form-check-label" for="cudaHalf">GPU 半精度推理（更快，需 CUDA）</label>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">YOLO CPU 线程数</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="1" min="0" max="64" name="config_compute_yolo_threads"
+                                           class="form-control" value="{{ configs.compute_yolo_threads|default:'0' }}">
+                                    <div class="form-text">0=自动（CPU 约 60% 核给 YOLO；CUDA 时仅少量 CPU 做预处理）</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">EAR CPU 线程数</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="1" min="0" max="64" name="config_compute_ear_threads"
+                                           class="form-control" value="{{ configs.compute_ear_threads|default:'0' }}">
+                                    <div class="form-text">0=自动；与 YOLO 线程之和建议不超过物理核数</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">CPU 忙时 EAR 拉伸%</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="10" min="100" max="300" name="config_ear_busy_stretch_pct"
+                                           class="form-control" value="{{ configs.ear_busy_stretch_pct|default:'150' }}">
+                                    <div class="form-text">仅 CPU：YOLO 繁忙时 EAR 间隔×该比例（仍继续采样，不暂停）</div>
                                 </div>
                             </div>
                         </div>

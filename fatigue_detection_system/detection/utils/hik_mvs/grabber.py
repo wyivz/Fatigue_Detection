@@ -262,6 +262,7 @@ class MvsGrabber:
     def _ear_loop(self) -> None:
         """High-rate EAR sampling using shared YOLO face bbox when available."""
         from detection.views import dlib_detector
+        from detection.utils.compute_scheduler import compute_scheduler
         from detection.utils.fatigue_tracker import fatigue_tracker
 
         last_seq = -1
