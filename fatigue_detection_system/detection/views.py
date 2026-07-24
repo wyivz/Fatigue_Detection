@@ -19,6 +19,20 @@ from .models import DetectionSession, DetectionResult, SystemConfig
 from .utils.yolo_detector import YOLODetector
 from .utils.dlib_detector import DlibDetector
 
+import logging
+logger = logging.getLogger(__name__)
+
+def _safe_log(msg):
+    """避免 Windows 上 stdout 失效时 print 抛出 OSError: [Errno 22]。"""
+    try:
+        logger.info(msg)
+    except Exception:
+        pass
+    try:
+        print(msg)
+    except OSError:
+        pass
+
 # 检查权重文件是否存在
 yolo_weights_path = os.path.join(settings.BASE_DIR, 'weights', 'best.pt')
 dlib_weights_path = os.path.join(settings.BASE_DIR, 'weights', 'shape_predictor_68_face_landmarks.dat')
@@ -29,27 +43,27 @@ dlib_weights_exist = os.path.exists(dlib_weights_path)
 # 创建检测器实例
 try:
     if not yolo_weights_exist:
-        print(f"警告: YOLO权重文件不存在: {yolo_weights_path}")
-        print("请下载权重文件并放到weights目录")
+        _safe_log(f"警告: YOLO权重文件不存在: {yolo_weights_path}")
+        _safe_log("请下载权重文件并放到weights目录")
         yolo_detector = None
     else:
         yolo_detector = YOLODetector()
-        print("YOLO 检测器加载成功")
+        _safe_log("YOLO 检测器加载成功")
 except Exception as e:
     yolo_detector = None
-    print(f"YOLO 检测器加载失败: {e}")
+    _safe_log(f"YOLO 检测器加载失败: {e}")
 
 try:
     if not dlib_weights_exist:
-        print(f"警告: dlib面部特征点预测器文件不存在: {dlib_weights_path}")
-        print("请下载预测器文件并放到weights目录")
+        _safe_log(f"警告: dlib面部特征点预测器文件不存在: {dlib_weights_path}")
+        _safe_log("请下载预测器文件并放到weights目录")
         dlib_detector = None
     else:
         dlib_detector = DlibDetector()
-        print("dlib 检测器加载成功")
+        _safe_log("dlib 检测器加载成功")
 except Exception as e:
     dlib_detector = None
-    print(f"dlib 检测器加载失败: {e}")
+    _safe_log(f"dlib 检测器加载失败: {e}")
 
 @login_required
 def dashboard(request):
@@ -499,7 +513,7 @@ def get_result(request):
         detect_fatigue = request.POST.get('detect_fatigue') == 'true'
         detect_behaviors = request.POST.get('detect_behaviors') == 'true'
         
-        print(f"收到检测请求: session_id={session_id}, detect_fatigue={detect_fatigue}, detect_behaviors={detect_behaviors}")
+        _safe_log(f"收到检测请求: session_id={session_id}, detect_fatigue={detect_fatigue}, detect_behaviors={detect_behaviors}")
         
         if not session_id or not image_data:
             return JsonResponse({'status': 'error', 'message': '缺少必要参数'})
@@ -508,17 +522,20 @@ def get_result(request):
             session = DetectionSession.objects.get(id=session_id, user=request.user)
             
             # 解码Base64图像
-            image_data = image_data.split(',')[1]
+            if ',' in image_data:
+                image_data = image_data.split(',', 1)[1]
             image_bytes = base64.b64decode(image_data)
             np_arr = np.frombuffer(image_bytes, np.uint8)
             image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if image is None:
+                return JsonResponse({'status': 'error', 'message': '图像解码失败'})
             
             # 处理图像
             result = process_image(image, session, detect_fatigue, detect_behaviors)
             
             return JsonResponse(result)
         except Exception as e:
-            print(f"检测过程出现错误: {e}")
+            _safe_log(f"检测过程出现错误: {e}")
             return JsonResponse({'status': 'error', 'message': str(e)})
     
     return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
