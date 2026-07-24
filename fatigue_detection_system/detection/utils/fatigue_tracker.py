@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 
 def _cfg_float(configs: Dict[str, Any], key: str, default: float) -> float:
@@ -41,6 +41,12 @@ def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, A
         "perclos_alert_pct": _cfg_float(configs, "perclos_alert_pct", 20.0),
         "ear_sample_interval_ms": max(50, _cfg_int(configs, "ear_sample_interval_ms", 100)),
         "behavior_confirm_frames": max(1, _cfg_int(configs, "behavior_confirm_frames", 2)),
+        # Hysteresis band around EAR threshold to avoid flicker false closes
+        "ear_hysteresis": _cfg_float(configs, "ear_hysteresis", 0.03),
+        # Yawn must persist this many ms before latching
+        "yawn_confirm_ms": _cfg_int(configs, "yawn_confirm_ms", 400),
+        # How long a yawn latch stays after mouth closes
+        "yawn_hold_ms": _cfg_int(configs, "yawn_hold_ms", 800),
     }
 
 
@@ -58,13 +64,27 @@ class FatigueSnapshot:
 
 
 @dataclass
+class _ClosedSegment:
+    start: float
+    end: float
+
+    @property
+    def duration_ms(self) -> float:
+        return max(0.0, (self.end - self.start) * 1000.0)
+
+
+@dataclass
 class _SessionFatigueState:
-    samples: Deque[Tuple[float, bool]] = field(default_factory=deque)  # (t, eyes_closed)
+    # Closed segments longer than blink (for PERCLOS); short blinks excluded
+    closed_segments: Deque[_ClosedSegment] = field(default_factory=deque)
+    eyes_closed: bool = False  # hysteretic state
     closed_start: Optional[float] = None
     last_t: Optional[float] = None
     recent_microsleep_until: float = 0.0
     last_ear: Optional[float] = None
     last_yawn: bool = False
+    yawn_candidate_start: Optional[float] = None
+    yawn_until: float = 0.0
     last_landmarks: Any = None
     last_faces: int = 0
     config: Dict[str, Any] = field(default_factory=dict)
@@ -73,7 +93,7 @@ class _SessionFatigueState:
 class FatigueTemporalTracker:
     """Thread-safe per-session EAR / PERCLOS fatigue state machine."""
 
-    _MICROSLEEP_HOLD_SEC = 2.0
+    _MICROSLEEP_HOLD_SEC = 1.5
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -110,24 +130,28 @@ class FatigueTemporalTracker:
         landmarks: Any = None,
         timestamp: Optional[float] = None,
     ) -> FatigueSnapshot:
-        """Feed one EAR sample. Skip PERCLOS denominator when no face / no EAR.
+        """Feed one EAR sample.
 
-        yawn_detected=None keeps the previous yawn flag (used by high-rate EAR loop).
+        - EAR uses hysteresis to avoid threshold flicker.
+        - Normal blinks (<= blink_max_ms) do NOT count toward PERCLOS.
+        - yawn_detected=None keeps prior yawn latch (EAR loop); True/False updates yawn FSM.
         """
         t = time.time() if timestamp is None else float(timestamp)
         with self._lock:
             state = self._get_state(session_id)
             cfg = state.config or load_fatigue_config()
-            if yawn_detected is not None:
-                state.last_yawn = bool(yawn_detected)
             state.last_faces = int(faces_detected)
             if landmarks is not None:
                 state.last_landmarks = landmarks
 
+            if yawn_detected is not None:
+                self._update_yawn(state, bool(yawn_detected), t, cfg)
+
             if ear is None or faces_detected <= 0:
-                # End any open closed-eye segment without counting gap as closed.
-                if state.closed_start is not None and state.last_t is not None:
-                    self._finalize_closed_segment(state, state.last_t, cfg)
+                # Lost face: end closed segment without treating gap as closed
+                if state.eyes_closed and state.closed_start is not None:
+                    self._close_segment(state, state.last_t or t, cfg)
+                state.eyes_closed = False
                 state.closed_start = None
                 state.last_t = t
                 state.last_ear = ear
@@ -137,22 +161,25 @@ class FatigueTemporalTracker:
             ear_f = float(ear)
             state.last_ear = ear_f
             thresh = float(cfg["eye_ar_thresh"])
-            closed = ear_f < thresh
+            hyst = max(0.0, float(cfg.get("ear_hysteresis", 0.03)))
+            close_thresh = thresh
+            open_thresh = thresh + hyst
 
-            if state.last_t is not None and t > state.last_t:
-                # Attribute the inter-sample interval to the *previous* eye state
-                # already reflected by closed_start / open.
-                pass
-
-            if closed:
-                if state.closed_start is None:
-                    state.closed_start = t
-                state.samples.append((t, True))
+            # Hysteresis: harder to enter closed, easier to stay open until clearly open
+            if state.eyes_closed:
+                want_closed = ear_f < open_thresh
             else:
-                if state.closed_start is not None:
-                    self._finalize_closed_segment(state, t, cfg)
+                want_closed = ear_f < close_thresh
+
+            if want_closed:
+                if not state.eyes_closed:
+                    state.eyes_closed = True
+                    state.closed_start = t
+            else:
+                if state.eyes_closed and state.closed_start is not None:
+                    self._close_segment(state, t, cfg)
+                state.eyes_closed = False
                 state.closed_start = None
-                state.samples.append((t, False))
 
             state.last_t = t
             self._prune(state, t, cfg)
@@ -164,48 +191,86 @@ class FatigueTemporalTracker:
             cfg = state.config or load_fatigue_config()
             return self._snapshot(state, cfg, time.time())
 
-    def _finalize_closed_segment(
+    def _update_yawn(
+        self, state: _SessionFatigueState, raw_yawn: bool, t: float, cfg: Dict[str, Any]
+    ) -> None:
+        confirm_ms = float(cfg.get("yawn_confirm_ms", 400))
+        hold_ms = float(cfg.get("yawn_hold_ms", 800))
+        if raw_yawn:
+            if state.yawn_candidate_start is None:
+                state.yawn_candidate_start = t
+            elif (t - state.yawn_candidate_start) * 1000.0 >= confirm_ms:
+                state.last_yawn = True
+                state.yawn_until = t + hold_ms / 1000.0
+        else:
+            state.yawn_candidate_start = None
+            if t >= state.yawn_until:
+                state.last_yawn = False
+
+        if state.last_yawn and t >= state.yawn_until and not raw_yawn:
+            state.last_yawn = False
+
+    def _close_segment(
         self, state: _SessionFatigueState, end_t: float, cfg: Dict[str, Any]
     ) -> None:
         if state.closed_start is None:
             return
-        duration_ms = max(0.0, (end_t - state.closed_start) * 1000.0)
+        start = state.closed_start
+        duration_ms = max(0.0, (end_t - start) * 1000.0)
+        blink_max = float(cfg["blink_max_ms"])
         microsleep_min = float(cfg["microsleep_min_ms"])
+
+        # Only non-blink closures contribute to PERCLOS
+        if duration_ms > blink_max:
+            state.closed_segments.append(_ClosedSegment(start=start, end=end_t))
+
         if duration_ms >= microsleep_min:
             state.recent_microsleep_until = end_t + self._MICROSLEEP_HOLD_SEC
+
+        state.closed_start = None
 
     def _prune(self, state: _SessionFatigueState, now: float, cfg: Dict[str, Any]) -> None:
         window = float(cfg["perclos_window_sec"])
         cutoff = now - window
-        while state.samples and state.samples[0][0] < cutoff:
-            state.samples.popleft()
+        while state.closed_segments and state.closed_segments[0].end < cutoff:
+            state.closed_segments.popleft()
+        # Trim partial overlap at window start
+        if state.closed_segments and state.closed_segments[0].start < cutoff:
+            seg = state.closed_segments[0]
+            state.closed_segments[0] = _ClosedSegment(start=cutoff, end=seg.end)
 
     def _current_closed_ms(self, state: _SessionFatigueState, now: float) -> int:
-        if state.closed_start is None:
+        if not state.eyes_closed or state.closed_start is None:
             return 0
         return int(max(0.0, (now - state.closed_start) * 1000.0))
 
     def _compute_perclos(self, state: _SessionFatigueState, now: float, cfg: Dict[str, Any]) -> float:
-        """PERCLOS = closed time in window / full window duration (face-valid samples only for numerator)."""
+        """PERCLOS from non-blink closed segments / full window.
+
+        Ongoing closure only counts after it exceeds blink_max (avoid blink inflation).
+        """
         window = float(cfg["perclos_window_sec"])
+        blink_max = float(cfg["blink_max_ms"])
         if window <= 1e-6:
             return 0.0
 
-        samples = list(state.samples)
+        cutoff = now - window
         closed_sec = 0.0
+        for seg in state.closed_segments:
+            a = max(seg.start, cutoff)
+            b = min(seg.end, now)
+            if b > a:
+                closed_sec += b - a
 
-        if len(samples) >= 2:
-            for i in range(1, len(samples)):
-                t0, closed0 = samples[i - 1]
-                t1, _ = samples[i]
-                dt = max(0.0, t1 - t0)
-                if closed0:
-                    closed_sec += dt
-            last_t, last_closed = samples[-1]
-            if now > last_t and (last_closed or state.closed_start is not None):
-                closed_sec += now - last_t
-        elif state.closed_start is not None:
-            closed_sec = max(0.0, now - state.closed_start)
+        # Ongoing long closure (already past blink length)
+        if state.eyes_closed and state.closed_start is not None:
+            ongoing_ms = (now - state.closed_start) * 1000.0
+            if ongoing_ms > blink_max:
+                # Count only the portion beyond blink_max, from closed_start+blink
+                count_from = state.closed_start + blink_max / 1000.0
+                a = max(count_from, cutoff)
+                if now > a:
+                    closed_sec += now - a
 
         closed_sec = min(closed_sec, window)
         return max(0.0, min(100.0, (closed_sec / window) * 100.0))
@@ -213,6 +278,10 @@ class FatigueTemporalTracker:
     def _snapshot(
         self, state: _SessionFatigueState, cfg: Dict[str, Any], now: float
     ) -> FatigueSnapshot:
+        # Refresh yawn latch expiry
+        if state.last_yawn and now >= state.yawn_until:
+            state.last_yawn = False
+
         closed_ms = self._current_closed_ms(state, now)
         blink_max = int(cfg["blink_max_ms"])
         microsleep_min = int(cfg["microsleep_min_ms"])
@@ -222,7 +291,7 @@ class FatigueTemporalTracker:
 
         is_microsleep = closed_ms >= microsleep_min or now < state.recent_microsleep_until
         is_blink = (
-            state.closed_start is not None
+            state.eyes_closed
             and 0 < closed_ms <= blink_max
             and not is_microsleep
         )
