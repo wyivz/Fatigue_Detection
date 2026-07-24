@@ -482,22 +482,25 @@ def mvs_preview(request):
 
     def frame_generator():
             idle = 0
+            last_jpeg = None
             while True:
                 st = mvs_grabber.status()
                 if not st.get('running') or st.get('session_id') != session.id:
                     idle += 1
                     if idle > 50:
                         break
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                     continue
                 idle = 0
                 jpeg = mvs_grabber.get_jpeg()
-                if jpeg:
+                # Only push when frame changed to reduce bandwidth; still poll quickly
+                if jpeg and jpeg is not last_jpeg:
+                    last_jpeg = jpeg
                     yield (
                         b'--frame\r\n'
                         b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n'
                     )
-                time.sleep(0.05)
+                time.sleep(0.03)
 
     response = StreamingHttpResponse(
         frame_generator(),

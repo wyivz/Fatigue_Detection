@@ -168,15 +168,6 @@ class MvsGrabber:
                 if self._stop.wait(0.05):
                     break
 
-        with self._lock:
-            if self._camera:
-                try:
-                    self._camera.stop_and_close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._camera = None
-            self.running = False
-
     def _detect_loop(self) -> None:
         """Run YOLO/dlib at detection_interval only; does not drive preview FPS."""
         from detection.models import DetectionSession
