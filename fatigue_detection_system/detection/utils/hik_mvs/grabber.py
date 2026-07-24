@@ -40,6 +40,8 @@ class MvsGrabber:
         self._preview_jpeg_quality = 70
         self._latest_bgr: Optional[np.ndarray] = None
         self._latest_face_bbox: Optional[List[int]] = None
+        self._latest_face_bboxes: List[List[int]] = []
+        self._latest_faces_meta: List[Dict[str, Any]] = []
         self._frame_seq = 0
         self._detect_busy = False
         self._timing_avg: Dict[str, float] = {}
@@ -81,6 +83,8 @@ class MvsGrabber:
             self.latest_meta = {"timing": {}}
             self._latest_bgr = None
             self._latest_face_bbox = None
+            self._latest_face_bboxes = []
+            self._latest_faces_meta = []
             self._frame_seq = 0
             self._timing_avg = {}
             self._session_id = session_id
@@ -191,6 +195,8 @@ class MvsGrabber:
             self._detect_thread = None
             self._detect_busy = False
             self._latest_face_bbox = None
+            self._latest_face_bboxes = []
+            self._latest_faces_meta = []
             session_id = self._session_id
             self._session_id = None
         if session_id is not None:
@@ -345,6 +351,7 @@ class MvsGrabber:
                 face_bbox = (
                     None if self._latest_face_bbox is None else list(self._latest_face_bbox)
                 )
+                face_bboxes = [list(b) for b in (self._latest_face_bboxes or [])]
                 detect_busy = bool(self._detect_busy)
                 in_warmup = time.time() < float(self._warmup_until or 0.0)
 
@@ -364,24 +371,36 @@ class MvsGrabber:
             try:
                 if dlib_detector is not None:
                     with compute_scheduler.ear_context():
-                        sample = self._resize_for_preview(frame)
-                        scaled_bbox = face_bbox
-                        if face_bbox is not None:
-                            fh, fw = frame.shape[:2]
-                            sh, sw = sample.shape[:2]
-                            if fw > 0 and fh > 0 and (sw != fw or sh != fh):
-                                sx = sw / float(fw)
-                                sy = sh / float(fh)
-                                scaled_bbox = [
-                                    int(face_bbox[0] * sx),
-                                    int(face_bbox[1] * sy),
-                                    int(face_bbox[2] * sx),
-                                    int(face_bbox[3] * sy),
-                                ]
+                        # Must match YOLO / persist frame size so landmarks overlay correctly.
+                        sample = self._resize_for_detect(frame)
+                        fh, fw = frame.shape[:2]
+                        sh, sw = sample.shape[:2]
+                        sx = sw / float(fw) if fw > 0 and sw != fw else 1.0
+                        sy = sh / float(fh) if fh > 0 and sh != fh else 1.0
+
+                        def _scale_box(b):
+                            if b is None:
+                                return None
+                            if sx == 1.0 and sy == 1.0:
+                                return [int(v) for v in b]
+                            return [
+                                int(b[0] * sx),
+                                int(b[1] * sy),
+                                int(b[2] * sx),
+                                int(b[3] * sy),
+                            ]
+
+                        scaled_boxes = [_scale_box(b) for b in face_bboxes]
+                        scaled_boxes = [b for b in scaled_boxes if b is not None]
+                        scaled_primary = _scale_box(face_bbox)
+                        if not scaled_boxes and scaled_primary is not None:
+                            scaled_boxes = [scaled_primary]
 
                         t_ear = time.perf_counter()
-                        dlib_results = dlib_detector.detect_fatigue(
-                            sample, face_bbox=scaled_bbox
+                        dlib_results = dlib_detector.detect_fatigue_multi(
+                            sample,
+                            face_bboxes=scaled_boxes or None,
+                            primary_bbox=scaled_primary,
                         )
                         ear_cost = (time.perf_counter() - t_ear) * 1000.0
 
@@ -397,16 +416,36 @@ class MvsGrabber:
                             self.latest_meta = meta
                     else:
                         faces_n = int(dlib_results.get("faces_detected") or 0)
-                        if faces_n <= 0 and scaled_bbox is not None:
+                        if faces_n <= 0 and scaled_primary is not None:
                             faces_n = 1 if dlib_results.get("landmarks") is not None else 0
 
+                        lm = dlib_results.get("landmarks")
+                        lm_size = None
+                        if lm is not None:
+                            lm_size = (int(sw), int(sh))
+
+                        # Tracker / alerts: primary face only
                         snap = fatigue_tracker.update(
                             session_id,
                             ear=dlib_results.get("eye_aspect_ratio"),
                             yawn_detected=bool(dlib_results.get("yawn_detected")),
                             faces_detected=faces_n,
-                            landmarks=dlib_results.get("landmarks"),
+                            landmarks=lm,
+                            landmarks_size=lm_size,
+                            faces=dlib_results.get("faces") or [],
                         )
+
+                        faces_meta = []
+                        for ent in dlib_results.get("faces") or []:
+                            faces_meta.append(
+                                {
+                                    "bbox": ent.get("bbox"),
+                                    "ear": ent.get("eye_aspect_ratio"),
+                                    "mar": ent.get("mouth_aspect_ratio"),
+                                    "yawn": bool(ent.get("yawn_detected")),
+                                    "is_primary": bool(ent.get("is_primary")),
+                                }
+                            )
 
                         level = int(snap.fatigue_level)
                         yawn = bool(snap.yawn_detected)
@@ -419,6 +458,7 @@ class MvsGrabber:
                                 self._pending_fatigue_event = True
                             self._last_fatigue_level = level
                             self._last_yawn = yawn
+                            self._latest_faces_meta = faces_meta
 
                             meta = dict(self.latest_meta)
                             timing = dict(meta.get("timing") or {})
@@ -434,6 +474,8 @@ class MvsGrabber:
                                     "fatigue_level": snap.fatigue_level,
                                     "yawn_detected": snap.yawn_detected,
                                     "has_landmarks": dlib_results.get("landmarks") is not None,
+                                    "face_count": faces_n,
+                                    "faces": faces_meta,
                                     "fatigue_event": bool(rising_fatigue or rising_yawn),
                                     "scheduler": compute_scheduler.snapshot(),
                                 }
@@ -513,6 +555,7 @@ class MvsGrabber:
                 detect_loop_ms = (time.perf_counter() - loop_start) * 1000.0
 
                 face_bbox = result.get("face_bbox")
+                face_bboxes = result.get("face_bboxes") or []
                 timing_src = dict(result.get("timing") or {})
                 timing_src["detect_loop_ms"] = detect_loop_ms
 
@@ -529,26 +572,45 @@ class MvsGrabber:
                     "eye_closed_ms": result.get("eye_closed_ms"),
                     "is_microsleep": result.get("is_microsleep"),
                     "has_landmarks": result.get("has_landmarks"),
+                    "face_count": result.get("face_count"),
                     "detection_id": result.get("detection_id"),
                     "behavior_debug": result.get("behavior_debug") or {},
                     "confirm_progress": result.get("confirm_progress") or {},
                     "fatigue_event": False,
                 }
                 with self._lock:
+                    fh, fw = frame.shape[:2]
+                    dh, dw = det_frame.shape[:2]
+                    if dw > 0 and dh > 0 and (dw != fw or dh != fh):
+                        sx = fw / float(dw)
+                        sy = fh / float(dh)
+                    else:
+                        sx = sy = 1.0
+
+                    def _to_full(b):
+                        if b is None:
+                            return None
+                        if sx == 1.0 and sy == 1.0:
+                            return [int(v) for v in b]
+                        return [
+                            int(b[0] * sx),
+                            int(b[1] * sy),
+                            int(b[2] * sx),
+                            int(b[3] * sy),
+                        ]
+
                     if face_bbox is not None:
-                        fh, fw = frame.shape[:2]
-                        dh, dw = det_frame.shape[:2]
-                        if dw > 0 and dh > 0 and (dw != fw or dh != fh):
-                            sx = fw / float(dw)
-                            sy = fh / float(dh)
-                            self._latest_face_bbox = [
-                                int(face_bbox[0] * sx),
-                                int(face_bbox[1] * sy),
-                                int(face_bbox[2] * sx),
-                                int(face_bbox[3] * sy),
-                            ]
-                        else:
-                            self._latest_face_bbox = [int(v) for v in face_bbox]
+                        self._latest_face_bbox = _to_full(face_bbox)
+                    scaled_all = []
+                    for b in face_bboxes:
+                        fb = _to_full(b)
+                        if fb is not None:
+                            scaled_all.append(fb)
+                    if scaled_all:
+                        self._latest_face_bboxes = scaled_all
+                    elif self._latest_face_bbox is not None:
+                        self._latest_face_bboxes = [list(self._latest_face_bbox)]
+
                     prev = dict(self.latest_meta or {})
                     prev_timing = dict(prev.get("timing") or {})
                     merged = self._merge_timing(timing_src)
@@ -556,6 +618,11 @@ class MvsGrabber:
                         if k.startswith("ear"):
                             merged.setdefault(k, v)
                     meta["timing"] = merged
+                    # Keep EAR-loop faces list / fatigue metrics when fresher
+                    if prev.get("faces"):
+                        meta["faces"] = prev.get("faces")
+                    if prev.get("face_count") is not None and meta.get("face_count") is None:
+                        meta["face_count"] = prev.get("face_count")
                     try:
                         if int(prev.get("fatigue_level") or 0) >= int(meta.get("fatigue_level") or 0):
                             for k in (
@@ -567,6 +634,8 @@ class MvsGrabber:
                                 "is_microsleep",
                                 "yawn_detected",
                                 "has_landmarks",
+                                "faces",
+                                "face_count",
                             ):
                                 if k in prev and prev[k] is not None:
                                     meta[k] = prev[k]

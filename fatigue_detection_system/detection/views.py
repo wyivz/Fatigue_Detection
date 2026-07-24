@@ -665,6 +665,8 @@ def save_fatigue_event(image, session, snap, mouth_aspect_ratio=None, face_detec
 
     draw_payload = {
         'landmarks': lm,
+        'landmarks_size': getattr(live or snap, 'landmarks_size', None),
+        'faces': getattr(live or snap, 'faces', None),
         'eye_aspect_ratio': ear,
         'mouth_aspect_ratio': mouth_aspect_ratio,
         'yawn_detected': yawn,
@@ -719,6 +721,8 @@ def persist_detection_snapshot(image, session, results):
     if dlib_detector is not None:
         draw_payload = {
             'landmarks': snap.landmarks,
+            'landmarks_size': getattr(snap, 'landmarks_size', None),
+            'faces': getattr(snap, 'faces', None),
             'eye_aspect_ratio': results.get('eye_aspect_ratio', snap.eye_aspect_ratio),
             'mouth_aspect_ratio': results.get('mouth_aspect_ratio'),
             'yawn_detected': results.get('yawn_detected', snap.yawn_detected),
@@ -810,10 +814,16 @@ def process_image(
             configs=configs,
         )
 
-        for det in processed_yolo.get('detections', []):
-            if det.get('class_name') == 'face':
-                face_bbox = det.get('bbox')
-                break
+        # Prefer YOLO's primary face (largest); fall back to first face box.
+        face_bbox = processed_yolo.get('face_bbox')
+        if face_bbox is None:
+            for det in processed_yolo.get('detections', []):
+                if det.get('class_name') == 'face':
+                    face_bbox = det.get('bbox')
+                    break
+        face_bboxes = processed_yolo.get('face_bboxes') or []
+        if not face_bboxes and face_bbox is not None:
+            face_bboxes = [face_bbox]
 
         results.update({
             'face_detected': bool(processed_yolo['face_detected']),
@@ -821,28 +831,40 @@ def process_image(
             'phone_detected': bool(confirmed['phone_detected']),
             'drinking_detected': bool(confirmed['drinking_detected']),
             'face_bbox': face_bbox,
+            'face_bboxes': face_bboxes,
+            'face_count': int(processed_yolo.get('face_count') or len(face_bboxes)),
             'behavior_debug': processed_yolo.get('behavior_debug') or {},
             'confirm_progress': confirmed.get('confirm_progress') or {},
             'detections': processed_yolo.get('detections') or [],
         })
     else:
+        face_bboxes = []
         results.update({
             'face_detected': False,
             'smoking_detected': False,
             'phone_detected': False,
             'drinking_detected': False,
             'face_bbox': None,
+            'face_bboxes': [],
+            'face_count': 0,
             'behavior_debug': {},
             'confirm_progress': {},
             'detections': [],
         })
 
     draw_lm = None
+    draw_lm_size = None
     draw_mar = None
+    draw_faces = None
+    faces_n = 0
     if detect_fatigue and dlib_detector:
         try:
             t_dlib = _time.perf_counter()
-            dlib_results = dlib_detector.detect_fatigue(image, face_bbox=face_bbox)
+            dlib_results = dlib_detector.detect_fatigue_multi(
+                image,
+                face_bboxes=face_bboxes or None,
+                primary_bbox=face_bbox,
+            )
             timing['dlib_ms'] = round((_time.perf_counter() - t_dlib) * 1000.0, 1)
 
             faces_n = int(dlib_results.get('faces_detected') or 0)
@@ -855,13 +877,28 @@ def process_image(
                 yawn_detected=bool(dlib_results.get('yawn_detected')),
                 faces_detected=faces_n,
                 landmarks=dlib_results.get('landmarks'),
+                landmarks_size=(
+                    (int(image.shape[1]), int(image.shape[0]))
+                    if dlib_results.get('landmarks') is not None
+                    else None
+                ),
+                faces=dlib_results.get('faces') or [],
             )
             draw_mar = dlib_results.get('mouth_aspect_ratio')
             draw_lm = dlib_results.get('landmarks') or snap.landmarks
+            draw_faces = dlib_results.get('faces') or getattr(snap, 'faces', None)
+            draw_lm_size = (
+                (int(image.shape[1]), int(image.shape[0]))
+                if dlib_results.get('landmarks') is not None
+                else getattr(snap, 'landmarks_size', None)
+            )
         except Exception as e:
             _safe_log(f'dlib检测失败(沿用tracker快照): {e}')
             snap = fatigue_tracker.get_snapshot(session.id)
             draw_lm = snap.landmarks
+            draw_lm_size = getattr(snap, 'landmarks_size', None)
+            draw_faces = getattr(snap, 'faces', None)
+            faces_n = int(snap.faces_detected or 0)
             timing['dlib_ms'] = round(timing.get('dlib_ms') or 0.0, 1)
 
         results.update({
@@ -873,10 +910,23 @@ def process_image(
             'eye_closed_ms': int(snap.eye_closed_ms),
             'is_microsleep': bool(snap.is_microsleep),
             'has_landmarks': draw_lm is not None,
+            'faces': [
+                {
+                    'ear': f.get('eye_aspect_ratio'),
+                    'mar': f.get('mouth_aspect_ratio'),
+                    'yawn': bool(f.get('yawn_detected')),
+                    'is_primary': bool(f.get('is_primary')),
+                    'bbox': f.get('bbox'),
+                }
+                for f in (draw_faces or [])
+            ],
+            'face_count': max(int(results.get('face_count') or 0), int(faces_n or 0)),
         })
     else:
         snap = fatigue_tracker.get_snapshot(session.id)
         draw_lm = snap.landmarks
+        draw_lm_size = getattr(snap, 'landmarks_size', None)
+        draw_faces = getattr(snap, 'faces', None)
         results.update({
             'eye_aspect_ratio': float(snap.eye_aspect_ratio) if snap.eye_aspect_ratio is not None else None,
             'mouth_aspect_ratio': None,
@@ -886,6 +936,17 @@ def process_image(
             'eye_closed_ms': int(snap.eye_closed_ms),
             'is_microsleep': bool(snap.is_microsleep),
             'has_landmarks': snap.landmarks is not None,
+            'faces': [
+                {
+                    'ear': f.get('eye_aspect_ratio'),
+                    'mar': f.get('mouth_aspect_ratio'),
+                    'yawn': bool(f.get('yawn_detected')),
+                    'is_primary': bool(f.get('is_primary')),
+                    'bbox': f.get('bbox'),
+                }
+                for f in (draw_faces or [])
+            ],
+            'face_count': int(results.get('face_count') or snap.faces_detected or 0),
         })
 
     if not persist:
@@ -909,6 +970,8 @@ def process_image(
     ):
         draw_payload = {
             'landmarks': draw_lm,
+            'landmarks_size': draw_lm_size,
+            'faces': draw_faces,
             'eye_aspect_ratio': results.get('eye_aspect_ratio'),
             'mouth_aspect_ratio': draw_mar,
             'yawn_detected': results.get('yawn_detected'),

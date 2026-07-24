@@ -1100,14 +1100,34 @@
         let detailsHTML = '';
         
         // 面部检测
+        const faceCount = (result.face_count != null) ? Number(result.face_count) : (result.face_detected ? 1 : 0);
+        let faceLabel = result.face_detected ? '已检测到' : '未检测到';
+        if (faceCount > 0) {
+            faceLabel = faceCount + ' 人' + (faceCount > 1 ? '（主脸告警）' : '');
+        }
         detailsHTML += `<div class="result-item ${result.face_detected ? 'success' : ''}">
             <div class="d-flex justify-content-between">
                 <span><i class="fas fa-user me-2"></i>面部检测</span>
-                <span>${result.face_detected ? '已检测到' : '未检测到'}</span>
+                <span>${faceLabel}</span>
             </div>
         </div>`;
+
+        // 多人 EAR 列表（告警仍只看主脸顶层指标）
+        if (Array.isArray(result.faces) && result.faces.length > 0) {
+            const parts = result.faces.map((f, i) => {
+                const ear = (f.ear != null) ? Number(f.ear).toFixed(2) : '-';
+                const tag = f.is_primary ? '主' : String(i + 1);
+                return `${tag}:${ear}`;
+            });
+            detailsHTML += `<div class="result-item">
+                <div class="d-flex justify-content-between">
+                    <span><i class="fas fa-users me-2"></i>各脸 EAR</span>
+                    <span class="small">${parts.join(' | ')}</span>
+                </div>
+            </div>`;
+        }
         
-        // 眼睛状态 - 无论是否检测到人脸都显示
+        // 眼睛状态 - 无论是否检测到人脸都显示（主脸）
         let eyeText = '未检测';
         let eyeWarning = false;
         
@@ -1118,7 +1138,7 @@
         
         detailsHTML += `<div class="result-item ${eyeWarning ? 'warning' : ''}">
             <div class="d-flex justify-content-between">
-                <span><i class="fas fa-eye me-2"></i>眼睛状态</span>
+                <span><i class="fas fa-eye me-2"></i>眼睛状态(主)</span>
                 <span>${eyeText}</span>
             </div>
         </div>`;

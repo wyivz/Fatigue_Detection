@@ -8,7 +8,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from django.conf import settings
-from ultralytics import YOLO
+
+# Lazy import: avoid loading ultralytics (and heavy train/FastSAM stack) at Django startup.
+YOLO = None
+
+
+def _yolo_cls():
+    global YOLO
+    if YOLO is None:
+        from ultralytics import YOLO as _YOLO
+
+        YOLO = _YOLO
+    return YOLO
 
 
 def _cfg_float(configs: Dict[str, Any], key: str, default: float) -> float:
@@ -35,6 +46,26 @@ def _bbox_diag(bbox: List[int]) -> float:
     return max(1.0, float(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5))
 
 
+def _bbox_area(bbox: List[int]) -> float:
+    x1, y1, x2, y2 = bbox
+    return max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
+
+
+def pick_primary_face(face_boxes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Choose the primary monitored face when multiple faces appear.
+
+    Prefer the largest box (closest to camera / intended driver). Ties break by
+    higher confidence.
+    """
+    if not face_boxes:
+        return None
+    return max(
+        face_boxes,
+        key=lambda d: (_bbox_area(d["bbox"]), float(d.get("confidence") or 0.0)),
+    )
+
+
 class YOLODetector:
     """Detect face / smoking / phone / drinking with optional spatial filters."""
 
@@ -45,7 +76,7 @@ class YOLODetector:
             weights_path = os.path.join(settings.BASE_DIR, "weights", "best.pt")
 
         self.load_config()
-        self.model = YOLO(weights_path)
+        self.model = _yolo_cls()(weights_path)
         self._apply_runtime_params()
         self.class_names = list(self.CLASS_NAMES)
 
@@ -200,11 +231,17 @@ class YOLODetector:
             kept.append(det)
 
         face_boxes = [d for d in kept if d["class_id"] == 0]
-        face_bbox = face_boxes[0]["bbox"] if face_boxes else None
+        primary = pick_primary_face(face_boxes)
+        face_bbox = primary["bbox"] if primary is not None else None
 
         final: List[Dict[str, Any]] = []
         for det in kept:
             if det["class_id"] == 0:
+                # Mark primary so UI / EAR know which face is tracked
+                if primary is not None and det is primary:
+                    det = {**det, "is_primary": True}
+                else:
+                    det = {**det, "is_primary": False}
                 final.append(det)
                 continue
             if self.spatial_filter and face_bbox is not None:
@@ -229,10 +266,14 @@ class YOLODetector:
                 processed_data["drinking_detected"] = True
             processed_data["detections"].append(det)
 
+        processed_data["face_bbox"] = face_bbox
+        processed_data["face_bboxes"] = [d["bbox"] for d in face_boxes]
+        processed_data["face_count"] = len(face_boxes)
         processed_data["behavior_debug"] = {
             "raw_count": len(raw),
             "kept_count": len(final),
             "filtered_count": len(processed_data["filtered_out"]),
+            "face_count": len(face_boxes),
             "top_conf": {
                 name: max(
                     (d["confidence"] for d in raw if d["class_name"] == name),
@@ -288,9 +329,18 @@ class YOLODetector:
             x1, y1, x2, y2 = det["bbox"]
             cls_id = int(det["class_id"])
             conf = float(det["confidence"])
-            label = f"{det['class_name']} {conf:.2f}"
+            name = det["class_name"]
+            if cls_id == 0 and det.get("is_primary"):
+                label = f"face* {conf:.2f}"
+                thickness = 3
+            elif cls_id == 0:
+                label = f"face {conf:.2f}"
+                thickness = 1
+            else:
+                label = f"{name} {conf:.2f}"
+                thickness = 2
             color = colors[cls_id % len(colors)]
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
             text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
             cv2.rectangle(
                 img,

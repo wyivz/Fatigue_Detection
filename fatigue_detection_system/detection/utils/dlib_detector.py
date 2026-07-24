@@ -38,6 +38,8 @@ class DlibDetector:
         self.RIGHT_EYE_END = 47
         self.MOUTH_START = 48
         self.MOUTH_END = 67
+        # Cap faces per frame so EAR loop stays real-time with multiple people.
+        self.MAX_FACES = 4
 
         self.load_config()
 
@@ -58,7 +60,10 @@ class DlibDetector:
         from detection.models import SystemConfig
 
         self.EYE_AR_THRESH = 0.25
-        self.MOUTH_AR_THRESH = 0.5
+        # Outer-lip MAR: closed ~0.25–0.45, yawn typically >= 0.55–0.70
+        self.MOUTH_AR_THRESH = 0.55
+        self.MOUTH_REL_OPEN_THRESH = 0.12  # mouth vertical / nose-chin
+        self.MAX_FACES = 4
 
         try:
             eye_thresh_config = SystemConfig.objects.filter(config_key="eye_ar_thresh").first()
@@ -70,16 +75,31 @@ class DlibDetector:
             ).first()
             if mouth_thresh_config:
                 mar_th = float(mouth_thresh_config.config_value)
-                # 旧版外唇 MAR 默认 0.6，换内唇算法后过高，自动落到 0.5
-                if abs(mar_th - 0.6) < 1e-6:
-                    mar_th = 0.5
-                    mouth_thresh_config.config_value = "0.5"
+                # Migrate old inner-lip defaults (0.5) and prior outer default (0.6)
+                # to the calibrated outer-lip threshold.
+                if abs(mar_th - 0.5) < 1e-6 or abs(mar_th - 0.6) < 1e-6:
+                    mar_th = 0.55
+                    mouth_thresh_config.config_value = "0.55"
                     mouth_thresh_config.save(update_fields=["config_value"])
                 self.MOUTH_AR_THRESH = mar_th
 
+            rel_cfg = SystemConfig.objects.filter(config_key="mouth_rel_open_thresh").first()
+            if rel_cfg:
+                try:
+                    self.MOUTH_REL_OPEN_THRESH = max(
+                        0.05, min(0.35, float(rel_cfg.config_value))
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            max_faces_cfg = SystemConfig.objects.filter(config_key="dlib_max_faces").first()
+            if max_faces_cfg:
+                self.MAX_FACES = max(1, min(8, int(float(max_faces_cfg.config_value))))
+
             print(
                 f"已加载配置: EYE_AR_THRESH={self.EYE_AR_THRESH}, "
-                f"MOUTH_AR_THRESH={self.MOUTH_AR_THRESH}"
+                f"MOUTH_AR_THRESH={self.MOUTH_AR_THRESH}, "
+                f"MOUTH_REL={self.MOUTH_REL_OPEN_THRESH}, MAX_FACES={self.MAX_FACES}"
             )
         except Exception as e:  # noqa: BLE001
             print(f"加载配置失败: {e}")
@@ -137,70 +157,264 @@ class DlibDetector:
 
     def mouth_aspect_ratio(self, landmarks):
         """
-        Inner-lip MAR (more sensitive to yawns than outer-lip ratio).
-        Closed mouth ~0.05–0.30; yawn typically >= 0.45–0.50.
-        """
-        a = dist.euclidean(landmarks[61], landmarks[67])
-        b = dist.euclidean(landmarks[62], landmarks[66])
-        c = dist.euclidean(landmarks[63], landmarks[65])
-        d = dist.euclidean(landmarks[60], landmarks[64])
-        if d < 1e-6:
-            return 0.0
-        return (a + b + c) / (3.0 * d)
+        Outer-lip MAR (stable on mono / noisy industrial video).
 
-    def _analyze_landmarks(self, landmarks, results):
+        Uses three vertical outer-lip spans over mouth width:
+          (||p50-p58|| + ||p51-p57|| + ||p52-p56||) / (3 * ||p48-p54||)
+
+        Typical ranges: closed/talking ~0.25–0.50; yawn usually >= 0.55–0.70.
+        Inner-lip MAR was too noisy and caused false yawns.
+        """
+        v1 = dist.euclidean(landmarks[50], landmarks[58])
+        v2 = dist.euclidean(landmarks[51], landmarks[57])
+        v3 = dist.euclidean(landmarks[52], landmarks[56])
+        horiz = dist.euclidean(landmarks[48], landmarks[54])
+        if horiz < 1e-6:
+            return 0.0
+        return float((v1 + v2 + v3) / (3.0 * horiz))
+
+    def mouth_relative_open(self, landmarks):
+        """Vertical mouth opening normalized by nose-bridge → chin distance."""
+        open_px = dist.euclidean(landmarks[51], landmarks[57])
+        face_scale = dist.euclidean(landmarks[27], landmarks[8])
+        if face_scale < 1e-6:
+            # Fallback: jaw width
+            face_scale = dist.euclidean(landmarks[3], landmarks[13])
+        if face_scale < 1e-6:
+            return 0.0
+        return float(open_px / face_scale)
+
+    def is_yawn(self, landmarks, mar=None):
+        """
+        Yawn if outer MAR exceeds threshold AND absolute opening is large
+        relative to face size (filters talking / landmark jitter).
+        """
+        if mar is None:
+            mar = self.mouth_aspect_ratio(landmarks)
+        if mar <= float(self.MOUTH_AR_THRESH):
+            return False
+        rel = self.mouth_relative_open(landmarks)
+        return bool(rel >= float(self.MOUTH_REL_OPEN_THRESH))
+
+    def _metrics_from_landmarks(self, landmarks):
         left_eye = landmarks[self.LEFT_EYE_START : self.LEFT_EYE_END + 1]
         right_eye = landmarks[self.RIGHT_EYE_START : self.RIGHT_EYE_END + 1]
         ear = (self.eye_aspect_ratio(left_eye) + self.eye_aspect_ratio(right_eye)) / 2.0
-        results["eye_aspect_ratio"] = float(ear)
-
         mar = self.mouth_aspect_ratio(landmarks)
-        results["mouth_aspect_ratio"] = float(mar)
-        results["yawn_detected"] = bool(mar > self.MOUTH_AR_THRESH)
-
+        yawn = self.is_yawn(landmarks, mar=mar)
         if ear < self.EYE_AR_THRESH * 0.8:
             fatigue_level = 4
         elif ear < self.EYE_AR_THRESH:
-            fatigue_level = 3 if results["yawn_detected"] else 2
+            fatigue_level = 3 if yawn else 2
         else:
-            fatigue_level = 1 if results["yawn_detected"] else 0
-        results["fatigue_level"] = int(fatigue_level)
-        results["landmarks"] = landmarks
+            fatigue_level = 1 if yawn else 0
+        return {
+            "eye_aspect_ratio": float(ear),
+            "mouth_aspect_ratio": float(mar),
+            "mouth_rel_open": float(self.mouth_relative_open(landmarks)),
+            "yawn_detected": yawn,
+            "fatigue_level": int(fatigue_level),
+            "landmarks": landmarks,
+        }
+
+    def _analyze_landmarks(self, landmarks, results):
+        results.update(self._metrics_from_landmarks(landmarks))
+
+    @staticmethod
+    def _bbox_area(bbox):
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0, x2 - x1) * max(0, y2 - y1)
+
+    def _predict_one(self, gray, face_bbox, image_shape):
+        """Run predictor for one bbox; returns metrics dict or None."""
+        rect = self._bbox_to_rect(face_bbox, image_shape)
+        if rect is None or self.predictor is None:
+            return None
+        shape = self.predictor(gray, rect)
+        landmarks = np.zeros((68, 2), dtype=int)
+        for i in range(0, 68):
+            landmarks[i] = (shape.part(i).x, shape.part(i).y)
+        metrics = self._metrics_from_landmarks(landmarks)
+        metrics["bbox"] = [int(v) for v in face_bbox]
+        return metrics
+
+    def detect_fatigue_multi(self, image, face_bboxes=None, primary_bbox=None):
+        """
+        Run 68-point + EAR/MAR for multiple YOLO face boxes.
+
+        Returns aggregate fields for the primary face (largest / explicit) plus
+        a per-face `faces` list for drawing / UI. Tracker callers should only
+        feed the primary metrics into fatigue_tracker.
+        """
+        results = {
+            "faces_detected": 0,
+            "eye_aspect_ratio": None,
+            "mouth_aspect_ratio": None,
+            "yawn_detected": False,
+            "fatigue_level": 0,
+            "landmarks": None,
+            "faces": [],
+            "primary_index": None,
+        }
+
+        boxes = []
+        if face_bboxes:
+            for b in face_bboxes:
+                if b is None:
+                    continue
+                try:
+                    boxes.append([int(v) for v in b])
+                except (TypeError, ValueError):
+                    continue
+
+        # Prefer largest faces when over the cap
+        if len(boxes) > self.MAX_FACES:
+            boxes = sorted(boxes, key=self._bbox_area, reverse=True)[: self.MAX_FACES]
+
+        try:
+            with self._lock:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                face_entries = []
+
+                if boxes and self.predictor is not None:
+                    for bbox in boxes:
+                        one = self._predict_one(gray, bbox, image.shape)
+                        if one is not None:
+                            face_entries.append(one)
+                elif self.predictor is not None:
+                    hog_faces = list(self.detector(gray, 0))[: self.MAX_FACES]
+                    for rect in hog_faces:
+                        shape = self.predictor(gray, rect)
+                        landmarks = np.zeros((68, 2), dtype=int)
+                        for i in range(0, 68):
+                            landmarks[i] = (shape.part(i).x, shape.part(i).y)
+                        metrics = self._metrics_from_landmarks(landmarks)
+                        metrics["bbox"] = [
+                            int(rect.left()),
+                            int(rect.top()),
+                            int(rect.right()),
+                            int(rect.bottom()),
+                        ]
+                        face_entries.append(metrics)
+
+                results["faces_detected"] = len(face_entries)
+                if not face_entries:
+                    return results
+
+                primary_idx = 0
+                if primary_bbox is not None:
+                    try:
+                        pb = [int(v) for v in primary_bbox]
+                    except (TypeError, ValueError):
+                        pb = None
+                    if pb is not None:
+                        best_i, best_iou = 0, -1.0
+                        for i, ent in enumerate(face_entries):
+                            iou = self._bbox_iou(ent["bbox"], pb)
+                            if iou > best_iou:
+                                best_iou, best_i = iou, i
+                        primary_idx = best_i
+                else:
+                    primary_idx = max(
+                        range(len(face_entries)),
+                        key=lambda i: self._bbox_area(face_entries[i]["bbox"]),
+                    )
+
+                for i, ent in enumerate(face_entries):
+                    ent["is_primary"] = i == primary_idx
+                    # JSON-friendly landmarks for meta/UI
+                    ent["landmarks_list"] = [
+                        [int(x), int(y)] for x, y in ent["landmarks"]
+                    ]
+
+                results["faces"] = face_entries
+                results["primary_index"] = int(primary_idx)
+                primary = face_entries[primary_idx]
+                results["eye_aspect_ratio"] = primary["eye_aspect_ratio"]
+                results["mouth_aspect_ratio"] = primary["mouth_aspect_ratio"]
+                results["yawn_detected"] = primary["yawn_detected"]
+                results["fatigue_level"] = primary["fatigue_level"]
+                results["landmarks"] = primary["landmarks"]
+        except Exception as e:  # noqa: BLE001
+            print(f"多人疲劳检测异常: {e}")
+            results["eye_aspect_ratio"] = None
+            results["yawn_detected"] = False
+            results["fatigue_level"] = 0
+
+        return results
+
+    @staticmethod
+    def _bbox_iou(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = area_a + area_b - inter
+        return float(inter) / float(union) if union > 0 else 0.0
 
     def detect_fatigue(self, image, face_bbox=None):
         """
         Prefer external YOLO face_bbox for 68-point prediction when available.
         HOG is only used when no valid external box is provided.
         """
+        if face_bbox is not None:
+            multi = self.detect_fatigue_multi(
+                image, face_bboxes=[face_bbox], primary_bbox=face_bbox
+            )
+            return {
+                "faces_detected": multi.get("faces_detected") or 0,
+                "eye_aspect_ratio": multi.get("eye_aspect_ratio"),
+                "mouth_aspect_ratio": multi.get("mouth_aspect_ratio"),
+                "yawn_detected": bool(multi.get("yawn_detected")),
+                "fatigue_level": int(multi.get("fatigue_level") or 0),
+                "landmarks": multi.get("landmarks"),
+                "faces": multi.get("faces") or [],
+            }
+
         results = {
             "faces_detected": 0,
             "eye_aspect_ratio": None,
+            "mouth_aspect_ratio": None,
             "yawn_detected": False,
             "fatigue_level": 0,
             "landmarks": None,
+            "faces": [],
         }
 
         try:
             with self._lock:
-                faces = []
-                ext_rect = self._bbox_to_rect(face_bbox, image.shape)
-                if ext_rect is not None and self.predictor is not None:
-                    faces = [ext_rect]
-                else:
-                    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-                    faces = list(self.detector(gray, 0))
-
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                faces = list(self.detector(gray, 0))
                 results["faces_detected"] = len(faces)
 
                 if len(faces) > 0 and self.predictor is not None:
-                    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                     shape = self.predictor(gray, faces[0])
                     landmarks = np.zeros((68, 2), dtype=int)
                     for i in range(0, 68):
                         landmarks[i] = (shape.part(i).x, shape.part(i).y)
                     self._analyze_landmarks(landmarks, results)
+                    results["faces"] = [
+                        {
+                            **self._metrics_from_landmarks(landmarks),
+                            "bbox": [
+                                int(faces[0].left()),
+                                int(faces[0].top()),
+                                int(faces[0].right()),
+                                int(faces[0].bottom()),
+                            ],
+                            "is_primary": True,
+                        }
+                    ]
                 elif hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data"):
-                    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                     cascade_path = cv2.data.haarcascades + "haarcascade_eye.xml"
                     eye_cascade = cv2.CascadeClassifier(cascade_path)
                     eyes = eye_cascade.detectMultiScale(gray, 1.3, 5)
@@ -215,27 +429,89 @@ class DlibDetector:
 
         return results
 
-    def draw_landmarks(self, image, landmarks):
+    @staticmethod
+    def scale_landmarks(landmarks, src_wh, dst_wh):
+        """Remap 68-point landmarks from src (w,h) to dst (w,h)."""
+        if landmarks is None or src_wh is None or dst_wh is None:
+            return landmarks
+        try:
+            sw, sh = int(src_wh[0]), int(src_wh[1])
+            dw, dh = int(dst_wh[0]), int(dst_wh[1])
+        except (TypeError, ValueError, IndexError):
+            return landmarks
+        if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
+            return landmarks
+        if sw == dw and sh == dh:
+            return landmarks
+        pts = np.asarray(landmarks, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[1] < 2:
+            return landmarks
+        out = pts.copy()
+        out[:, 0] = out[:, 0] * (dw / float(sw))
+        out[:, 1] = out[:, 1] * (dh / float(sh))
+        return np.round(out).astype(int)
+
+    def draw_landmarks(self, image, landmarks, landmarks_size=None, color=(0, 255, 0)):
         if landmarks is None:
             return image
 
-        img = image.copy()
-        for x, y in landmarks:
-            cv2.circle(img, (x, y), 1, (0, 255, 0), -1)
+        # Allow drawing onto a shared buffer without forced copy
+        img = image
+        h, w = img.shape[:2]
+        pts = self.scale_landmarks(landmarks, landmarks_size, (w, h))
+        pts = np.asarray(pts, dtype=int)
+        for x, y in pts:
+            cv2.circle(img, (int(x), int(y)), 1, color, -1)
 
-        left_eye = landmarks[self.LEFT_EYE_START : self.LEFT_EYE_END + 1]
-        right_eye = landmarks[self.RIGHT_EYE_START : self.RIGHT_EYE_END + 1]
-        cv2.drawContours(img, [cv2.convexHull(left_eye)], -1, (0, 255, 0), 1)
-        cv2.drawContours(img, [cv2.convexHull(right_eye)], -1, (0, 255, 0), 1)
-        mouth = landmarks[self.MOUTH_START : self.MOUTH_END + 1]
-        cv2.drawContours(img, [cv2.convexHull(mouth)], -1, (0, 255, 0), 1)
+        left_eye = pts[self.LEFT_EYE_START : self.LEFT_EYE_END + 1]
+        right_eye = pts[self.RIGHT_EYE_START : self.RIGHT_EYE_END + 1]
+        cv2.drawContours(img, [cv2.convexHull(left_eye)], -1, color, 1)
+        cv2.drawContours(img, [cv2.convexHull(right_eye)], -1, color, 1)
+        mouth = pts[self.MOUTH_START : self.MOUTH_END + 1]
+        cv2.drawContours(img, [cv2.convexHull(mouth)], -1, color, 1)
         return img
 
     def draw_fatigue_results(self, image, results):
         img = image.copy()
+        lm_size = results.get("landmarks_size")
 
-        if results.get("landmarks") is not None:
-            img = self.draw_landmarks(img, results["landmarks"])
+        faces = results.get("faces") or []
+        if faces:
+            for ent in faces:
+                lm = ent.get("landmarks")
+                if lm is None:
+                    continue
+                # Primary: bright green; others: cyan
+                color = (0, 255, 0) if ent.get("is_primary") else (255, 255, 0)
+                self.draw_landmarks(img, lm, landmarks_size=lm_size, color=color)
+                ear = ent.get("eye_aspect_ratio")
+                bbox = ent.get("bbox")
+                if ear is not None and bbox is not None:
+                    try:
+                        x1, y1, _, _ = [int(v) for v in bbox]
+                        if lm_size is not None:
+                            scaled = self.scale_landmarks(
+                                [[x1, y1]], lm_size, (img.shape[1], img.shape[0])
+                            )
+                            x1, y1 = int(scaled[0][0]), int(scaled[0][1])
+                        tag = "P" if ent.get("is_primary") else ""
+                        cv2.putText(
+                            img,
+                            f"{tag}EAR:{float(ear):.2f}",
+                            (x1, max(15, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            color,
+                            1,
+                        )
+                    except (TypeError, ValueError, IndexError):
+                        pass
+        elif results.get("landmarks") is not None:
+            self.draw_landmarks(
+                img,
+                results["landmarks"],
+                landmarks_size=lm_size,
+            )
 
         if results.get("eye_aspect_ratio") is not None:
             ear = results["eye_aspect_ratio"]

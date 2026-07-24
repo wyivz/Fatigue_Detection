@@ -34,7 +34,7 @@ def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
     return {
         "eye_ar_thresh": _cfg_float(configs, "eye_ar_thresh", 0.25),
-        "mouth_ar_thresh": _cfg_float(configs, "mouth_ar_thresh", 0.5),
+        "mouth_ar_thresh": _cfg_float(configs, "mouth_ar_thresh", 0.55),
         "blink_max_ms": _cfg_int(configs, "blink_max_ms", 250),
         "microsleep_min_ms": _cfg_int(configs, "microsleep_min_ms", 500),
         "perclos_window_sec": max(5, _cfg_int(configs, "perclos_window_sec", 60)),
@@ -45,8 +45,8 @@ def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, A
         "behavior_window_frames": max(1, _cfg_int(configs, "behavior_window_frames", 5)),
         # Hysteresis band around EAR threshold to avoid flicker false closes
         "ear_hysteresis": _cfg_float(configs, "ear_hysteresis", 0.03),
-        # Yawn must persist this many ms before latching
-        "yawn_confirm_ms": _cfg_int(configs, "yawn_confirm_ms", 300),
+        # Yawn must persist this many ms before latching (filters talking)
+        "yawn_confirm_ms": _cfg_int(configs, "yawn_confirm_ms", 500),
         # How long a yawn latch stays after mouth closes
         "yawn_hold_ms": _cfg_int(configs, "yawn_hold_ms", 1200),
     }
@@ -63,6 +63,10 @@ class FatigueSnapshot:
     is_blink: bool = False
     faces_detected: int = 0
     landmarks: Any = None
+    # (w, h) of the image landmarks were computed on — needed to remap when drawing
+    landmarks_size: Optional[Tuple[int, int]] = None
+    # Per-face metrics/landmarks for multi-person drawing (alert still uses primary fields)
+    faces: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -88,6 +92,8 @@ class _SessionFatigueState:
     yawn_candidate_start: Optional[float] = None
     yawn_until: float = 0.0
     last_landmarks: Any = None
+    last_landmarks_size: Optional[Tuple[int, int]] = None
+    last_face_entries: Optional[List[Dict[str, Any]]] = None
     last_faces: int = 0
     config: Dict[str, Any] = field(default_factory=dict)
 
@@ -140,6 +146,8 @@ class FatigueTemporalTracker:
         yawn_detected: Optional[bool] = None,
         faces_detected: int = 0,
         landmarks: Any = None,
+        landmarks_size: Optional[Tuple[int, int]] = None,
+        faces: Optional[List[Dict[str, Any]]] = None,
         timestamp: Optional[float] = None,
     ) -> FatigueSnapshot:
         """Feed one EAR sample.
@@ -147,6 +155,8 @@ class FatigueTemporalTracker:
         - EAR uses hysteresis to avoid threshold flicker.
         - Normal blinks (<= blink_max_ms) do NOT count toward PERCLOS.
         - yawn_detected=None keeps prior yawn latch (EAR loop); True/False updates yawn FSM.
+        - landmarks_size=(w,h) should match the image used for landmark prediction.
+        - faces: optional multi-face list for drawing; alert metrics still use primary EAR.
         """
         t = time.time() if timestamp is None else float(timestamp)
         with self._lock:
@@ -155,6 +165,16 @@ class FatigueTemporalTracker:
             state.last_faces = int(faces_detected)
             if landmarks is not None:
                 state.last_landmarks = landmarks
+                if landmarks_size is not None:
+                    try:
+                        state.last_landmarks_size = (
+                            int(landmarks_size[0]),
+                            int(landmarks_size[1]),
+                        )
+                    except (TypeError, ValueError, IndexError):
+                        state.last_landmarks_size = None
+            if faces is not None:
+                state.last_face_entries = list(faces)
 
             if yawn_detected is not None:
                 self._update_yawn(state, bool(yawn_detected), t, cfg)
@@ -206,8 +226,8 @@ class FatigueTemporalTracker:
     def _update_yawn(
         self, state: _SessionFatigueState, raw_yawn: bool, t: float, cfg: Dict[str, Any]
     ) -> None:
-        confirm_ms = float(cfg.get("yawn_confirm_ms", 400))
-        hold_ms = float(cfg.get("yawn_hold_ms", 800))
+        confirm_ms = float(cfg.get("yawn_confirm_ms", 500))
+        hold_ms = float(cfg.get("yawn_hold_ms", 1200))
         if raw_yawn:
             if state.yawn_candidate_start is None:
                 state.yawn_candidate_start = t
@@ -215,7 +235,11 @@ class FatigueTemporalTracker:
                 state.last_yawn = True
                 state.yawn_until = t + hold_ms / 1000.0
         else:
-            state.yawn_candidate_start = None
+            # Brief dips during a real yawn should not reset the candidate immediately
+            if state.yawn_candidate_start is not None:
+                # Allow up to 150ms gap without clearing candidate
+                if (t - state.yawn_candidate_start) * 1000.0 > confirm_ms + 150.0:
+                    state.yawn_candidate_start = None
             if t >= state.yawn_until:
                 state.last_yawn = False
 
@@ -329,6 +353,8 @@ class FatigueTemporalTracker:
             is_blink=bool(is_blink),
             faces_detected=int(state.last_faces),
             landmarks=state.last_landmarks,
+            landmarks_size=state.last_landmarks_size,
+            faces=state.last_face_entries,
         )
 
 
