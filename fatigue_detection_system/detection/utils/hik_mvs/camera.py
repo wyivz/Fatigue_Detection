@@ -248,6 +248,10 @@ class HikCamera:
         except Exception:  # noqa: BLE001
             pass
 
+        # Default imaging: continuous auto exposure + continuous auto gain
+        # (runtime only unless user saves UserSet in MVS; applied every app open)
+        self._apply_default_auto_exposure_gain(cam, sdk)
+
         st_param = sdk.MVCC_INTVALUE()
         memset(byref(st_param), 0, sizeof(sdk.MVCC_INTVALUE))
         ret = cam.MV_CC_GetIntValue("PayloadSize", st_param)
@@ -261,6 +265,47 @@ class HikCamera:
         self._cam = cam
         self._sdk = sdk
         self._opened = True
+
+    @staticmethod
+    def _set_enum(cam, sdk, key: str, symbolic: str, numeric: int) -> bool:
+        """Try GenICam enum by name, then by numeric value. Returns True on success."""
+        try:
+            ret = cam.MV_CC_SetEnumValueByString(key, symbolic)
+            if ret == sdk.MV_OK:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ret = cam.MV_CC_SetEnumValue(key, numeric)
+            if ret == sdk.MV_OK:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _apply_default_auto_exposure_gain(self, cam, sdk) -> None:
+        """
+        Enable continuous auto exposure and continuous auto gain.
+
+        Hikrobot GenICam: ExposureAuto / GainAuto = Continuous (value 2).
+        Failures are ignored so unsupported nodes do not block open.
+        """
+        # MV_EXPOSURE_AUTO_MODE_CONTINUOUS = 2, MV_GAIN_MODE_CONTINUOUS = 2
+        continuous = 2
+        ok_exp = self._set_enum(cam, sdk, "ExposureAuto", "Continuous", continuous)
+        ok_gain = self._set_enum(cam, sdk, "GainAuto", "Continuous", continuous)
+        if not ok_gain:
+            # Some models expose Gain mode under a different node name
+            ok_gain = self._set_enum(cam, sdk, "Gain", "Continuous", continuous)
+        # Soft upper bound helps AE recover in dark scenes without crushing highlights
+        try:
+            cam.MV_CC_SetFloatValue("AutoExposureTimeUpperLimit", 20000.0)
+        except Exception:  # noqa: BLE001
+            try:
+                cam.MV_CC_SetIntValue("AutoExposureTimeUpperLimit", 20000)
+            except Exception:  # noqa: BLE001
+                pass
+        _ = (ok_exp, ok_gain)
 
     def start_grab(self) -> None:
         if not self._opened:
