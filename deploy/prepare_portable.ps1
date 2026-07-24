@@ -31,21 +31,34 @@ $OutApp = Join-Path $OutRoot "app"
 
 New-Item -ItemType Directory -Force -Path $RuntimePy | Out-Null
 
-Write-Host "1/5 Installing portable Python 3.8.10 ..."
-$p = Start-Process -FilePath $PythonInstaller -ArgumentList @(
-    "/quiet",
-    "InstallAllUsers=0",
-    "PrependPath=0",
-    "Include_launcher=0",
-    "Include_test=0",
-    "SimpleInstall=1",
-    "TargetDir=$RuntimePy"
-) -Wait -PassThru
-
+# Prefer copying the already-installed Python 3.8 (silent TargetDir is unreliable).
+$SystemPy = Join-Path $env:LOCALAPPDATA "Programs\Python\Python38"
 $PyExe = Join-Path $RuntimePy "python.exe"
-if (-not (Test-Path -LiteralPath $PyExe)) {
-    throw "Python install failed. ExitCode=$($p.ExitCode)"
+
+Write-Host "1/5 Preparing portable Python 3.8.10 ..."
+if (Test-Path -LiteralPath (Join-Path $SystemPy "python.exe")) {
+    Write-Host "Copying from $SystemPy ..."
+    cmd /c "robocopy `"$SystemPy`" `"$RuntimePy`" /E /XD __pycache__ /NFL /NDL /NJH /NJS /nc /ns /np"
+    if ($LASTEXITCODE -ge 8) { throw "robocopy Python failed: $LASTEXITCODE" }
+} else {
+    Write-Host "System Python38 not found, trying silent installer TargetDir..."
+    $p = Start-Process -FilePath $PythonInstaller -ArgumentList @(
+        "/quiet",
+        "InstallAllUsers=0",
+        "PrependPath=0",
+        "Include_launcher=0",
+        "Include_test=0",
+        "TargetDir=$RuntimePy"
+    ) -Wait -PassThru
+    if (-not (Test-Path -LiteralPath $PyExe)) {
+        throw "Python install failed. ExitCode=$($p.ExitCode)"
+    }
 }
+
+if (-not (Test-Path -LiteralPath $PyExe)) {
+    throw "Missing $PyExe"
+}
+& $PyExe --version
 Write-Host "Python OK: $PyExe"
 
 Write-Host "2/5 Copying venv (large, please wait) ..."
