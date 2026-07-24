@@ -4,7 +4,8 @@ SleepyDetect Portable Package
 Target PC requirements
 - Windows 10/11 (or industrial Windows), 64-bit
 - Install VC++ 2015-2022 x64 Redistributable if missing
-- For industrial GigE cameras: install Hikrobot MVS 4.4.0 (64-bit) with Runtime
+- For industrial GigE cameras: install Hikrobot MVS 4.6.3 (64-bit) with Runtime
+  (Camera SDK 4.7.1.x / same build as development PC)
 - Camera drivers working (for system webcam mode)
 - Path without Chinese characters (example: D:\SleepyDetect_Portable)
 

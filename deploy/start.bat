@@ -31,7 +31,7 @@ echo  SleepyDetect portable start
 echo  ROOT: %ROOT%
 echo  URL:  http://127.0.0.1:%PORT%/
 echo  Keep this window open
-echo  For GigE: install Hikrobot MVS 4.4 Runtime
+echo  For GigE: install Hikrobot MVS 4.6.3 Runtime
 echo ========================================
 
 cd /d "%ROOT%app"
