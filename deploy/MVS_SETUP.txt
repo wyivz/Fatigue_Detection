@@ -1,0 +1,13 @@
+Install Hikrobot MVS 4.4.0 (64-bit) on this development PC, then:
+
+1. Open MVS client, confirm GigE preview works, then CLOSE the client.
+2. (Optional) refresh Python bindings:
+     powershell -ExecutionPolicy Bypass -File .\deploy\copy_mvs_sdk.ps1
+   Note: project already vendors MvImport; re-apply DLL path patch if you overwrite MvCameraControl_class.py.
+3. Restart Django and open /detection/realtime/
+4. Choose "工业相机 (GigE / MVS)", refresh device list, Start.
+
+If DLL is not found, set:
+  set MVS_RUNTIME_DIR=C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64
+or
+  set HIK_CAMERA_SDK_MVS_LIBRARY=C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64\MvCameraControl.dll
