@@ -166,6 +166,9 @@
                             <th>#</th>
                             <th>时间</th>
                             <th>面部检测</th>
+                            <th>EAR</th>
+                            <th>PERCLOS</th>
+                            <th>闭眼ms</th>
                             <th>疲劳等级</th>
                             <th>不良行为</th>
                             <th>结果图像</th>
@@ -181,6 +184,27 @@
                                 <span class="badge bg-success">已检测</span>
                                 {% else %}
                                 <span class="badge bg-secondary">未检测</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.eye_aspect_ratio != None %}
+                                    {{ result.eye_aspect_ratio|floatformat:2 }}
+                                {% else %}
+                                    <span class="text-muted">-</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.perclos != None %}
+                                    {{ result.perclos|floatformat:1 }}%
+                                {% else %}
+                                    <span class="text-muted">-</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.eye_closed_ms != None %}
+                                    {{ result.eye_closed_ms }}
+                                {% else %}
+                                    <span class="text-muted">-</span>
                                 {% endif %}
                             </td>
                             <td>

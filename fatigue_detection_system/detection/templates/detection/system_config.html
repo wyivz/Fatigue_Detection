@@ -153,11 +153,20 @@
                             </div>
 
                             <div class="row mb-3">
-                                <label class="col-md-4 col-form-label">行为确认帧数</label>
+                                <label class="col-md-4 col-form-label">行为确认命中数 M</label>
                                 <div class="col-md-8">
                                     <input type="number" step="1" min="1" max="10" name="config_behavior_confirm_frames"
                                            class="form-control" value="{{ configs.behavior_confirm_frames|default:'2' }}">
-                                    <div class="form-text">抽烟/手机/喝水需连续检出该帧数才告警，用于抑制闪烁误报</div>
+                                    <div class="form-text">窗口内至少检出 M 次才告警（不再要求连续）</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">行为确认窗口 N</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="1" min="1" max="20" name="config_behavior_window_frames"
+                                           class="form-control" value="{{ configs.behavior_window_frames|default:'5' }}">
+                                    <div class="form-text">最近 N 次 YOLO 结果中统计命中；建议 N≥M，如 2/5</div>
                                 </div>
                             </div>
                         </div>
@@ -230,11 +239,73 @@
                             <h6 class="border-bottom pb-2">检测模型设置</h6>
                             
                             <div class="row mb-3">
-                                <label class="col-md-4 col-form-label">YOLO置信度阈值</label>
+                                <label class="col-md-4 col-form-label">YOLO全局置信度</label>
                                 <div class="col-md-8">
-                                    <input type="number" step="0.05" min="0.1" max="0.95" name="config_yolo_conf_thresh" 
-                                           class="form-control" value="{{ configs.yolo_conf_thresh|default:'0.5' }}">
-                                    <div class="form-text">YOLO检测的置信度阈值，建议值：0.5</div>
+                                    <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_thresh" 
+                                           class="form-control" value="{{ configs.yolo_conf_thresh|default:'0.3' }}">
+                                    <div class="form-text">黑白工业相机建议 0.25–0.35；过低可能误报</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">分档置信度 (烟/电话/水/脸)</label>
+                                <div class="col-md-8">
+                                    <div class="row g-2">
+                                        <div class="col-3">
+                                            <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_smoke"
+                                                   class="form-control" value="{{ configs.yolo_conf_smoke|default:'0.2' }}" title="smoke">
+                                        </div>
+                                        <div class="col-3">
+                                            <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_phone"
+                                                   class="form-control" value="{{ configs.yolo_conf_phone|default:'0.25' }}" title="phone">
+                                        </div>
+                                        <div class="col-3">
+                                            <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_water"
+                                                   class="form-control" value="{{ configs.yolo_conf_water|default:'0.25' }}" title="water">
+                                        </div>
+                                        <div class="col-3">
+                                            <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_face"
+                                                   class="form-control" value="{{ configs.yolo_conf_face|default:'0.35' }}" title="face">
+                                        </div>
+                                    </div>
+                                    <div class="form-text">顺序：抽烟 / 打电话 / 喝水 / 人脸</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">NMS IoU</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="0.05" min="0.1" max="0.95" name="config_yolo_iou_thresh"
+                                           class="form-control" value="{{ configs.yolo_iou_thresh|default:'0.5' }}">
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">YOLO imgsz</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="32" min="320" max="1280" name="config_yolo_imgsz"
+                                           class="form-control" value="{{ configs.yolo_imgsz|default:'640' }}">
+                                    <div class="form-text">推理输入边长；小目标可试 960</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">检测最大宽度</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="80" min="640" max="2560" name="config_yolo_detect_max_width"
+                                           class="form-control" value="{{ configs.yolo_detect_max_width|default:'1280' }}">
+                                    <div class="form-text">工业相机送入 YOLO 前的缩放上限（预览仍为 960）</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">贴脸几何过滤</label>
+                                <div class="col-md-8">
+                                    <div class="form-check form-switch mt-2">
+                                        <input class="form-check-input" type="checkbox" name="config_yolo_spatial_filter"
+                                               value="true" id="yoloSpatialFilter" {% if configs.yolo_spatial_filter != 'false' %}checked{% endif %}>
+                                        <label class="form-check-label" for="yoloSpatialFilter">行为框须靠近人脸（降误报）</label>
+                                    </div>
                                 </div>
                             </div>
                             

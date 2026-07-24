@@ -1171,6 +1171,28 @@
                 <span>${drinkingText}</span>
             </div>
         </div>`;
+
+        // 行为调试：raw conf / 过滤 / 确认进度
+        const dbg = result.behavior_debug || {};
+        const prog = result.confirm_progress || {};
+        const top = dbg.top_conf || {};
+        const fmtConf = (v) => (v === null || v === undefined) ? '-' : Number(v).toFixed(2);
+        const fmtProg = (key) => {
+            const p = prog[key];
+            if (!p) return '-';
+            return `${p.hits || 0}/${p.need || '?'} (N=${p.window || '?'})`;
+        };
+        let filterHint = '';
+        if (Array.isArray(dbg.filtered_out) && dbg.filtered_out.length) {
+            filterHint = dbg.filtered_out.slice(0, 3).map(f => `${f.class_name}:${f.reason || ''}`).join('; ');
+        }
+        detailsHTML += `<div class="result-item">
+            <div class="small text-muted">
+                YOLO raw conf 烟/话/水/脸: ${fmtConf(top.smoke)} / ${fmtConf(top.phone)} / ${fmtConf(top.water)} / ${fmtConf(top.face)}
+                <br>确认进度 烟/话/水: ${fmtProg('smoking')} | ${fmtProg('phone')} | ${fmtProg('drinking')}
+                ${filterHint ? `<br>已过滤: ${filterHint}` : ''}
+            </div>
+        </div>`;
         
         detectionDetails.innerHTML = detailsHTML;
         

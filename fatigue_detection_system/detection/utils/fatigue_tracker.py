@@ -40,7 +40,9 @@ def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, A
         "perclos_window_sec": max(5, _cfg_int(configs, "perclos_window_sec", 60)),
         "perclos_alert_pct": _cfg_float(configs, "perclos_alert_pct", 20.0),
         "ear_sample_interval_ms": max(50, _cfg_int(configs, "ear_sample_interval_ms", 100)),
+        # Hits required inside sliding window (M of N)
         "behavior_confirm_frames": max(1, _cfg_int(configs, "behavior_confirm_frames", 2)),
+        "behavior_window_frames": max(1, _cfg_int(configs, "behavior_window_frames", 5)),
         # Hysteresis band around EAR threshold to avoid flicker false closes
         "ear_hysteresis": _cfg_float(configs, "ear_hysteresis", 0.03),
         # Yawn must persist this many ms before latching

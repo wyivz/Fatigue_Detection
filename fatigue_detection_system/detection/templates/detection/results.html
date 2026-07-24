@@ -107,6 +107,8 @@
                             <th>#</th>
                             <th>时间</th>
                             <th>检测结果</th>
+                            <th>EAR</th>
+                            <th>PERCLOS</th>
                             <th>疲劳等级</th>
                             <th>图像</th>
                         </tr>
@@ -138,6 +140,20 @@
                                 {% endif %}
                             </td>
                             <td>
+                                {% if result.eye_aspect_ratio != None %}
+                                    {{ result.eye_aspect_ratio|floatformat:2 }}
+                                {% else %}
+                                    <span class="text-muted">-</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.perclos != None %}
+                                    {{ result.perclos|floatformat:1 }}%
+                                {% else %}
+                                    <span class="text-muted">-</span>
+                                {% endif %}
+                            </td>
+                            <td>
                                 {% if result.fatigue_level == 0 %}
                                     <span class="badge bg-success">正常</span>
                                 {% elif result.fatigue_level == 1 %}
@@ -162,7 +178,7 @@
                         </tr>
                         {% empty %}
                         <tr>
-                            <td colspan="5" class="text-center py-4">
+                            <td colspan="7" class="text-center py-4">
                                 <p class="mb-0 text-muted">暂无检测结果</p>
                             </td>
                         </tr>

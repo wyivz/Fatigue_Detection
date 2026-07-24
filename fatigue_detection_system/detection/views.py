@@ -363,7 +363,7 @@ def system_config(request):
         messages.error(request, '您没有访问此页面的权限')
         return redirect('detection:dashboard')
     
-    bool_keys = {'enable_voice', 'mono_camera_mode'}
+    bool_keys = {'enable_voice', 'mono_camera_mode', 'yolo_spatial_filter'}
 
     if request.method == 'POST':
         # 先收集 POST（同名 hidden+checkbox 取最后一个）

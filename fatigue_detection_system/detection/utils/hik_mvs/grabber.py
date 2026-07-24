@@ -36,12 +36,16 @@ class MvsGrabber:
         self._interval_ms = 500
         self._ear_interval_ms = 100
         self._preview_max_width = 960
+        self._detect_max_width = 1280
         self._preview_jpeg_quality = 70
         self._latest_bgr: Optional[np.ndarray] = None
         self._latest_face_bbox: Optional[List[int]] = None
         self._frame_seq = 0
         self._detect_busy = False
         self._timing_avg: Dict[str, float] = {}
+        self._last_fatigue_level = 0
+        self._last_yawn = False
+        self._event_save_cooldown_until = 0.0
         self.latest_jpeg: Optional[bytes] = None
         self.latest_meta: Dict[str, Any] = {}
         self.error: Optional[str] = None
@@ -80,6 +84,13 @@ class MvsGrabber:
             configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
             fcfg = load_fatigue_config(configs)
             self._ear_interval_ms = max(50, int(fcfg["ear_sample_interval_ms"]))
+            try:
+                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 1280))))
+            except (TypeError, ValueError):
+                self._detect_max_width = 1280
+            self._last_fatigue_level = 0
+            self._last_yawn = False
+            self._event_save_cooldown_until = 0.0
             fatigue_tracker.reset(session_id)
             behavior_tracker.reset(session_id)
             fatigue_tracker.configure(session_id, configs)
@@ -199,8 +210,14 @@ class MvsGrabber:
                 pass
 
     def _resize_for_preview(self, frame: np.ndarray) -> np.ndarray:
+        return self._resize_max_width(frame, self._preview_max_width)
+
+    def _resize_for_detect(self, frame: np.ndarray) -> np.ndarray:
+        return self._resize_max_width(frame, self._detect_max_width)
+
+    @staticmethod
+    def _resize_max_width(frame: np.ndarray, max_w: int) -> np.ndarray:
         h, w = frame.shape[:2]
-        max_w = self._preview_max_width
         if w <= max_w:
             return frame
         nh = int(h * (max_w / float(w)))
