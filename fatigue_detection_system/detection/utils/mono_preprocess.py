@@ -33,9 +33,9 @@ def load_mono_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     """Load mono-camera enhancement settings from SystemConfig or a dict."""
     if configs is None:
         try:
-            from detection.models import SystemConfig
+            from detection.utils.config_cache import get_configs
 
-            configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+            configs = get_configs()
         except Exception:  # noqa: BLE001
             configs = {}
 

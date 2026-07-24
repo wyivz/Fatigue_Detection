@@ -21,13 +21,23 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-# Prefer: set DJANGO_SECRET_KEY in the environment for any non-local deploy.
-SECRET_KEY = os.environ.get(
-    "DJANGO_SECRET_KEY",
-    "django-insecure-dev-only-change-me-before-deploy",
-)
+# Prefer: set DJANGO_SECRET_KEY in the environment. Otherwise persist a local key file.
+_SECRET_FILE = BASE_DIR / ".django_secret_key"
+if os.environ.get("DJANGO_SECRET_KEY"):
+    SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
+elif _SECRET_FILE.is_file():
+    SECRET_KEY = _SECRET_FILE.read_text(encoding="utf-8").strip()
+else:
+    from django.core.management.utils import get_random_secret_key
+
+    SECRET_KEY = get_random_secret_key()
+    try:
+        _SECRET_FILE.write_text(SECRET_KEY, encoding="utf-8")
+    except OSError:
+        SECRET_KEY = "django-insecure-dev-only-change-me-before-deploy"
 
 # SECURITY WARNING: don't run with debug turned on in production!
+# Packaged installs should set DJANGO_DEBUG=0 (install.ps1 / start.bat).
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
 ALLOWED_HOSTS = [
@@ -132,6 +142,7 @@ STATIC_URL = "static/"
 STATICFILES_DIRS = [
     os.path.join(BASE_DIR, 'static')
 ]
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 # 媒体文件配置
 MEDIA_URL = '/media/'

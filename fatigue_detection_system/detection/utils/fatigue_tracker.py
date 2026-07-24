@@ -26,9 +26,9 @@ def _cfg_int(configs: Dict[str, Any], key: str, default: int) -> int:
 def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if configs is None:
         try:
-            from detection.models import SystemConfig
+            from detection.utils.config_cache import get_configs
 
-            configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+            configs = get_configs()
         except Exception:  # noqa: BLE001
             configs = {}
 
@@ -90,6 +90,7 @@ class _SessionFatigueState:
     last_ear: Optional[float] = None
     last_yawn: bool = False
     yawn_candidate_start: Optional[float] = None
+    last_raw_yawn_t: Optional[float] = None
     yawn_until: float = 0.0
     last_landmarks: Any = None
     last_landmarks_size: Optional[Tuple[int, int]] = None
@@ -228,17 +229,19 @@ class FatigueTemporalTracker:
     ) -> None:
         confirm_ms = float(cfg.get("yawn_confirm_ms", 500))
         hold_ms = float(cfg.get("yawn_hold_ms", 1200))
+        gap_ms = 150.0
         if raw_yawn:
+            state.last_raw_yawn_t = t
             if state.yawn_candidate_start is None:
                 state.yawn_candidate_start = t
             elif (t - state.yawn_candidate_start) * 1000.0 >= confirm_ms:
                 state.last_yawn = True
                 state.yawn_until = t + hold_ms / 1000.0
         else:
-            # Brief dips during a real yawn should not reset the candidate immediately
+            # Clear candidate only after a real gap since last positive raw sample
             if state.yawn_candidate_start is not None:
-                # Allow up to 150ms gap without clearing candidate
-                if (t - state.yawn_candidate_start) * 1000.0 > confirm_ms + 150.0:
+                last_pos = state.last_raw_yawn_t
+                if last_pos is None or (t - last_pos) * 1000.0 > gap_ms:
                     state.yawn_candidate_start = None
             if t >= state.yawn_until:
                 state.last_yawn = False
@@ -256,9 +259,12 @@ class FatigueTemporalTracker:
         blink_max = float(cfg["blink_max_ms"])
         microsleep_min = float(cfg["microsleep_min_ms"])
 
-        # Only non-blink closures contribute to PERCLOS
+        # Only non-blink closures contribute to PERCLOS; store the portion
+        # beyond blink_max so ongoing/closed math stay consistent.
         if duration_ms > blink_max:
-            state.closed_segments.append(_ClosedSegment(start=start, end=end_t))
+            seg_start = start + blink_max / 1000.0
+            if end_t > seg_start:
+                state.closed_segments.append(_ClosedSegment(start=seg_start, end=end_t))
 
         if duration_ms >= microsleep_min:
             state.recent_microsleep_until = end_t + self._MICROSLEEP_HOLD_SEC

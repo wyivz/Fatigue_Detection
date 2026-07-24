@@ -73,15 +73,33 @@ class DlibDetector:
             mouth_thresh_config = SystemConfig.objects.filter(
                 config_key="mouth_ar_thresh"
             ).first()
+            migrated = SystemConfig.objects.filter(
+                config_key="mouth_ar_migrated_v2"
+            ).first()
             if mouth_thresh_config:
                 mar_th = float(mouth_thresh_config.config_value)
-                # Migrate old inner-lip defaults (0.5) and prior outer default (0.6)
-                # to the calibrated outer-lip threshold.
-                if abs(mar_th - 0.5) < 1e-6 or abs(mar_th - 0.6) < 1e-6:
+                # One-shot migration from old inner-lip / legacy defaults
+                if migrated is None and (
+                    abs(mar_th - 0.5) < 1e-6 or abs(mar_th - 0.6) < 1e-6
+                ):
                     mar_th = 0.55
                     mouth_thresh_config.config_value = "0.55"
                     mouth_thresh_config.save(update_fields=["config_value"])
+                    SystemConfig.objects.update_or_create(
+                        config_key="mouth_ar_migrated_v2",
+                        defaults={"config_value": "1"},
+                    )
+                elif migrated is None:
+                    SystemConfig.objects.update_or_create(
+                        config_key="mouth_ar_migrated_v2",
+                        defaults={"config_value": "1"},
+                    )
                 self.MOUTH_AR_THRESH = mar_th
+            elif migrated is None:
+                SystemConfig.objects.update_or_create(
+                    config_key="mouth_ar_migrated_v2",
+                    defaults={"config_value": "1"},
+                )
 
             rel_cfg = SystemConfig.objects.filter(config_key="mouth_rel_open_thresh").first()
             if rel_cfg:
@@ -241,13 +259,17 @@ class DlibDetector:
         metrics["bbox"] = [int(v) for v in face_bbox]
         return metrics
 
-    def detect_fatigue_multi(self, image, face_bboxes=None, primary_bbox=None):
+    def detect_fatigue_multi(
+        self, image, face_bboxes=None, primary_bbox=None, allow_hog=True
+    ):
         """
         Run 68-point + EAR/MAR for multiple YOLO face boxes.
 
         Returns aggregate fields for the primary face (largest / explicit) plus
         a per-face `faces` list for drawing / UI. Tracker callers should only
         feed the primary metrics into fatigue_tracker.
+
+        allow_hog=False: never fall back to HOG when boxes are empty (MVS path).
         """
         results = {
             "faces_detected": 0,
@@ -261,7 +283,7 @@ class DlibDetector:
         }
 
         boxes = []
-        if face_bboxes:
+        if face_bboxes is not None:
             for b in face_bboxes:
                 if b is None:
                     continue
@@ -284,7 +306,7 @@ class DlibDetector:
                         one = self._predict_one(gray, bbox, image.shape)
                         if one is not None:
                             face_entries.append(one)
-                elif self.predictor is not None:
+                elif allow_hog and self.predictor is not None:
                     hog_faces = list(self.detector(gray, 0))[: self.MAX_FACES]
                     for rect in hog_faces:
                         shape = self.predictor(gray, rect)

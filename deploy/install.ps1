@@ -7,7 +7,7 @@
 #   -CudaIndex cu121   Online-only torch index (ignored when OFFLINE.flag present)
 #   -SkipMigrate       Skip Django migrate
 #   -AdminUser xxx     Default admin username (default: admin)
-#   -AdminPass xxx     Default admin password (default: ChangeMeNow!)
+#   -AdminPass xxx     Admin password (default: auto-generate into ADMIN_CREDENTIALS.txt)
 #   -AllowOnline       Even if OFFLINE.flag exists, allow PyPI fallback (not recommended)
 
 param(
@@ -16,7 +16,7 @@ param(
     [string]$CudaIndex = "cu121",
     [switch]$SkipMigrate,
     [string]$AdminUser = "admin",
-    [string]$AdminPass = "ChangeMeNow!",
+    [string]$AdminPass = "",
     [switch]$AllowOnline
 )
 
@@ -277,12 +277,22 @@ if ($strictOffline -or $hasLocalTorch) {
 }
 
 # Force clean ultralytics install (USB/copy corruption often leaves null-bytes in .py files)
-Write-Host "Reinstalling ultralytics cleanly from wheels ..."
-& $VenvPy -m pip install --force-reinstall --no-deps --no-index --find-links $WheelsDir "ultralytics==8.3.40"
-if ($LASTEXITCODE -ne 0) {
-    & $VenvPy -m pip install --force-reinstall --no-deps --no-index --find-links $WheelsDir ultralytics
+$ultraWheels = @(Get-ChildItem -LiteralPath $WheelsDir -Filter "ultralytics*.whl" -ErrorAction SilentlyContinue)
+if ($ultraWheels.Count -gt 0) {
+    Write-Host "Reinstalling ultralytics cleanly from wheels ..."
+    & $VenvPy -m pip install --force-reinstall --no-deps --no-index --find-links $WheelsDir "ultralytics==8.3.40"
+    if ($LASTEXITCODE -ne 0) {
+        & $VenvPy -m pip install --force-reinstall --no-deps --no-index --find-links $WheelsDir ultralytics
+    }
+    Assert-Ok "pip reinstall ultralytics (wheels)"
+} else {
+    Write-Host "No ultralytics wheel in wheels\; ensuring install from PyPI / prior requirements ..."
+    & $VenvPy -m pip install --force-reinstall --no-deps "ultralytics==8.3.40"
+    if ($LASTEXITCODE -ne 0) {
+        & $VenvPy -m pip install --force-reinstall --no-deps ultralytics
+    }
+    Assert-Ok "pip reinstall ultralytics (online)"
 }
-Assert-Ok "pip reinstall ultralytics"
 
 $ultraCheck = & $VenvPy -c "from ultralytics import YOLO; import ultralytics; print('ultralytics', ultralytics.__version__, 'ok')"
 if ($LASTEXITCODE -ne 0) {
@@ -300,8 +310,26 @@ if ($verifyOut -match "True") {
 if ($ForceCpu) { $useCuda = $false }
 
 Write-Step "6/6 Django migrate + admin"
+if (-not $AdminPass) {
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $bytes = New-Object byte[] 9
+    $rng.GetBytes($bytes)
+    $AdminPass = ([Convert]::ToBase64String($bytes) -replace '[+/=]', 'x').Substring(0, 12)
+    $credFile = Join-Path $Root "ADMIN_CREDENTIALS.txt"
+    @"
+SleepyDetect admin credentials (local only — do not share)
+username: $AdminUser
+password: $AdminPass
+generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+"@ | Set-Content -LiteralPath $credFile -Encoding UTF8
+    Write-Host "Generated admin password -> $credFile" -ForegroundColor Yellow
+}
+
 Push-Location -LiteralPath $AppDir
 try {
+    # Prefer packaged (non-debug) runtime unless user overrides
+    if (-not $env:DJANGO_DEBUG) { $env:DJANGO_DEBUG = "0" }
+
     if (-not $SkipMigrate) {
         & $VenvPy manage.py migrate --noinput
         Assert-Ok "migrate"

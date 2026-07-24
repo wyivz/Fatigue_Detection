@@ -211,27 +211,11 @@ class MvsGrabber:
             self._complete_session(session_id)
 
     def status(self) -> Dict[str, Any]:
+        """Read-only status snapshot (no tracker side effects)."""
         with self._lock:
             now = time.time()
             warming = bool(self.running and now < float(self._warmup_until or 0.0))
             remain = max(0.0, float(self._warmup_until or 0.0) - now) if warming else 0.0
-            if self.running and (not warming) and (not self._warmup_ui_cleared):
-                self._warmup_ui_cleared = True
-                sid = self._session_id
-                if sid is not None:
-                    try:
-                        from detection.utils.fatigue_tracker import (
-                            behavior_tracker,
-                            fatigue_tracker,
-                        )
-
-                        fatigue_tracker.reset(sid)
-                        behavior_tracker.reset(sid)
-                        self._last_fatigue_level = 0
-                        self._last_yawn = False
-                        self._pending_fatigue_event = False
-                    except Exception:  # noqa: BLE001
-                        pass
             meta = dict(self.latest_meta)
             if warming:
                 meta = {
@@ -369,10 +353,40 @@ class MvsGrabber:
 
             last_seq = seq
             try:
+                # One-shot post-warmup clear (moved out of status() to avoid poll side effects)
+                if (not in_warmup) and (not self._warmup_ui_cleared):
+                    with self._lock:
+                        if not self._warmup_ui_cleared:
+                            self._warmup_ui_cleared = True
+                            self._last_fatigue_level = 0
+                            self._last_yawn = False
+                            self._pending_fatigue_event = False
+                    try:
+                        from detection.utils.fatigue_tracker import (
+                            behavior_tracker,
+                            fatigue_tracker as _ft,
+                        )
+
+                        _ft.reset(session_id)
+                        behavior_tracker.reset(session_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 if dlib_detector is not None:
                     with compute_scheduler.ear_context():
                         # Must match YOLO / persist frame size so landmarks overlay correctly.
                         sample = self._resize_for_detect(frame)
+                        try:
+                            from detection.utils.mono_preprocess import (
+                                enhance_for_mono,
+                                load_mono_config,
+                            )
+
+                            if load_mono_config().get("enabled"):
+                                sample = enhance_for_mono(sample)
+                        except Exception:  # noqa: BLE001
+                            pass
+
                         fh, fw = frame.shape[:2]
                         sh, sw = sample.shape[:2]
                         sx = sw / float(fw) if fw > 0 and sw != fw else 1.0
@@ -397,12 +411,26 @@ class MvsGrabber:
                             scaled_boxes = [scaled_primary]
 
                         t_ear = time.perf_counter()
-                        dlib_results = dlib_detector.detect_fatigue_multi(
-                            sample,
-                            face_bboxes=scaled_boxes or None,
-                            primary_bbox=scaled_primary,
-                        )
-                        ear_cost = (time.perf_counter() - t_ear) * 1000.0
+                        if not scaled_boxes:
+                            # No YOLO face: do not HOG-fallback; clear fatigue sample
+                            dlib_results = {
+                                "faces_detected": 0,
+                                "eye_aspect_ratio": None,
+                                "mouth_aspect_ratio": None,
+                                "yawn_detected": False,
+                                "fatigue_level": 0,
+                                "landmarks": None,
+                                "faces": [],
+                            }
+                            ear_cost = (time.perf_counter() - t_ear) * 1000.0
+                        else:
+                            dlib_results = dlib_detector.detect_fatigue_multi(
+                                sample,
+                                face_bboxes=scaled_boxes,
+                                primary_bbox=scaled_primary,
+                                allow_hog=False,
+                            )
+                            ear_cost = (time.perf_counter() - t_ear) * 1000.0
 
                     # Warmup: run models for cache, but do not feed trackers / UI state
                     if in_warmup:
@@ -416,7 +444,7 @@ class MvsGrabber:
                             self.latest_meta = meta
                     else:
                         faces_n = int(dlib_results.get("faces_detected") or 0)
-                        if faces_n <= 0 and scaled_primary is not None:
+                        if faces_n <= 0 and scaled_boxes:
                             faces_n = 1 if dlib_results.get("landmarks") is not None else 0
 
                         lm = dlib_results.get("landmarks")
@@ -452,7 +480,7 @@ class MvsGrabber:
                         with self._lock:
                             prev_level = self._last_fatigue_level
                             prev_yawn = self._last_yawn
-                            rising_fatigue = prev_level < 2 <= level
+                            rising_fatigue = level > prev_level and level >= 2
                             rising_yawn = (not prev_yawn) and yawn
                             if rising_fatigue or rising_yawn:
                                 self._pending_fatigue_event = True
@@ -608,8 +636,14 @@ class MvsGrabber:
                             scaled_all.append(fb)
                     if scaled_all:
                         self._latest_face_bboxes = scaled_all
-                    elif self._latest_face_bbox is not None:
+                        if self._latest_face_bbox is None:
+                            self._latest_face_bbox = list(scaled_all[0])
+                    elif face_bbox is not None and self._latest_face_bbox is not None:
                         self._latest_face_bboxes = [list(self._latest_face_bbox)]
+                    else:
+                        # No faces this frame — clear caches so EAR does not track ghosts
+                        self._latest_face_bboxes = []
+                        self._latest_face_bbox = None
 
                     prev = dict(self.latest_meta or {})
                     prev_timing = dict(prev.get("timing") or {})

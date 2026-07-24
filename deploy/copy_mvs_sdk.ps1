@@ -1,4 +1,4 @@
-# After installing Hikrobot MVS 4.4 on this PC, optionally refresh MvImport from Samples.
+# After installing Hikrobot MVS 4.6.x on this PC, optionally refresh MvImport from Samples.
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\deploy\copy_mvs_sdk.ps1
 
@@ -16,7 +16,7 @@ foreach ($c in $candidates) {
     if (Test-Path -LiteralPath $c) { $src = $c; break }
 }
 if (-not $src) {
-    throw "MVS Samples MvImport not found. Install MVS 4.4 first."
+    throw "MVS Samples MvImport not found. Install MVS 4.6.x first."
 }
 
 Write-Host "Copy from: $src"

@@ -51,19 +51,56 @@ def _bbox_area(bbox: List[int]) -> float:
     return max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
 
 
-def pick_primary_face(face_boxes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def pick_primary_face(
+    face_boxes: List[Dict[str, Any]],
+    sticky_bbox: Optional[List[int]] = None,
+    iou_keep: float = 0.25,
+    area_switch_ratio: float = 1.35,
+) -> Optional[Dict[str, Any]]:
     """
     Choose the primary monitored face when multiple faces appear.
 
-    Prefer the largest box (closest to camera / intended driver). Ties break by
-    higher confidence.
+    Prefer the largest box, but keep the previous primary when IoU is decent
+    unless another face is clearly larger (area_switch_ratio).
     """
     if not face_boxes:
         return None
-    return max(
+    largest = max(
         face_boxes,
         key=lambda d: (_bbox_area(d["bbox"]), float(d.get("confidence") or 0.0)),
     )
+    if sticky_bbox is None:
+        return largest
+
+    best_iou = -1.0
+    sticky_match = None
+    for d in face_boxes:
+        iou = _bbox_iou(d["bbox"], sticky_bbox)
+        if iou > best_iou:
+            best_iou = iou
+            sticky_match = d
+    if sticky_match is None or best_iou < float(iou_keep):
+        return largest
+
+    # Stick unless another face is substantially larger
+    if _bbox_area(largest["bbox"]) >= _bbox_area(sticky_match["bbox"]) * float(area_switch_ratio):
+        return largest
+    return sticky_match
+
+
+def _bbox_iou(a: List[int], b: List[int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter) / float(union) if union > 0 else 0.0
 
 
 class YOLODetector:
@@ -79,10 +116,11 @@ class YOLODetector:
         self.model = _yolo_cls()(weights_path)
         self._apply_runtime_params()
         self.class_names = list(self.CLASS_NAMES)
+        self._sticky_primary_bbox: Optional[List[int]] = None
 
     def load_config(self):
-        from detection.models import SystemConfig
         from detection.utils.compute_scheduler import compute_scheduler
+        from detection.utils.config_cache import get_configs
 
         self.conf_thresh = 0.5
         self.iou_thresh = 0.5
@@ -98,7 +136,7 @@ class YOLODetector:
         self.near_face_ratio = 1.2  # max center distance in face-diag units
 
         try:
-            configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+            configs = get_configs(force=True)
             compute_scheduler.configure(configs)
             self.conf_thresh = _cfg_float(configs, "yolo_conf_thresh", 0.5)
             self.iou_thresh = _cfg_float(configs, "yolo_iou_thresh", 0.5)
@@ -231,8 +269,9 @@ class YOLODetector:
             kept.append(det)
 
         face_boxes = [d for d in kept if d["class_id"] == 0]
-        primary = pick_primary_face(face_boxes)
+        primary = pick_primary_face(face_boxes, sticky_bbox=self._sticky_primary_bbox)
         face_bbox = primary["bbox"] if primary is not None else None
+        self._sticky_primary_bbox = list(face_bbox) if face_bbox is not None else None
 
         final: List[Dict[str, Any]] = []
         for det in kept:

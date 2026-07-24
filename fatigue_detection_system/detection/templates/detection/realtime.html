@@ -324,10 +324,37 @@
 
 {% block extra_js %}
 <script>
+    // CSRF for all jQuery POST (Django cookie)
+    function getCookie(name) {
+        let cookieValue = null;
+        if (document.cookie && document.cookie !== '') {
+            const cookies = document.cookie.split(';');
+            for (let i = 0; i < cookies.length; i++) {
+                const cookie = cookies[i].trim();
+                if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                    cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                    break;
+                }
+            }
+        }
+        return cookieValue;
+    }
+    const csrftoken = getCookie('csrftoken');
+    $.ajaxSetup({
+        beforeSend: function(xhr, settings) {
+            if (!/^(GET|HEAD|OPTIONS|TRACE)$/i.test(settings.type) && !this.crossDomain) {
+                xhr.setRequestHeader('X-CSRFToken', csrftoken);
+            }
+        }
+    });
+
     // 会话ID
     const sessionId = {{ session.id }};
     const detectionIntervalMs = {{ detection_interval|default:500 }};
     const earSampleIntervalMs = {{ ear_sample_interval_ms|default:100 }};
+    const perclosAlertPct = {{ perclos_alert_pct|default:20 }};
+    const enableVoice = {{ enable_voice|yesno:"true,false" }};
+    const fatigueAlertLevel = {{ fatigue_alert_level|default:2 }};
     
     // DOM元素
     const videoElement = document.getElementById('video-stream');
@@ -805,6 +832,7 @@
                 mvsPreviewImg.style.display = 'none';
                 mvsPreviewImg.removeAttribute('src');
                 videoElement.style.display = 'block';
+                videoElement.style.visibility = 'visible';
                 stream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         deviceId: { exact: deviceValue },
@@ -815,10 +843,13 @@
                 });
                 videoElement.srcObject = stream;
                 canvasElement.style.display = 'none';
-                await $.post("{% url 'detection:start_detection' %}", {
+                const startResp = await $.post("{% url 'detection:start_detection' %}", {
                     session_id: sessionId,
                     source_type: 'browser'
                 });
+                if (startResp.status !== 'success') {
+                    throw new Error(startResp.message || '启动检测会话失败');
+                }
                 startDetectionLoop();
             }
         } catch (error) {
@@ -883,8 +914,10 @@
         mvsPreviewImg.removeAttribute('src');
         mvsPreviewImg.style.display = 'none';
         videoElement.style.display = 'block';
+        videoElement.style.visibility = 'visible';
         
         canvasElement.style.display = 'none';
+        canvasElement.getContext('2d').clearRect(0, 0, canvasElement.width || 0, canvasElement.height || 0);
         
         isDetecting = false;
         isRequestInFlight = false;
@@ -1080,7 +1113,7 @@
         if (level >= 3) {
             fatigueLevel.style.backgroundColor = '#F44336'; // 红色
 
-            const alertLevel = {{ fatigue_alert_level|default:3 }};
+            const alertLevel = fatigueAlertLevel;
             if (level >= alertLevel && alertSound.checked) {
                 const nowMs = Date.now();
                 if (nowMs - lastFatigueAlertAt >= FATIGUE_ALERT_COOLDOWN_MS) {
@@ -1148,7 +1181,7 @@
         let perclosWarning = false;
         if (result.perclos !== null && result.perclos !== undefined) {
             perclosText = Number(result.perclos).toFixed(1) + '%';
-            perclosWarning = Number(result.perclos) >= 15;
+            perclosWarning = Number(result.perclos) >= perclosAlertPct;
         }
         let closedText = '—';
         if (result.eye_closed_ms !== null && result.eye_closed_ms !== undefined) {
@@ -1300,6 +1333,9 @@
     
     // 播放警告音效
     function playAlertSound(type = 'alert') {
+        if (!enableVoice || !alertSound.checked) {
+            return;
+        }
         if (!audioInitialized) {
             console.error('音频未初始化');
             return;

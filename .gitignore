@@ -23,6 +23,10 @@ __MACOSX/
 # Django local runtime
 *.sqlite3
 fatigue_detection_system/db.sqlite3
+fatigue_detection_system/.django_secret_key
+fatigue_detection_system/staticfiles/
+ADMIN_CREDENTIALS.txt
+**/ADMIN_CREDENTIALS.txt
 fatigue_detection_system/media/results/*
 !fatigue_detection_system/media/results/.gitkeep
 fatigue_detection_system/media/uploads/*

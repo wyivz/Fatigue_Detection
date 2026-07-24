@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse, HttpResponse
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.contrib import messages
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -104,7 +104,9 @@ def dashboard(request):
     
     return render(request, 'detection/dashboard.html', context)
 
+
 @login_required
+@ensure_csrf_cookie
 def realtime_detection(request):
     """
     实时检测页面，使用摄像头
@@ -121,12 +123,13 @@ def realtime_detection(request):
     for config in system_configs:
         configs[config.config_key] = config.config_value
     
-    # 设置默认配置
-    fatigue_alert_level = int(configs.get('fatigue_alert_level', 3))
+    # 设置默认配置（与 system_config 默认对齐：中度疲劳=2）
+    fatigue_alert_level = int(configs.get('fatigue_alert_level', 2))
     alert_volume = int(configs.get('alert_volume', 80))
-    enable_voice = configs.get('enable_voice') == 'true'
+    enable_voice = configs.get('enable_voice', 'true') == 'true'
     detection_interval = int(configs.get('detection_interval', 500))
     ear_sample_interval_ms = int(configs.get('ear_sample_interval_ms', 100))
+    perclos_alert_pct = float(configs.get('perclos_alert_pct', 20))
     default_source_type = configs.get('default_source_type', 'mvs')
     default_mvs_index = int(configs.get('default_mvs_index', 0))
     
@@ -137,6 +140,7 @@ def realtime_detection(request):
         'enable_voice': enable_voice,
         'detection_interval': detection_interval,
         'ear_sample_interval_ms': ear_sample_interval_ms,
+        'perclos_alert_pct': perclos_alert_pct,
         'default_source_type': default_source_type,
         'default_mvs_index': default_mvs_index,
     }
@@ -383,6 +387,20 @@ def system_config(request):
                 config_key=config_key,
                 defaults={'config_value': value},
             )
+
+        try:
+            from .utils.config_cache import invalidate
+            invalidate()
+        except Exception:  # noqa: BLE001
+            pass
+        # Reload live detectors so new thresholds apply without restart
+        try:
+            if yolo_detector is not None:
+                yolo_detector.load_config()
+            if dlib_detector is not None:
+                dlib_detector.load_config()
+        except Exception:  # noqa: BLE001
+            pass
         
         messages.success(request, '系统配置已更新')
         return redirect('detection:system_config')
@@ -396,7 +414,6 @@ def system_config(request):
     
     return render(request, 'detection/system_config.html', {'configs': configs_dict})
 
-@csrf_exempt
 @login_required
 def start_detection(request):
     """
@@ -455,6 +472,14 @@ def start_detection(request):
                     )
                 except Exception as exc:  # noqa: BLE001
                     return JsonResponse({'status': 'error', 'message': str(exc)})
+            else:
+                # Browser / webcam: ensure leftover MVS grabber is released
+                try:
+                    from .utils.hik_mvs.grabber import mvs_grabber
+                    if mvs_grabber.running:
+                        mvs_grabber.stop(complete_session=False)
+                except Exception:  # noqa: BLE001
+                    pass
             return JsonResponse({
                 'status': 'success',
                 'session_id': session.id,
@@ -466,7 +491,6 @@ def start_detection(request):
     return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
 
 
-@csrf_exempt
 @login_required
 def reset_fatigue(request):
     """API: 用户确认疲劳告警后，清空 PERCLOS/微睡/哈欠累计，避免历史拖累后续判断。"""
@@ -492,6 +516,7 @@ def reset_fatigue(request):
             if mvs_grabber._session_id == session.id:
                 mvs_grabber._last_fatigue_level = 0
                 mvs_grabber._last_yawn = False
+                mvs_grabber._pending_fatigue_event = False
     except Exception:  # noqa: BLE001
         pass
     return JsonResponse({
@@ -505,7 +530,6 @@ def reset_fatigue(request):
     })
 
 
-@csrf_exempt
 @login_required
 def stop_detection(request):
     """
@@ -555,8 +579,14 @@ def mvs_status(request):
     """API: MVS grabber status + latest detection meta."""
     from .utils.hik_mvs.grabber import mvs_grabber
     session_id = request.GET.get('session_id')
+    if not session_id:
+        return JsonResponse({'status': 'error', 'message': '缺少会话ID'}, status=400)
+    try:
+        session = DetectionSession.objects.get(id=session_id, user=request.user)
+    except DetectionSession.DoesNotExist:
+        return JsonResponse({'status': 'error', 'message': '无效的会话ID'}, status=404)
     st = mvs_grabber.status()
-    if session_id and st.get('session_id') and int(session_id) != int(st['session_id']):
+    if st.get('session_id') and int(st['session_id']) != int(session.id):
         return JsonResponse({'status': 'error', 'message': '会话与采集器不匹配'}, status=400)
     return JsonResponse({'status': 'success', **st})
 
@@ -604,7 +634,6 @@ def mvs_preview(request):
     )
     return response
 
-@csrf_exempt
 @login_required
 def get_result(request):
     """
@@ -787,7 +816,8 @@ def process_image(
         'total_ms': 0.0,
     }
     results = {'status': 'success', 'face_bbox': None}
-    configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+    from .utils.config_cache import get_configs
+    configs = get_configs()
     mono_cfg = load_mono_config(configs)
 
     face_bbox = None

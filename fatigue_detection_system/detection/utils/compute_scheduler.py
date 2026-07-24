@@ -128,13 +128,13 @@ class ComputeScheduler:
         return plan
 
     def _apply_global_defaults(self) -> None:
-        """Baseline process limits (overridden inside worker contexts)."""
+        """Set process thread pools once (avoid per-inference races)."""
         plan = self.plan
+        total = max(1, min(plan.cpu_count, plan.yolo_threads + plan.ear_threads))
         try:
             import torch
 
-            # Leave headroom; per-context will tighten further.
-            torch.set_num_threads(max(1, plan.cpu_count))
+            torch.set_num_threads(total)
             try:
                 torch.set_num_interop_threads(max(1, min(2, plan.cpu_count // 2 or 1)))
             except RuntimeError:
@@ -145,7 +145,7 @@ class ComputeScheduler:
         try:
             import cv2
 
-            cv2.setNumThreads(max(1, plan.opencv_ear_threads))
+            cv2.setNumThreads(max(1, min(4, plan.opencv_yolo_threads + plan.opencv_ear_threads)))
         except Exception:  # noqa: BLE001
             pass
 
@@ -168,45 +168,15 @@ class ComputeScheduler:
             "ear_busy_yield_ms": p.ear_busy_yield_ms,
         }
 
-    @staticmethod
-    def _set_torch_threads(n: int) -> None:
-        try:
-            import torch
-
-            torch.set_num_threads(max(1, int(n)))
-        except Exception:  # noqa: BLE001
-            pass
-
-    @staticmethod
-    def _set_cv_threads(n: int) -> None:
-        try:
-            import cv2
-
-            cv2.setNumThreads(max(1, int(n)))
-        except Exception:  # noqa: BLE001
-            pass
-
     @contextmanager
     def yolo_context(self) -> Iterator[SchedulerPlan]:
-        plan = self.ensure_configured()
-        self._set_torch_threads(plan.yolo_threads)
-        self._set_cv_threads(plan.opencv_yolo_threads)
-        try:
-            yield plan
-        finally:
-            # Restore a balanced default so idle process is not stuck on YOLO quota
-            self._set_torch_threads(max(1, plan.ear_threads + plan.yolo_threads) // 2 or 1)
-            self._set_cv_threads(plan.opencv_ear_threads)
+        # Thread pools are fixed at configure time to avoid process-wide races
+        # between concurrent EAR / YOLO workers.
+        yield self.ensure_configured()
 
     @contextmanager
     def ear_context(self) -> Iterator[SchedulerPlan]:
-        plan = self.ensure_configured()
-        self._set_torch_threads(plan.ear_threads)
-        self._set_cv_threads(plan.opencv_ear_threads)
-        try:
-            yield plan
-        finally:
-            self._set_cv_threads(plan.opencv_ear_threads)
+        yield self.ensure_configured()
 
     def ear_interval_ms(self, base_ms: int, detect_busy: bool) -> int:
         """Effective EAR period: stretch on CPU when YOLO is busy; full rate on CUDA."""
