@@ -52,9 +52,10 @@ class YOLODetector:
     def load_config(self):
         from detection.models import SystemConfig
 
-        self.conf_thresh = 0.3
+        self.conf_thresh = 0.5
         self.iou_thresh = 0.5
         self.imgsz = 640
+        self._imgsz_from_config = False
         self.device = "cpu"
         # Per-class floors (applied after global conf)
         self.conf_face = 0.35
@@ -66,9 +67,14 @@ class YOLODetector:
 
         try:
             configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
-            self.conf_thresh = _cfg_float(configs, "yolo_conf_thresh", 0.3)
+            self.conf_thresh = _cfg_float(configs, "yolo_conf_thresh", 0.5)
             self.iou_thresh = _cfg_float(configs, "yolo_iou_thresh", 0.5)
-            self.imgsz = max(320, _cfg_int(configs, "yolo_imgsz", 640))
+            if "yolo_imgsz" in configs and str(configs.get("yolo_imgsz", "")).strip():
+                self.imgsz = max(320, _cfg_int(configs, "yolo_imgsz", 640))
+                self._imgsz_from_config = True
+            else:
+                self.imgsz = 640
+                self._imgsz_from_config = False
             self.device = configs.get("device") or "cpu"
             self.conf_face = _cfg_float(configs, "yolo_conf_face", max(self.conf_thresh, 0.35))
             self.conf_smoke = _cfg_float(configs, "yolo_conf_smoke", min(self.conf_thresh, 0.2))
@@ -104,20 +110,16 @@ class YOLODetector:
                 print(f"无法在设备 {self.device} 上运行模型: {e}")
 
     def detect(self, image):
-        """Run inference with explicit conf / iou / imgsz (CPU-friendly defaults)."""
-        predict_kwargs = {
-            "conf": float(self.conf_thresh),
-            "iou": float(self.iou_thresh),
-            "imgsz": int(self.imgsz),
-            "verbose": False,
-            "max_det": 20,
-        }
-        # Explicit device every call; half only on CUDA
-        if self.device:
-            predict_kwargs["device"] = self.device
-        if isinstance(self.device, str) and self.device.startswith("cuda"):
-            predict_kwargs["half"] = True
-        results = self.model(image, **predict_kwargs)
+        """Run inference.
+
+        Keep call style close to the original (model(image, verbose=False)) so we do not
+        force a heavier letterbox/imgsz path than before. conf/iou live on the model object.
+        """
+        kwargs = {"verbose": False}
+        # Only override imgsz when user explicitly configured it in DB
+        if getattr(self, "_imgsz_from_config", False):
+            kwargs["imgsz"] = int(self.imgsz)
+        results = self.model(image, **kwargs)
         return results[0]
 
     def _class_conf_floor(self, cls_id: int) -> float:
