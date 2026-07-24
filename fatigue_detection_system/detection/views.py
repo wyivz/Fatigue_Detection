@@ -624,6 +624,64 @@ def get_result(request):
     
     return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
 
+
+def save_fatigue_event(image, session, snap, mouth_aspect_ratio=None, face_detected=False):
+    """
+    Persist a fatigue edge event (level rise / yawn) without re-running YOLO.
+    Used by MVS EAR loop so history matches realtime alerts.
+    """
+    from .utils.fatigue_tracker import fatigue_tracker
+
+    if dlib_detector is None:
+        return None
+
+    # Refresh snapshot in case caller passed a stale one
+    live = fatigue_tracker.get_snapshot(session.id)
+    level = int(live.fatigue_level if live else (snap.fatigue_level if snap else 0))
+    yawn = bool(live.yawn_detected if live else (snap.yawn_detected if snap else False))
+    ear = live.eye_aspect_ratio if live else (snap.eye_aspect_ratio if snap else None)
+    perclos = float(live.perclos if live else (snap.perclos if snap else 0.0))
+    closed_ms = int(live.eye_closed_ms if live else (snap.eye_closed_ms if snap else 0))
+    lm = live.landmarks if live else (snap.landmarks if snap else None)
+
+    draw_payload = {
+        'landmarks': lm,
+        'eye_aspect_ratio': ear,
+        'mouth_aspect_ratio': mouth_aspect_ratio,
+        'yawn_detected': yawn,
+        'fatigue_level': level,
+        'perclos': perclos,
+        'eye_closed_ms': closed_ms,
+    }
+    try:
+        annotated = dlib_detector.draw_fatigue_results(image, draw_payload)
+    except Exception as e:  # noqa: BLE001
+        _safe_log(f'fatigue event draw failed: {e}')
+        annotated = image
+
+    row = DetectionResult(
+        session=session,
+        face_detected=bool(face_detected or lm is not None),
+        smoking_detected=False,
+        phone_detected=False,
+        drinking_detected=False,
+        eye_aspect_ratio=float(ear) if ear is not None else None,
+        yawn_detected=yawn,
+        fatigue_level=level,
+        perclos=perclos,
+        eye_closed_ms=closed_ms,
+    )
+    result_filename = f"fatigue_{session.id}_{timezone.now().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}.jpg"
+    try:
+        ok, buffer = cv2.imencode('.jpg', annotated)
+        if ok:
+            row.result_image.save(result_filename, ContentFile(buffer.tobytes()), save=False)
+    except Exception as e:  # noqa: BLE001
+        _safe_log(f'fatigue event image save failed: {e}')
+    row.save()
+    return row
+
+
 def process_image(
     image,
     session,
