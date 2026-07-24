@@ -153,53 +153,68 @@ Write-Host "Installing dlib from: $($DlibWheel.FullName)"
 & $VenvPy -m pip install --force-reinstall --no-deps $DlibWheel.FullName
 Assert-Ok "pip install dlib"
 
+$WheelsDir = Join-Path $Root "wheels"
+$hasLocalTorch = $false
+if (Test-Path -LiteralPath $WheelsDir) {
+    $hasLocalTorch = [bool](Get-ChildItem -LiteralPath $WheelsDir -Filter "torch-*.whl" -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
 $useCuda = $false
 if (-not $ForceCpu) {
     $useCuda = Test-HasNvidia
 }
-if ($useCuda) {
-    Write-Host "NVIDIA GPU detected. Installing torch+$CudaIndex ..."
-    $index = "https://download.pytorch.org/whl/$CudaIndex"
-    & $VenvPy -m pip install torch torchvision --index-url $index
+
+if ($hasLocalTorch) {
+    Write-Host "Installing torch/torchvision from local wheels\ ..."
+    & $VenvPy -m pip install --no-index --find-links $WheelsDir torch torchvision
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[WARN] $CudaIndex failed, trying cu118 ..." -ForegroundColor Yellow
-        & $VenvPy -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/cu118"
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[WARN] CUDA torch failed, falling back to CPU torch." -ForegroundColor Yellow
-        & $VenvPy -m pip install torch torchvision
-        $useCuda = $false
+        Write-Host "[WARN] Local torch wheels failed, will try online." -ForegroundColor Yellow
+        $hasLocalTorch = $false
     } else {
-        $useCuda = $true
+        # Keep useCuda based on nvidia-smi; wheel may be CUDA or CPU
+        Write-Host "Local torch installed."
     }
-} else {
-    Write-Host "No NVIDIA GPU (or -ForceCpu). Installing CPU torch ..."
-    & $VenvPy -m pip install torch torchvision
-    Assert-Ok "pip install cpu torch"
 }
 
-# Prefer local wheels if present (offline / faster)
-$WheelsDir = Join-Path $Root "wheels"
+if (-not $hasLocalTorch) {
+    if ($useCuda) {
+        Write-Host "NVIDIA GPU detected. Installing torch+$CudaIndex ..."
+        $index = "https://download.pytorch.org/whl/$CudaIndex"
+        & $VenvPy -m pip install torch torchvision --index-url $index
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[WARN] $CudaIndex failed, trying cu118 ..." -ForegroundColor Yellow
+            & $VenvPy -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/cu118"
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[WARN] CUDA torch failed, falling back to CPU torch." -ForegroundColor Yellow
+            & $VenvPy -m pip install torch torchvision
+            $useCuda = $false
+        } else {
+            $useCuda = $true
+        }
+    } else {
+        Write-Host "No NVIDIA GPU (or -ForceCpu). Installing CPU torch ..."
+        & $VenvPy -m pip install torch torchvision
+        Assert-Ok "pip install cpu torch"
+    }
+}
+
 if (Test-Path -LiteralPath $WheelsDir) {
-    Write-Host "Installing extra local wheels from: $WheelsDir"
-    Get-ChildItem -LiteralPath $WheelsDir -Filter "*.whl" -File -ErrorAction SilentlyContinue | ForEach-Object {
-        & $VenvPy -m pip install --no-deps $_.FullName
-    }
+    Write-Host "Installing remaining deps preferring local wheels\ ..."
+    & $VenvPy -m pip install --find-links $WheelsDir -r $ReqFile
+} else {
+    & $VenvPy -m pip install -r $ReqFile
 }
-
-& $VenvPy -m pip install -r $ReqFile
 Assert-Ok "pip install requirements-app.txt"
 
 Write-Step "5/6 Verify torch / CUDA"
-$verify = @"
-import torch
-print('torch', torch.__version__)
-print('cuda_available', torch.cuda.is_available())
-if torch.cuda.is_available():
-    print('device', torch.cuda.get_device_name(0))
-"@
-& $VenvPy -c $verify
-
+$verifyOut = & $VenvPy -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+Write-Host $verifyOut
+$useCuda = $false
+if ($verifyOut -match "True") {
+    $useCuda = $true
+}
+if ($ForceCpu) { $useCuda = $false }
 Write-Step "6/6 Django migrate + admin"
 Push-Location -LiteralPath $AppDir
 try {
@@ -210,7 +225,7 @@ try {
 
     $createAdmin = @"
 import os
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'fatigue_detection_system.settings')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'fatigue_detection.settings')
 import django
 django.setup()
 from django.contrib.auth import get_user_model
@@ -228,7 +243,7 @@ else:
     if ($useCuda) {
         $setCuda = @"
 import os
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'fatigue_detection_system.settings')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'fatigue_detection.settings')
 import django
 django.setup()
 from detection.models import SystemConfig
