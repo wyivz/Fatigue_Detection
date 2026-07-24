@@ -107,7 +107,7 @@ SleepyDetect Install Package
 1. Copy this whole folder to the target PC (prefer ASCII path, e.g. D:\SleepyDetect_Install)
 2. Double-click install.bat  (needs network unless wheels\ was pre-downloaded)
 3. Double-click start.bat
-4. Browser: http://127.0.0.1:8000/   admin / ChangeMeNow!
+4. Browser: http://127.0.0.1:8000/   admin / ChangeMeNow! (change immediately)
 5. GigE camera: install Hikrobot MVS 4.6.3 Runtime (see MVS_SETUP.txt)
 "@
 $tip | Set-Content -LiteralPath (Join-Path $OutDir "请先读我.txt") -Encoding UTF8

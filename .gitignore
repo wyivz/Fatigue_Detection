@@ -45,6 +45,9 @@ _dump_*.py
 **/_fix_*.py
 **/_test_fatigue_*.py
 **/_process_image_snippet.py
+_history_final_snapshot/
+tools/_reconstruct_git_history*.py
+tools/_scan_transcript_ops.py
 
 # IDE
 .idea/

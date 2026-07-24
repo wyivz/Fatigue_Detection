@@ -1,124 +1,100 @@
-# 基于YOLO与dlib的疲劳驾驶检测系统
+# Fatigue Detection（基于 YOLO 与 dlib）
 
-这是一个基于YOLO和dlib的疲劳驾驶检测系统，可以实时检测驾驶员的面部状态、疲劳程度和不良驾驶行为，如打哈欠、抽烟、打电话等。
+实时检测驾驶员面部状态、疲劳程度与不良驾驶行为（打哈欠、抽烟、打电话、喝水等）。支持系统摄像头与海康威视 GigE 工业相机（MVS）。
 
-## 功能特点
+仓库：https://github.com/wyivz/Fatigue_Detection
 
-- 实时摄像头检测：使用摄像头实时监测驾驶员状态
-- 视频文件检测：上传视频文件进行分析
-- 图片检测：上传图片快速分析
-- 多维度检测：
-  - 面部检测和跟踪
-  - 疲劳状态评估（基于眼睛闭合和打哈欠检测）
-  - 不良驾驶行为检测（抽烟、打电话、喝水等）
-- 检测结果可视化：实时显示检测结果和警告
-- 检测数据统计分析：查看历史检测结果和统计图表
+## 功能
 
-## 系统要求
+- 实时检测（webcam / GigE）
+- 视频与图片检测
+- 疲劳评估：EAR/MAR、多帧 PERCLOS、哈欠确认
+- 行为检测：YOLO（face / smoke / phone / water）
+- 历史会话与结果统计
+- Windows 便携包 / 一键安装脚本（见 `deploy/`）
 
-- Python 3.8+
+## 环境
+
+- Python 3.8（推荐 3.8.10）
 - Django 4.2
-- OpenCV 4.5+
-- dlib
-- YOLO (YOLOv5/YOLOv8)
-- 支持的操作系统：Windows、macOS、Linux
+- OpenCV、dlib、ultralytics、torch
 
-dlib 用whl安装
+Windows 上 dlib 建议用仓库根目录 wheel：
 
 ```bash
 pip install dlib-19.19.0-cp38-cp38-win_amd64.whl
 ```
 
-## 安装指南
+## 快速开始（开发）
 
-1. 克隆仓库
 ```bash
-git clone https://github.com/yourusername/fatigue-detection-system.git
-cd fatigue-detection-system
-```
-
-2. 创建虚拟环境（推荐）
-```bash
+git clone https://github.com/wyivz/Fatigue_Detection.git
+cd Fatigue_Detection
 python -m venv venv
-source venv/bin/activate  # 在Windows上使用 venv\Scripts\activate
-```
-
-3. 安装依赖
-```bash
+# Windows:
+venv\Scripts\activate
 pip install -r requirements.txt
+pip install dlib-19.19.0-cp38-cp38-win_amd64.whl
 ```
 
-4. 下载必要的权重文件
-   - 将YOLO权重文件 `best.pt` 放入 `weights` 目录
-   - 将dlib面部特征点预测器 `shape_predictor_68_face_landmarks.dat` 放入 `weights` 目录
+权重文件放到 `fatigue_detection_system/weights/`：
 
-5. 运行数据库迁移
+- `best.pt`（YOLO）
+- `shape_predictor_68_face_landmarks.dat`（[dlib 官方](http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2)）
+
+若仓库已包含上述文件可跳过下载。
+
 ```bash
-python manage.py makemigrations
+cd fatigue_detection_system
 python manage.py migrate
-```
-
-6. 创建超级用户
-```bash
 python manage.py createsuperuser
+python manage.py runserver 127.0.0.1:8000
 ```
 
-7. 启动开发服务器
-```bash
-python manage.py runserver
-```
+或在仓库根目录双击 `start.bat`。
 
-8. 访问系统
-   - 在浏览器中打开 `http://127.0.0.1:8000/`
-   - 使用创建的超级用户账号登录
+浏览器打开 http://127.0.0.1:8000/
 
-## 权重文件下载
+### 环境变量（可选）
 
-- YOLO权重文件：基于自定义数据集训练的YOLO权重文件，用于检测面部、抽烟、打电话和喝水行为
-- dlib面部特征点预测器：可以从 [dlib官方模型](http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2) 下载
+| 变量 | 说明 |
+|------|------|
+| `DJANGO_SECRET_KEY` | 生产环境必填 |
+| `DJANGO_DEBUG` | `1`/`0`，默认 `1` |
+| `DJANGO_ALLOWED_HOSTS` | 逗号分隔，默认 `127.0.0.1,localhost` |
 
-## 使用说明
+## 工控机部署
 
-### 实时检测
-1. 登录系统后，点击"实时检测"
-2. 选择摄像头，点击"开始检测"
-3. 系统会实时分析摄像头画面，检测驾驶员状态
-4. 检测到疲劳状态或不良行为时会发出警告
+- 便携包：`deploy/prepare_portable.ps1`
+- 一键安装包：`deploy/prepare_install_bundle.ps1` → 目标机运行 `install.bat`
+- GigE：安装海康 MVS Runtime，说明见 `deploy/MVS_SETUP.txt`
 
-### 视频检测
-1. 点击"视频检测"
-2. 上传视频文件（支持mp4、avi、mov格式）
-3. 选择需要检测的项目（疲劳状态、不良行为）
-4. 点击"开始检测"，等待系统处理
-5. 查看检测结果和统计信息
+一键安装若自动创建管理员，默认口令为 `ChangeMeNow!`，登录后请立即修改。
 
-### 图片检测
-1. 点击"图片检测"
-2. 上传图片文件（支持jpg、png格式）
-3. 选择需要检测的项目
-4. 点击"开始检测"
-5. 查看检测结果
+## 黑白工业相机微调
 
-## 系统架构
+见 `datasets/mono_behavior/README.md` 与 `tools/finetune_mono_yolo.py`。
 
-- 前端：HTML、CSS、JavaScript、Bootstrap 5
-- 后端：Django
-- 图像处理：OpenCV、dlib
-- 目标检测：YOLO (YOLOv5/YOLOv8)
-- 数据库：SQLite（开发环境）/ MySQL或PostgreSQL（生产环境）
+## 技术栈
 
-## 文件结构
+前端：HTML / Bootstrap 5 / JavaScript  
+后端：Django  
+视觉：OpenCV、dlib、YOLO（ultralytics）  
+数据库：SQLite（开发）
+
+## 目录摘要
 
 ```
-fatigue_detection_system/
-├── accounts/            # 用户账户相关应用
-├── detection/           # 检测功能相关应用
-├── media/               # 媒体文件存储
-│   ├── uploads/         # 上传的文件
-│   └── results/         # 检测结果图像
-├── static/              # 静态文件
-├── templates/           # 全局模板
-├── weights/             # 模型权重文件
-├── manage.py            # Django管理脚本
-└── fatigue_detection/   # 项目主配置
-``` 
+Fatigue_Detection/
+├── fatigue_detection_system/   # Django 应用
+├── deploy/                     # 便携 / 一键安装
+├── datasets/mono_behavior/     # 微调数据布局
+├── tools/                      # 微调脚本
+├── requirements.txt
+├── start.bat / stop.bat
+└── README.md
+```
+
+## 许可与声明
+
+仅供学习与研究。实车/产线部署前请完成充分测试，并自行配置密钥与访问控制。
