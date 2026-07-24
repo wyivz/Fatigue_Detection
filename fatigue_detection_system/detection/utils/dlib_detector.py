@@ -45,7 +45,7 @@ class DlibDetector:
         from detection.models import SystemConfig
 
         self.EYE_AR_THRESH = 0.25
-        self.MOUTH_AR_THRESH = 0.6
+        self.MOUTH_AR_THRESH = 0.5
 
         try:
             eye_thresh_config = SystemConfig.objects.filter(config_key="eye_ar_thresh").first()
@@ -56,7 +56,13 @@ class DlibDetector:
                 config_key="mouth_ar_thresh"
             ).first()
             if mouth_thresh_config:
-                self.MOUTH_AR_THRESH = float(mouth_thresh_config.config_value)
+                mar_th = float(mouth_thresh_config.config_value)
+                # 旧版外唇 MAR 默认 0.6，换内唇算法后过高，自动落到 0.5
+                if abs(mar_th - 0.6) < 1e-6:
+                    mar_th = 0.5
+                    mouth_thresh_config.config_value = "0.5"
+                    mouth_thresh_config.save(update_fields=["config_value"])
+                self.MOUTH_AR_THRESH = mar_th
 
             print(
                 f"已加载配置: EYE_AR_THRESH={self.EYE_AR_THRESH}, "
@@ -116,11 +122,18 @@ class DlibDetector:
         c = dist.euclidean(eye[0], eye[3])
         return (a + b) / (2.0 * c)
 
-    def mouth_aspect_ratio(self, mouth):
-        a = dist.euclidean(mouth[2], mouth[10])
-        b = dist.euclidean(mouth[4], mouth[8])
-        c = dist.euclidean(mouth[0], mouth[6])
-        return (a + b) / (2.0 * c)
+    def mouth_aspect_ratio(self, landmarks):
+        """
+        Inner-lip MAR (more sensitive to yawns than outer-lip ratio).
+        Closed mouth ~0.05–0.30; yawn typically >= 0.45–0.50.
+        """
+        a = dist.euclidean(landmarks[61], landmarks[67])
+        b = dist.euclidean(landmarks[62], landmarks[66])
+        c = dist.euclidean(landmarks[63], landmarks[65])
+        d = dist.euclidean(landmarks[60], landmarks[64])
+        if d < 1e-6:
+            return 0.0
+        return (a + b + c) / (3.0 * d)
 
     def _analyze_landmarks(self, landmarks, results):
         left_eye = landmarks[self.LEFT_EYE_START : self.LEFT_EYE_END + 1]
@@ -128,8 +141,8 @@ class DlibDetector:
         ear = (self.eye_aspect_ratio(left_eye) + self.eye_aspect_ratio(right_eye)) / 2.0
         results["eye_aspect_ratio"] = float(ear)
 
-        mouth = landmarks[self.MOUTH_START : self.MOUTH_END + 1]
-        mar = self.mouth_aspect_ratio(mouth)
+        mar = self.mouth_aspect_ratio(landmarks)
+        results["mouth_aspect_ratio"] = float(mar)
         results["yawn_detected"] = bool(mar > self.MOUTH_AR_THRESH)
 
         if ear < self.EYE_AR_THRESH * 0.8:
@@ -248,6 +261,18 @@ class DlibDetector:
 
         yawn_text = "YAWN: Yes" if results.get("yawn_detected") else "YAWN: No"
         cv2.putText(img, yawn_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        mar = results.get("mouth_aspect_ratio")
+        if mar is not None:
+            cv2.putText(
+                img,
+                f"MAR: {float(mar):.2f}",
+                (10, 180),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+            )
 
         fatigue_level = int(results.get("fatigue_level") or 0)
         if fatigue_level >= 3:

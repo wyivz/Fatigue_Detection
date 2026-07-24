@@ -454,6 +454,38 @@ def start_detection(request):
     
     return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
 
+
+@csrf_exempt
+@login_required
+def reset_fatigue(request):
+    """API: 用户确认疲劳告警后，清空 PERCLOS/微睡/哈欠累计，避免历史拖累后续判断。"""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
+
+    session_id = request.POST.get('session_id')
+    if not session_id:
+        return JsonResponse({'status': 'error', 'message': '缺少会话ID'})
+
+    try:
+        session = DetectionSession.objects.get(id=session_id, user=request.user)
+    except DetectionSession.DoesNotExist:
+        return JsonResponse({'status': 'error', 'message': '无效的会话ID'})
+
+    from .utils.fatigue_tracker import fatigue_tracker
+
+    configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+    snap = fatigue_tracker.clear_history(session.id, configs)
+    return JsonResponse({
+        'status': 'success',
+        'session_id': session.id,
+        'fatigue_level': int(snap.fatigue_level),
+        'perclos': float(snap.perclos),
+        'eye_closed_ms': int(snap.eye_closed_ms),
+        'yawn_detected': bool(snap.yawn_detected),
+        'is_microsleep': bool(snap.is_microsleep),
+    })
+
+
 @csrf_exempt
 @login_required
 def stop_detection(request):

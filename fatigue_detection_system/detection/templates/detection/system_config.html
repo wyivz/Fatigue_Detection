@@ -38,9 +38,9 @@
                             <div class="row mb-3">
                                 <label class="col-md-4 col-form-label">嘴巴纵横比阈值</label>
                                 <div class="col-md-8">
-                                    <input type="number" step="0.01" min="0.3" max="1.0" name="config_mouth_ar_thresh" 
-                                           class="form-control" value="{{ configs.mouth_ar_thresh|default:'0.6' }}">
-                                    <div class="form-text">用于判断打哈欠的阈值，建议值：0.6</div>
+                                    <input type="number" step="0.01" min="0.2" max="1.0" name="config_mouth_ar_thresh" 
+                                           class="form-control" value="{{ configs.mouth_ar_thresh|default:'0.5' }}">
+                                    <div class="form-text">内唇 MAR 阈值（新算法）。闭嘴约 0.05–0.30，打哈欠通常 ≥0.45；建议 0.45–0.55</div>
                                 </div>
                             </div>
                         </div>

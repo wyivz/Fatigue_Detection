@@ -34,7 +34,7 @@ def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
     return {
         "eye_ar_thresh": _cfg_float(configs, "eye_ar_thresh", 0.25),
-        "mouth_ar_thresh": _cfg_float(configs, "mouth_ar_thresh", 0.6),
+        "mouth_ar_thresh": _cfg_float(configs, "mouth_ar_thresh", 0.5),
         "blink_max_ms": _cfg_int(configs, "blink_max_ms", 250),
         "microsleep_min_ms": _cfg_int(configs, "microsleep_min_ms", 500),
         "perclos_window_sec": max(5, _cfg_int(configs, "perclos_window_sec", 60)),
@@ -44,9 +44,9 @@ def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, A
         # Hysteresis band around EAR threshold to avoid flicker false closes
         "ear_hysteresis": _cfg_float(configs, "ear_hysteresis", 0.03),
         # Yawn must persist this many ms before latching
-        "yawn_confirm_ms": _cfg_int(configs, "yawn_confirm_ms", 400),
+        "yawn_confirm_ms": _cfg_int(configs, "yawn_confirm_ms", 300),
         # How long a yawn latch stays after mouth closes
-        "yawn_hold_ms": _cfg_int(configs, "yawn_hold_ms", 800),
+        "yawn_hold_ms": _cfg_int(configs, "yawn_hold_ms", 1200),
     }
 
 
@@ -102,6 +102,15 @@ class FatigueTemporalTracker:
     def reset(self, session_id: int) -> None:
         with self._lock:
             self._sessions.pop(int(session_id), None)
+
+    def clear_history(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
+        """Clear PERCLOS / microsleep / yawn accumulators but keep session config."""
+        cfg = load_fatigue_config(configs)
+        with self._lock:
+            sid = int(session_id)
+            prev = self._sessions.get(sid)
+            keep_cfg = (prev.config if prev and prev.config else None) or cfg
+            self._sessions[sid] = _SessionFatigueState(config=keep_cfg)
 
     def configure(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
         cfg = load_fatigue_config(configs)
@@ -338,6 +347,15 @@ class BehaviorConfirmTracker:
     def reset(self, session_id: int) -> None:
         with self._lock:
             self._sessions.pop(int(session_id), None)
+
+    def clear_history(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
+        """Clear PERCLOS / microsleep / yawn accumulators but keep session config."""
+        cfg = load_fatigue_config(configs)
+        with self._lock:
+            sid = int(session_id)
+            prev = self._sessions.get(sid)
+            keep_cfg = (prev.config if prev and prev.config else None) or cfg
+            self._sessions[sid] = _SessionFatigueState(config=keep_cfg)
 
     def configure(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
         cfg = load_fatigue_config(configs)

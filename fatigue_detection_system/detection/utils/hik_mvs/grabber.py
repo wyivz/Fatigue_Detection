@@ -288,7 +288,7 @@ class MvsGrabber:
                     snap = fatigue_tracker.update(
                         session_id,
                         ear=dlib_results.get("eye_aspect_ratio"),
-                        yawn_detected=None,
+                        yawn_detected=bool(dlib_results.get("yawn_detected")),
                         faces_detected=faces_n,
                         landmarks=dlib_results.get("landmarks"),
                     )
@@ -306,6 +306,7 @@ class MvsGrabber:
                         meta.update(
                             {
                                 "eye_aspect_ratio": snap.eye_aspect_ratio,
+                                "mouth_aspect_ratio": dlib_results.get("mouth_aspect_ratio"),
                                 "perclos": snap.perclos,
                                 "eye_closed_ms": snap.eye_closed_ms,
                                 "is_microsleep": snap.is_microsleep,
@@ -376,6 +377,7 @@ class MvsGrabber:
                     "yawn_detected": result.get("yawn_detected"),
                     "fatigue_level": result.get("fatigue_level"),
                     "eye_aspect_ratio": result.get("eye_aspect_ratio"),
+                    "mouth_aspect_ratio": result.get("mouth_aspect_ratio"),
                     "perclos": result.get("perclos"),
                     "eye_closed_ms": result.get("eye_closed_ms"),
                     "is_microsleep": result.get("is_microsleep"),

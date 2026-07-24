@@ -22,6 +22,7 @@ urlpatterns = [
     path('api/start_detection/', views.start_detection, name='start_detection'),
     path('api/stop_detection/', views.stop_detection, name='stop_detection'),
     path('api/get_result/', views.get_result, name='get_result'),
+    path('api/reset_fatigue/', views.reset_fatigue, name='reset_fatigue'),
     path('api/list_sources/', views.list_sources, name='list_sources'),
     path('api/mvs_status/', views.mvs_status, name='mvs_status'),
     path('api/mvs_preview/', views.mvs_preview, name='mvs_preview'),

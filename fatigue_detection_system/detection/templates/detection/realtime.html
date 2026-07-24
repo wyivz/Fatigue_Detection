@@ -314,7 +314,7 @@
                     <p class="mb-0" id="warning-message">您可能处于疲劳状态，请注意休息！</p>
                 </div>
                 <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">知道了</button>
+                    <button type="button" class="btn btn-primary" id="warning-ack-btn" data-bs-dismiss="modal">知道了</button>
                 </div>
             </div>
         </div>
@@ -341,7 +341,47 @@
     const viewResultsLink = document.getElementById('view-results-link');
     const alertSound = document.getElementById('alert-sound');
     const warningModal = new bootstrap.Modal(document.getElementById('warning-modal'));
+    const warningAckBtn = document.getElementById('warning-ack-btn');
     const detectionAlert = document.getElementById('detection-alert');
+    let fatigueAckPending = false;
+
+    async function acknowledgeFatigueAlert() {
+        if (!fatigueAckPending) return;
+        fatigueAckPending = false;
+        try {
+            const formData = new FormData();
+            formData.append('session_id', sessionId);
+            const resp = await fetch("{% url 'detection:reset_fatigue' %}", {
+                method: 'POST',
+                body: formData,
+                credentials: 'same-origin',
+            });
+            const data = await resp.json();
+            if (data.status === 'success') {
+                lastFatigueAlertAt = Date.now();
+                updateDetectionResults(Object.assign({
+                    status: 'success',
+                    _softUpdate: true,
+                    face_detected: true,
+                }, data));
+                detectionAlert.innerHTML = '<i class="fas fa-check-circle me-2"></i>已确认告警，疲劳累计已重置';
+                detectionAlert.className = 'alert alert-success';
+            }
+        } catch (e) {
+            console.warn('reset_fatigue failed', e);
+        }
+    }
+
+    const warningModalEl = document.getElementById('warning-modal');
+    if (warningModalEl) {
+        warningModalEl.addEventListener('show.bs.modal', function () {
+            fatigueAckPending = true;
+        });
+        warningModalEl.addEventListener('hidden.bs.modal', function () {
+            // 点「知道了」或关闭按钮后重置 PERCLOS/微睡/哈欠累计
+            acknowledgeFatigueAlert();
+        });
+    }
     const perfTimingBody = document.getElementById('perf-timing-body');
     
     // 统计元素
@@ -1047,6 +1087,9 @@
         if (result.yawn_detected !== undefined) {
             yawnText = result.yawn_detected ? '是' : '否';
             yawnWarning = result.yawn_detected;
+            if (result.mouth_aspect_ratio !== null && result.mouth_aspect_ratio !== undefined) {
+                yawnText += ' (MAR: ' + Number(result.mouth_aspect_ratio).toFixed(2) + ')';
+            }
         }
         
         detailsHTML += `<div class="result-item ${yawnWarning ? 'warning' : ''}">
