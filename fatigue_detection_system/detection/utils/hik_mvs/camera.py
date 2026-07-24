@@ -24,21 +24,24 @@ def _load_sdk():
     if _sdk is not None:
         return _sdk
     try:
-        from detection.utils.hik_mvs.MvImport import MvCameraControl_class as mvs  # noqa: WPS433
-        from detection.utils.hik_mvs.MvImport.CameraParams_const import (  # noqa: WPS433
+        # Official MVS Samples use flat imports; put MvImport on sys.path.
+        if _MVIMPORT_DIR not in sys.path:
+            sys.path.insert(0, _MVIMPORT_DIR)
+        import MvCameraControl_class as mvs  # noqa: WPS433
+        from CameraParams_const import (  # noqa: WPS433
             MV_ACCESS_Exclusive,
             MV_GIGE_DEVICE,
             MV_USB_DEVICE,
         )
-        from detection.utils.hik_mvs.MvImport.CameraParams_header import (  # noqa: WPS433
+        from CameraParams_header import (  # noqa: WPS433
             MV_CC_DEVICE_INFO,
             MV_CC_DEVICE_INFO_LIST,
             MV_CC_PIXEL_CONVERT_PARAM,
             MV_FRAME_OUT_INFO_EX,
             MVCC_INTVALUE,
         )
-        from detection.utils.hik_mvs.MvImport.MvErrorDefine_const import MV_OK  # noqa: WPS433
-        from detection.utils.hik_mvs.MvImport.PixelType_header import (  # noqa: WPS433
+        from MvErrorDefine_const import MV_OK  # noqa: WPS433
+        from PixelType_header import (  # noqa: WPS433
             PixelType_Gvsp_BGR8_Packed,
             PixelType_Gvsp_BayerBG8,
             PixelType_Gvsp_BayerGB8,
@@ -51,7 +54,7 @@ def _load_sdk():
         if getattr(mvs, "MvCamCtrldll", None) is None:
             err = os.environ.get("MVS_DLL_LOAD_ERROR") or "MvCameraControl.dll not found"
             _sdk_error = (
-                "MVS Runtime not found. Install Hikrobot MVS 4.4 (64-bit) "
+                "MVS Runtime not found. Install Hikrobot MVS 4.6.3 (64-bit) "
                 "or set MVS_RUNTIME_DIR / HIK_CAMERA_SDK_MVS_LIBRARY. Detail: %s" % err
             )
             return None

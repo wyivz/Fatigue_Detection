@@ -26,54 +26,66 @@ def get_platform_functype():
         return CFUNCTYPE
 
     
+def _candidate_dll_paths():
+    paths = []
+    env_lib = os.environ.get('HIK_CAMERA_SDK_MVS_LIBRARY') or os.environ.get('MVS_DLL')
+    if env_lib:
+        paths.append(env_lib)
+    runtime_dir = os.environ.get('MVS_RUNTIME_DIR') or os.environ.get('MVCAM_COMMON_RUNENV')
+    if runtime_dir:
+        paths.append(os.path.join(runtime_dir, 'MvCameraControl.dll'))
+        paths.append(os.path.join(runtime_dir, 'Win64_x64', 'MvCameraControl.dll'))
+        paths.append(os.path.join(runtime_dir, '64', 'libMvCameraControl.so'))
+    if platform.system() == 'Windows':
+        pf86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+        pf = os.environ.get('ProgramFiles', r'C:\Program Files')
+        paths.extend([
+            os.path.join(pf86, 'Common Files', 'MVS', 'Runtime', 'Win64_x64', 'MvCameraControl.dll'),
+            os.path.join(pf, 'Common Files', 'MVS', 'Runtime', 'Win64_x64', 'MvCameraControl.dll'),
+            os.path.join(pf86, 'MVS', 'Runtime', 'Win64_x64', 'MvCameraControl.dll'),
+            os.path.join(pf, 'MVS', 'Runtime', 'Win64_x64', 'MvCameraControl.dll'),
+        ])
+    else:
+        paths.extend([
+            '/opt/MVS/lib/64/libMvCameraControl.so',
+            '/opt/MVS/lib/aarch64/libMvCameraControl.so',
+        ])
+    return paths
+
+
 def check_sys_and_update_dll():
-    
+    """Load MvCameraControl from MVS Runtime; leave None if missing."""
     global MvCamCtrldll
-    max_size = sys.maxsize
-    bit_info =""
-    if max_size > 2**32:
-        bit_info = "64"
-    else:
-        bit_info = "32"
-    
-    MvCamCtrldllPath = ""
-    currentsystem = platform.system()
-    
-    if currentsystem == 'Windows':
-        #print(" current is windows system .")
-        MvCamCtrldllPath = "MvCameraControl.dll"
-        if "winmode" in ctypes.WinDLL.__init__.__code__.co_varnames:
-            MvCamCtrldll = WinDLL(MvCamCtrldllPath, winmode=0)
-        else:
-            MvCamCtrldll = WinDLL(MvCamCtrldllPath)
-    else:
-        architecture = platform.machine()
-        if architecture == 'aarch64':
-            MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/aarch64/libMvCameraControl.so"
-        elif architecture == 'x86_64':
-            if bit_info == "32":
-                MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/32/libMvCameraControl.so"
-            else: 
-                MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/64/libMvCameraControl.so"
-        elif architecture == 'arm-none':
-            MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/arm-none/libMvCameraControl.so"
-        elif architecture == 'armhf':
-            MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/armhf/libMvCameraControl.so"
-        elif architecture == 'armv6l':
-            MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/armhf/libMvCameraControl.so"
-        elif architecture == 'armv7l':
-            MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/armhf/libMvCameraControl.so"
-        elif architecture == 'i386':
-            MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/32/libMvCameraControl.so"
-        elif architecture == 'i686':
-            MvCamCtrldllPath = os.getenv('MVCAM_COMMON_RUNENV') + "/32/libMvCameraControl.so"
-        else:
-            print ("machine: %s, not support." % architecture) 
-        
-        MvCamCtrldll = ctypes.cdll.LoadLibrary(MvCamCtrldllPath)
-        
-        
-#检测系统，并加载sdk库
+    MvCamCtrldll = None
+    last_err = None
+    for dll_path in _candidate_dll_paths():
+        if not dll_path or not os.path.isfile(dll_path):
+            continue
+        try:
+            runtime_dir = os.path.dirname(dll_path)
+            if platform.system() == 'Windows':
+                os.environ['PATH'] = runtime_dir + os.pathsep + os.environ.get('PATH', '')
+                if hasattr(os, 'add_dll_directory'):
+                    try:
+                        os.add_dll_directory(runtime_dir)
+                    except Exception:
+                        pass
+                if 'winmode' in ctypes.WinDLL.__init__.__code__.co_varnames:
+                    MvCamCtrldll = WinDLL(dll_path, winmode=0)
+                else:
+                    MvCamCtrldll = WinDLL(dll_path)
+            else:
+                MvCamCtrldll = ctypes.cdll.LoadLibrary(dll_path)
+            os.environ['MVS_LOADED_DLL'] = dll_path
+            return
+        except OSError as exc:
+            last_err = exc
+            continue
+    if last_err is not None:
+        os.environ['MVS_DLL_LOAD_ERROR'] = str(last_err)
+
+
+# 检测系统并加载 SDK 库（未找到 Runtime 时不在 import 阶段崩溃）
 check_sys_and_update_dll()
 
 
