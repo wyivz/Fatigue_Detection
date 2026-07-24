@@ -110,6 +110,13 @@ class MvsGrabber:
             else:
                 cam.open_by_index(int(device_index or 0))
             cam.start_grab()
+            # Discard a few frames so continuous AE/gain can settle (otherwise first
+            # seconds look dark + detections look "stuck").
+            for _ in range(10):
+                try:
+                    cam.get_bgr_frame(timeout_ms=400)
+                except Exception:  # noqa: BLE001
+                    break
             self._camera = cam
             self.running = True
             self._grab_thread = threading.Thread(

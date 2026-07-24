@@ -41,6 +41,19 @@ class DlibDetector:
 
         self.load_config()
 
+    def warmup(self) -> float:
+        """Touch HOG + predictor once so first live frame is not cold."""
+        import time as _time
+
+        t0 = _time.perf_counter()
+        try:
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            # Synthetic mid-frame box so predictor path is exercised
+            self.detect_fatigue(dummy, face_bbox=[160, 80, 480, 400])
+        except Exception as e:  # noqa: BLE001
+            print(f"dlib warmup failed: {e}")
+        return (_time.perf_counter() - t0) * 1000.0
+
     def load_config(self):
         from detection.models import SystemConfig
 

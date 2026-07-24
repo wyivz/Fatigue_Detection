@@ -134,6 +134,20 @@ class YOLODetector:
             results = self.model(image, **kwargs)
         return results[0]
 
+    def warmup(self, runs: int = 2) -> float:
+        """Run dummy inferences so first real frame is not a cold-start spike."""
+        import time as _time
+
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        t0 = _time.perf_counter()
+        for _ in range(max(1, int(runs))):
+            try:
+                self.detect(dummy)
+            except Exception as e:  # noqa: BLE001
+                print(f"YOLO warmup failed: {e}")
+                break
+        return (_time.perf_counter() - t0) * 1000.0
+
     def _class_conf_floor(self, cls_id: int) -> float:
         if cls_id == 0:
             return float(self.conf_face)
