@@ -36,7 +36,7 @@ class MvsGrabber:
         self._interval_ms = 500
         self._ear_interval_ms = 100
         self._preview_max_width = 960
-        self._detect_max_width = 1280
+        self._detect_max_width = 960
         self._preview_jpeg_quality = 70
         self._latest_bgr: Optional[np.ndarray] = None
         self._latest_face_bbox: Optional[List[int]] = None
@@ -46,6 +46,12 @@ class MvsGrabber:
         self._last_fatigue_level = 0
         self._last_yawn = False
         self._event_save_cooldown_until = 0.0
+        self._pending_fatigue_event = False
+        self._last_persist_at = 0.0
+        self._persist_interval_sec = 2.0
+        self._warmup_until = 0.0
+        self._warmup_sec = 5.0
+        self._warmup_ui_cleared = False
         self.latest_jpeg: Optional[bytes] = None
         self.latest_meta: Dict[str, Any] = {}
         self.error: Optional[str] = None
@@ -85,9 +91,20 @@ class MvsGrabber:
             fcfg = load_fatigue_config(configs)
             self._ear_interval_ms = max(50, int(fcfg["ear_sample_interval_ms"]))
             try:
-                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 1280))))
+                from detection.utils.compute_scheduler import compute_scheduler
+
+                plan = compute_scheduler.configure(configs)
+                self.latest_meta = {
+                    "timing": {},
+                    "scheduler": compute_scheduler.snapshot(),
+                }
+                _ = plan
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 960))))
             except (TypeError, ValueError):
-                self._detect_max_width = 1280
+                self._detect_max_width = 960
             self._last_fatigue_level = 0
             self._last_yawn = False
             self._event_save_cooldown_until = 0.0
@@ -321,13 +338,22 @@ class MvsGrabber:
         while not self._stop.is_set():
             loop_start = time.perf_counter()
             with self._lock:
-                frame = None if self._latest_bgr is None else self._latest_bgr.copy()
+                frame = None if self._latest_bgr is None else self._latest_bgr
                 seq = self._frame_seq
                 session_id = self._session_id
                 ear_ms = self._ear_interval_ms
                 face_bbox = (
                     None if self._latest_face_bbox is None else list(self._latest_face_bbox)
                 )
+                detect_busy = bool(self._detect_busy)
+                in_warmup = time.time() < float(self._warmup_until or 0.0)
+
+            # Cooperative scheduling: EAR always runs; on CPU stretch/yield while YOLO busy.
+            # On CUDA, YOLO is on GPU so EAR keeps full rate (no skip).
+            ear_ms = compute_scheduler.ear_interval_ms(ear_ms, detect_busy)
+            pause = compute_scheduler.ear_busy_pause_sec(detect_busy)
+            if pause > 0 and self._stop.wait(pause):
+                break
 
             if frame is None or session_id is None or seq == last_seq:
                 if self._stop.wait(0.02):
@@ -337,71 +363,86 @@ class MvsGrabber:
             last_seq = seq
             try:
                 if dlib_detector is not None:
-                    sample = self._resize_for_preview(frame)
-                    # Scale face_bbox if full-res frame was resized for sample
-                    scaled_bbox = face_bbox
-                    if face_bbox is not None and sample is not frame:
-                        fh, fw = frame.shape[:2]
-                        sh, sw = sample.shape[:2]
-                        if fw > 0 and fh > 0 and (sw != fw or sh != fh):
-                            sx = sw / float(fw)
-                            sy = sh / float(fh)
-                            scaled_bbox = [
-                                int(face_bbox[0] * sx),
-                                int(face_bbox[1] * sy),
-                                int(face_bbox[2] * sx),
-                                int(face_bbox[3] * sy),
-                            ]
+                    with compute_scheduler.ear_context():
+                        sample = self._resize_for_preview(frame)
+                        scaled_bbox = face_bbox
+                        if face_bbox is not None:
+                            fh, fw = frame.shape[:2]
+                            sh, sw = sample.shape[:2]
+                            if fw > 0 and fh > 0 and (sw != fw or sh != fh):
+                                sx = sw / float(fw)
+                                sy = sh / float(fh)
+                                scaled_bbox = [
+                                    int(face_bbox[0] * sx),
+                                    int(face_bbox[1] * sy),
+                                    int(face_bbox[2] * sx),
+                                    int(face_bbox[3] * sy),
+                                ]
 
-                    t_ear = time.perf_counter()
-                    dlib_results = dlib_detector.detect_fatigue(
-                        sample, face_bbox=scaled_bbox
-                    )
-                    ear_cost = (time.perf_counter() - t_ear) * 1000.0
+                        t_ear = time.perf_counter()
+                        dlib_results = dlib_detector.detect_fatigue(
+                            sample, face_bbox=scaled_bbox
+                        )
+                        ear_cost = (time.perf_counter() - t_ear) * 1000.0
 
-                    faces_n = int(dlib_results.get("faces_detected") or 0)
-                    if faces_n <= 0 and scaled_bbox is not None:
-                        faces_n = 1 if dlib_results.get("landmarks") is not None else 0
+                    # Warmup: run models for cache, but do not feed trackers / UI state
+                    if in_warmup:
+                        with self._lock:
+                            meta = dict(self.latest_meta)
+                            timing = dict(meta.get("timing") or {})
+                            timing.update(self._merge_timing({"ear_ms": ear_cost}))
+                            meta["timing"] = timing
+                            meta["scheduler"] = compute_scheduler.snapshot()
+                            meta["warming_up"] = True
+                            self.latest_meta = meta
+                    else:
+                        faces_n = int(dlib_results.get("faces_detected") or 0)
+                        if faces_n <= 0 and scaled_bbox is not None:
+                            faces_n = 1 if dlib_results.get("landmarks") is not None else 0
 
-                    snap = fatigue_tracker.update(
-                        session_id,
-                        ear=dlib_results.get("eye_aspect_ratio"),
-                        yawn_detected=bool(dlib_results.get("yawn_detected")),
-                        faces_detected=faces_n,
-                        landmarks=dlib_results.get("landmarks"),
-                    )
-                    with self._lock:
-                        meta = dict(self.latest_meta)
-                        timing = dict(meta.get("timing") or {})
-                        timing.update(
-                            self._merge_timing(
+                        snap = fatigue_tracker.update(
+                            session_id,
+                            ear=dlib_results.get("eye_aspect_ratio"),
+                            yawn_detected=bool(dlib_results.get("yawn_detected")),
+                            faces_detected=faces_n,
+                            landmarks=dlib_results.get("landmarks"),
+                        )
+
+                        level = int(snap.fatigue_level)
+                        yawn = bool(snap.yawn_detected)
+                        with self._lock:
+                            prev_level = self._last_fatigue_level
+                            prev_yawn = self._last_yawn
+                            rising_fatigue = prev_level < 2 <= level
+                            rising_yawn = (not prev_yawn) and yawn
+                            if rising_fatigue or rising_yawn:
+                                self._pending_fatigue_event = True
+                            self._last_fatigue_level = level
+                            self._last_yawn = yawn
+
+                            meta = dict(self.latest_meta)
+                            timing = dict(meta.get("timing") or {})
+                            timing.update(self._merge_timing({"ear_ms": ear_cost}))
+                            meta["timing"] = timing
+                            meta.update(
                                 {
-                                    "ear_ms": ear_cost,
+                                    "eye_aspect_ratio": snap.eye_aspect_ratio,
+                                    "mouth_aspect_ratio": dlib_results.get("mouth_aspect_ratio"),
+                                    "perclos": snap.perclos,
+                                    "eye_closed_ms": snap.eye_closed_ms,
+                                    "is_microsleep": snap.is_microsleep,
+                                    "fatigue_level": snap.fatigue_level,
+                                    "yawn_detected": snap.yawn_detected,
+                                    "has_landmarks": dlib_results.get("landmarks") is not None,
+                                    "fatigue_event": bool(rising_fatigue or rising_yawn),
+                                    "scheduler": compute_scheduler.snapshot(),
                                 }
                             )
-                        )
-                        meta["timing"] = timing
-                        meta.update(
-                            {
-                                "eye_aspect_ratio": snap.eye_aspect_ratio,
-                                "mouth_aspect_ratio": dlib_results.get("mouth_aspect_ratio"),
-                                "perclos": snap.perclos,
-                                "eye_closed_ms": snap.eye_closed_ms,
-                                "is_microsleep": snap.is_microsleep,
-                                "fatigue_level": snap.fatigue_level,
-                                "yawn_detected": snap.yawn_detected,
-                                "has_landmarks": dlib_results.get("landmarks") is not None,
-                            }
-                        )
-                        self.latest_meta = meta
+                            self.latest_meta = meta
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self.error = str(exc)
-            finally:
-                try:
-                    connection.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            # Avoid closing DB every EAR tick (ear loop does not use ORM anymore)
 
             elapsed_ms = (time.perf_counter() - loop_start) * 1000.0
             sleep_ms = max(0.0, ear_ms - elapsed_ms)
@@ -409,9 +450,9 @@ class MvsGrabber:
                 break
 
     def _detect_loop(self) -> None:
-        """Run YOLO/dlib at detection_interval; publish face_bbox for EAR loop."""
+        """Run YOLO at detection_interval; fatigue comes from EAR loop tracker snapshot."""
         from detection.models import DetectionSession
-        from detection.views import process_image
+        from detection.views import persist_detection_snapshot, process_image
 
         last_seq = -1
         while not self._stop.is_set():
@@ -439,8 +480,36 @@ class MvsGrabber:
                     with self._lock:
                         self.error = "Session not found"
                     break
-                det_frame = self._resize_for_preview(frame)
-                result = process_image(det_frame, session, True, True)
+                det_frame = self._resize_for_detect(frame)
+                now = time.time()
+                with self._lock:
+                    pending_event = bool(getattr(self, "_pending_fatigue_event", False))
+                    due_persist = (now - float(self._last_persist_at or 0.0)) >= float(
+                        self._persist_interval_sec or 2.0
+                    )
+                    in_warmup = now < float(self._warmup_until or 0.0)
+
+                # Infer without JPEG/DB — main CPU delay source previously.
+                result = process_image(
+                    det_frame,
+                    session,
+                    detect_fatigue=False,
+                    detect_behaviors=True,
+                    include_image_data=False,
+                    persist=False,
+                )
+                behavior_hit = bool(
+                    result.get("smoking_detected")
+                    or result.get("phone_detected")
+                    or result.get("drinking_detected")
+                )
+                # Do not write history during startup warmup window
+                if (not in_warmup) and (pending_event or behavior_hit or due_persist):
+                    result = persist_detection_snapshot(det_frame, session, result)
+                    with self._lock:
+                        self._last_persist_at = time.time()
+                        self._pending_fatigue_event = False
+
                 detect_loop_ms = (time.perf_counter() - loop_start) * 1000.0
 
                 face_bbox = result.get("face_bbox")
@@ -461,10 +530,12 @@ class MvsGrabber:
                     "is_microsleep": result.get("is_microsleep"),
                     "has_landmarks": result.get("has_landmarks"),
                     "detection_id": result.get("detection_id"),
+                    "behavior_debug": result.get("behavior_debug") or {},
+                    "confirm_progress": result.get("confirm_progress") or {},
+                    "fatigue_event": False,
                 }
                 with self._lock:
                     if face_bbox is not None:
-                        # Map bbox from resized det_frame coords to full-res frame
                         fh, fw = frame.shape[:2]
                         dh, dw = det_frame.shape[:2]
                         if dw > 0 and dh > 0 and (dw != fw or dh != fh):
@@ -478,13 +549,35 @@ class MvsGrabber:
                             ]
                         else:
                             self._latest_face_bbox = [int(v) for v in face_bbox]
-                    prev_timing = dict((self.latest_meta or {}).get("timing") or {})
+                    prev = dict(self.latest_meta or {})
+                    prev_timing = dict(prev.get("timing") or {})
                     merged = self._merge_timing(timing_src)
-                    # Keep ear averages from ear loop
                     for k, v in prev_timing.items():
                         if k.startswith("ear"):
                             merged.setdefault(k, v)
                     meta["timing"] = merged
+                    try:
+                        if int(prev.get("fatigue_level") or 0) >= int(meta.get("fatigue_level") or 0):
+                            for k in (
+                                "fatigue_level",
+                                "eye_aspect_ratio",
+                                "mouth_aspect_ratio",
+                                "perclos",
+                                "eye_closed_ms",
+                                "is_microsleep",
+                                "yawn_detected",
+                                "has_landmarks",
+                            ):
+                                if k in prev and prev[k] is not None:
+                                    meta[k] = prev[k]
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        from detection.utils.compute_scheduler import compute_scheduler
+
+                        meta["scheduler"] = compute_scheduler.snapshot()
+                    except Exception:  # noqa: BLE001
+                        meta["scheduler"] = prev.get("scheduler")
                     self.latest_meta = meta
             except Exception as exc:  # noqa: BLE001
                 with self._lock:

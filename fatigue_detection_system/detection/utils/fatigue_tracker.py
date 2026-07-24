@@ -105,14 +105,15 @@ class FatigueTemporalTracker:
         with self._lock:
             self._sessions.pop(int(session_id), None)
 
-    def clear_history(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
-        """Clear PERCLOS / microsleep / yawn accumulators but keep session config."""
+    def clear_history(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> FatigueSnapshot:
+        """Clear PERCLOS / microsleep / yawn accumulators after user acknowledges alert."""
         cfg = load_fatigue_config(configs)
         with self._lock:
             sid = int(session_id)
             prev = self._sessions.get(sid)
             keep_cfg = (prev.config if prev and prev.config else None) or cfg
             self._sessions[sid] = _SessionFatigueState(config=keep_cfg)
+            return self._snapshot(self._sessions[sid], keep_cfg, time.time())
 
     def configure(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
         cfg = load_fatigue_config(configs)
@@ -333,14 +334,15 @@ class FatigueTemporalTracker:
 
 @dataclass
 class _BehaviorState:
-    smoking: int = 0
-    phone: int = 0
-    drinking: int = 0
+    smoking_hits: Deque[bool] = field(default_factory=deque)
+    phone_hits: Deque[bool] = field(default_factory=deque)
+    drinking_hits: Deque[bool] = field(default_factory=deque)
     confirm_frames: int = 2
+    window_frames: int = 5
 
 
 class BehaviorConfirmTracker:
-    """Require N consecutive detections before confirming smoking/phone/drinking."""
+    """Confirm smoking/phone/drinking when hits >= M inside last N frames (tolerant to flicker)."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -350,24 +352,26 @@ class BehaviorConfirmTracker:
         with self._lock:
             self._sessions.pop(int(session_id), None)
 
-    def clear_history(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
-        """Clear PERCLOS / microsleep / yawn accumulators but keep session config."""
-        cfg = load_fatigue_config(configs)
-        with self._lock:
-            sid = int(session_id)
-            prev = self._sessions.get(sid)
-            keep_cfg = (prev.config if prev and prev.config else None) or cfg
-            self._sessions[sid] = _SessionFatigueState(config=keep_cfg)
-
     def configure(self, session_id: int, configs: Optional[Dict[str, Any]] = None) -> None:
         cfg = load_fatigue_config(configs)
         with self._lock:
             state = self._sessions.get(int(session_id))
             if state is None:
-                state = _BehaviorState(confirm_frames=cfg["behavior_confirm_frames"])
+                state = _BehaviorState(
+                    confirm_frames=cfg["behavior_confirm_frames"],
+                    window_frames=cfg["behavior_window_frames"],
+                )
                 self._sessions[int(session_id)] = state
             else:
                 state.confirm_frames = cfg["behavior_confirm_frames"]
+                state.window_frames = cfg["behavior_window_frames"]
+
+    @staticmethod
+    def _push(window: Deque[bool], hit: bool, size: int) -> int:
+        window.append(bool(hit))
+        while len(window) > size:
+            window.popleft()
+        return sum(1 for v in window if v)
 
     def update(
         self,
@@ -376,26 +380,33 @@ class BehaviorConfirmTracker:
         phone: bool,
         drinking: bool,
         configs: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, bool]:
+    ) -> Dict[str, Any]:
         cfg = load_fatigue_config(configs)
         need = max(1, int(cfg["behavior_confirm_frames"]))
+        win = max(need, int(cfg["behavior_window_frames"]))
         with self._lock:
             sid = int(session_id)
             state = self._sessions.get(sid)
             if state is None:
-                state = _BehaviorState(confirm_frames=need)
+                state = _BehaviorState(confirm_frames=need, window_frames=win)
                 self._sessions[sid] = state
             else:
                 state.confirm_frames = need
+                state.window_frames = win
 
-            state.smoking = state.smoking + 1 if smoking else 0
-            state.phone = state.phone + 1 if phone else 0
-            state.drinking = state.drinking + 1 if drinking else 0
+            s_hits = self._push(state.smoking_hits, smoking, win)
+            p_hits = self._push(state.phone_hits, phone, win)
+            d_hits = self._push(state.drinking_hits, drinking, win)
 
             return {
-                "smoking_detected": state.smoking >= need,
-                "phone_detected": state.phone >= need,
-                "drinking_detected": state.drinking >= need,
+                "smoking_detected": s_hits >= need,
+                "phone_detected": p_hits >= need,
+                "drinking_detected": d_hits >= need,
+                "confirm_progress": {
+                    "smoking": {"hits": s_hits, "need": need, "window": win},
+                    "phone": {"hits": p_hits, "need": need, "window": win},
+                    "drinking": {"hits": d_hits, "need": need, "window": win},
+                },
             }
 
 
