@@ -137,15 +137,18 @@ class MvsGrabber:
             else:
                 cam.open_by_index(int(device_index or 0))
             cam.start_grab()
-            # Discard a few frames so continuous AE/gain can settle (otherwise first
-            # seconds look dark + detections look "stuck").
-            for _ in range(10):
-                try:
-                    cam.get_bgr_frame(timeout_ms=400)
-                except Exception:  # noqa: BLE001
-                    break
+            # Discard frames so Continuous AE can climb; rescue if still near-black.
+            settle = {}
+            try:
+                settle = cam.settle_exposure(frames=30, timeout_ms=500)
+            except Exception as exc:  # noqa: BLE001
+                settle = {"settle_error": str(exc)}
             self._camera = cam
             self.running = True
+            self.latest_meta = {
+                "timing": {},
+                "camera": settle,
+            }
             # Warmup clock starts when streams are actually up
             self._warmup_until = time.time() + float(self._warmup_sec or 5.0)
             # Clear any fatigue accumulation from dark AE frames after streams settle
@@ -222,6 +225,9 @@ class MvsGrabber:
                     "timing": meta.get("timing") or {},
                     "scheduler": meta.get("scheduler"),
                     "warming_up": True,
+                    # Keep camera health during warmup so black-stream is visible early
+                    "camera": meta.get("camera"),
+                    "camera_warning": meta.get("camera_warning"),
                 }
             return {
                 "running": self.running,
@@ -312,6 +318,25 @@ class MvsGrabber:
                     if jpeg:
                         self.latest_jpeg = jpeg
                     self.error = None
+                    # Surface live camera health for UI / field debug
+                    try:
+                        cam_diag = dict(getattr(self._camera, "last_diag", {}) or {})
+                        meta = dict(self.latest_meta or {})
+                        meta["camera"] = cam_diag
+                        if float(cam_diag.get("mean") or 0) < 3.0:
+                            meta["camera_warning"] = (
+                                "画面过暗(mean=%.1f, %s)。请确认镜头盖已开、补光/曝光，"
+                                "并关闭 MVS 客户端独占预览。"
+                                % (
+                                    float(cam_diag.get("mean") or 0),
+                                    "黑白" if cam_diag.get("is_mono") else "彩色",
+                                )
+                            )
+                        else:
+                            meta.pop("camera_warning", None)
+                        self.latest_meta = meta
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self.error = str(exc)

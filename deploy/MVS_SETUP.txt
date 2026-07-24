@@ -19,6 +19,17 @@ Setup checklist
    Then re-check that MvCameraControl_class.py still has the multi-path DLL loader patch.
 4. Start Django, open /detection/realtime/, choose GigE device, Start.
 
+If preview is all black but device name enumerates:
+- Close MVS Client completely (Exclusive open).
+- Confirm lens cap off / IR illuminator on for mono cameras.
+- App auto-detects mono vs color from PixelFormat support list:
+    mono-only  -> Mono8
+    color/Bayer -> same-pattern Bayer*8 (never forces Mono on color)
+  Frames are converted to BGR via MV_CC_GetImageForBGR (works for both).
+- GigE: NIC jumbo frames / packet size; app sets GevSCPSPacketSize automatically.
+- After start, check mvs_status JSON meta.camera:
+    sensor_family / is_mono / mean / pixel_type / grab_path / packet_size.
+
 Optional env overrides:
   set MVS_RUNTIME_DIR=C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64
   set HIK_CAMERA_SDK_MVS_LIBRARY=C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64\MvCameraControl.dll

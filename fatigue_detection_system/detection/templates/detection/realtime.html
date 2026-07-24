@@ -749,6 +749,9 @@
                 if (data.error) {
                     detectionAlert.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>' + data.error;
                     detectionAlert.className = 'alert alert-warning';
+                } else if (data.meta && data.meta.camera_warning) {
+                    detectionAlert.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>' + data.meta.camera_warning;
+                    detectionAlert.className = 'alert alert-warning';
                 }
                 if (data.meta && data.meta.timing) {
                     updateTimingPanel(data.meta.timing);
