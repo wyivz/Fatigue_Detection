@@ -159,10 +159,28 @@
                 <div class="card-body p-0">
                     <div id="video-container">
                         <video id="video-stream" autoplay playsinline></video>
+                        <img id="mvs-preview" alt="MVS preview" style="width:100%;display:none;background:#111;min-height:240px;">
                         <canvas id="canvas"></canvas>
                     </div>
                 </div>
                 <div class="card-footer">
+                    <div class="mb-3">
+                        <label class="form-label">视频源类型</label>
+                        <select id="source-type" class="form-select">
+                            <option value="mvs" {% if default_source_type != 'browser' %}selected{% endif %}>工业相机 (GigE / MVS)</option>
+                            <option value="browser" {% if default_source_type == 'browser' %}selected{% endif %}>系统摄像头</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">设备</label>
+                        <div class="input-group">
+                            <select id="device-select" class="form-select"></select>
+                            <button type="button" class="btn btn-outline-secondary" id="refresh-sources-btn" title="刷新设备列表">
+                                <i class="fas fa-sync-alt"></i>
+                            </button>
+                        </div>
+                        <div class="form-text" id="source-hint">选择工业相机或系统摄像头后开始检测</div>
+                    </div>
                     <div class="row">
                         <div class="col-6">
                             <button id="start-btn" class="btn btn-success w-100">

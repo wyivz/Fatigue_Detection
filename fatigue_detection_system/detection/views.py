@@ -126,6 +126,8 @@ def realtime_detection(request):
     alert_volume = int(configs.get('alert_volume', 80))
     enable_voice = configs.get('enable_voice') == 'true'
     detection_interval = int(configs.get('detection_interval', 500))
+    default_source_type = configs.get('default_source_type', 'mvs')
+    default_mvs_index = int(configs.get('default_mvs_index', 0))
     
     context = {
         'session': session,
@@ -133,6 +135,8 @@ def realtime_detection(request):
         'alert_volume': alert_volume,
         'enable_voice': enable_voice,
         'detection_interval': detection_interval,
+        'default_source_type': default_source_type,
+        'default_mvs_index': default_mvs_index,
     }
     
     return render(request, 'detection/realtime.html', context)
