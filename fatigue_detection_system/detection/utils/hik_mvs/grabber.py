@@ -14,17 +14,19 @@ from .camera import HikCamera
 
 
 class MvsGrabber:
-    """High-rate preview grabber + lower-rate detection worker."""
+    """High-rate preview grabber + EAR sampler + lower-rate YOLO detection."""
 
     def __init__(self):
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._grab_thread: Optional[threading.Thread] = None
+        self._ear_thread: Optional[threading.Thread] = None
         self._detect_thread: Optional[threading.Thread] = None
         self._camera: Optional[HikCamera] = None
         self._session_id: Optional[int] = None
         self._user_id: Optional[int] = None
         self._interval_ms = 500
+        self._ear_interval_ms = 100
         self._preview_max_width = 960
         self._preview_jpeg_quality = 70
         self._latest_bgr: Optional[np.ndarray] = None
@@ -43,6 +45,13 @@ class MvsGrabber:
         device_index: Optional[int] = None,
         camera_ip: Optional[str] = None,
     ) -> None:
+        from detection.models import SystemConfig
+        from detection.utils.fatigue_tracker import (
+            behavior_tracker,
+            fatigue_tracker,
+            load_fatigue_config,
+        )
+
         with self._lock:
             if self.running:
                 raise RuntimeError("MVS grabber already running")
@@ -55,6 +64,15 @@ class MvsGrabber:
             self._session_id = session_id
             self._user_id = user_id
             self._interval_ms = max(50, int(interval_ms or 500))
+
+            configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+            fcfg = load_fatigue_config(configs)
+            self._ear_interval_ms = max(50, int(fcfg["ear_sample_interval_ms"]))
+            fatigue_tracker.reset(session_id)
+            behavior_tracker.reset(session_id)
+            fatigue_tracker.configure(session_id, configs)
+            behavior_tracker.configure(session_id, configs)
+
             cam = HikCamera()
             if camera_ip:
                 cam.open_by_ip(camera_ip)
@@ -66,10 +84,14 @@ class MvsGrabber:
             self._grab_thread = threading.Thread(
                 target=self._grab_loop, name="mvs-grab", daemon=True
             )
+            self._ear_thread = threading.Thread(
+                target=self._ear_loop, name="mvs-ear", daemon=True
+            )
             self._detect_thread = threading.Thread(
                 target=self._detect_loop, name="mvs-detect", daemon=True
             )
             self._grab_thread.start()
+            self._ear_thread.start()
             self._detect_thread.start()
 
     def stop(self, complete_session: bool = True) -> None:
@@ -78,6 +100,8 @@ class MvsGrabber:
         with self._lock:
             if self._grab_thread:
                 threads.append(self._grab_thread)
+            if self._ear_thread:
+                threads.append(self._ear_thread)
             if self._detect_thread:
                 threads.append(self._detect_thread)
         for thread in threads:
@@ -92,10 +116,19 @@ class MvsGrabber:
                 self._camera = None
             self.running = False
             self._grab_thread = None
+            self._ear_thread = None
             self._detect_thread = None
             self._detect_busy = False
             session_id = self._session_id
             self._session_id = None
+        if session_id is not None:
+            try:
+                from detection.utils.fatigue_tracker import behavior_tracker, fatigue_tracker
+
+                fatigue_tracker.reset(session_id)
+                behavior_tracker.reset(session_id)
+            except Exception:  # noqa: BLE001
+                pass
         if complete_session and session_id:
             self._complete_session(session_id)
 
@@ -168,6 +201,65 @@ class MvsGrabber:
                 if self._stop.wait(0.05):
                     break
 
+    def _ear_loop(self) -> None:
+        """High-rate EAR sampling for blink / microsleep / PERCLOS (no DB writes)."""
+        from detection.views import dlib_detector
+        from detection.utils.fatigue_tracker import fatigue_tracker
+
+        last_seq = -1
+        while not self._stop.is_set():
+            loop_start = time.time()
+            with self._lock:
+                frame = None if self._latest_bgr is None else self._latest_bgr.copy()
+                seq = self._frame_seq
+                session_id = self._session_id
+                ear_ms = self._ear_interval_ms
+
+            if frame is None or session_id is None or seq == last_seq:
+                if self._stop.wait(0.02):
+                    break
+                continue
+
+            last_seq = seq
+            try:
+                if dlib_detector is not None:
+                    sample = self._resize_for_preview(frame)
+                    dlib_results = dlib_detector.detect_fatigue(sample, face_bbox=None)
+                    snap = fatigue_tracker.update(
+                        session_id,
+                        ear=dlib_results.get("eye_aspect_ratio"),
+                        yawn_detected=None,
+                        faces_detected=int(dlib_results.get("faces_detected") or 0),
+                        landmarks=dlib_results.get("landmarks"),
+                    )
+                    with self._lock:
+                        # Lightweight live metrics between full detections
+                        meta = dict(self.latest_meta)
+                        meta.update(
+                            {
+                                "eye_aspect_ratio": snap.eye_aspect_ratio,
+                                "perclos": snap.perclos,
+                                "eye_closed_ms": snap.eye_closed_ms,
+                                "is_microsleep": snap.is_microsleep,
+                                "fatigue_level": snap.fatigue_level,
+                                "yawn_detected": snap.yawn_detected,
+                            }
+                        )
+                        self.latest_meta = meta
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self.error = str(exc)
+            finally:
+                try:
+                    connection.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            elapsed_ms = (time.time() - loop_start) * 1000.0
+            sleep_ms = max(0.0, ear_ms - elapsed_ms)
+            if sleep_ms > 0 and self._stop.wait(sleep_ms / 1000.0):
+                break
+
     def _detect_loop(self) -> None:
         """Run YOLO/dlib at detection_interval only; does not drive preview FPS."""
         from detection.models import DetectionSession
@@ -199,9 +291,10 @@ class MvsGrabber:
                     with self._lock:
                         self.error = "Session not found"
                     break
-                # Detection can use a moderately sized frame for speed
                 det_frame = self._resize_for_preview(frame)
-                result = process_image(det_frame, session, True, True)
+                result = process_image(
+                    det_frame, session, True, True, update_ear_tracker=True
+                )
                 meta = {
                     "face_detected": result.get("face_detected"),
                     "smoking_detected": result.get("smoking_detected"),
@@ -210,6 +303,9 @@ class MvsGrabber:
                     "yawn_detected": result.get("yawn_detected"),
                     "fatigue_level": result.get("fatigue_level"),
                     "eye_aspect_ratio": result.get("eye_aspect_ratio"),
+                    "perclos": result.get("perclos"),
+                    "eye_closed_ms": result.get("eye_closed_ms"),
+                    "is_microsleep": result.get("is_microsleep"),
                     "detection_id": result.get("detection_id"),
                 }
                 with self._lock:

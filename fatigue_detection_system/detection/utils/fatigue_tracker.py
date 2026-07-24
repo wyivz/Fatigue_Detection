@@ -105,17 +105,21 @@ class FatigueTemporalTracker:
         self,
         session_id: int,
         ear: Optional[float],
-        yawn_detected: bool = False,
+        yawn_detected: Optional[bool] = None,
         faces_detected: int = 0,
         landmarks: Any = None,
         timestamp: Optional[float] = None,
     ) -> FatigueSnapshot:
-        """Feed one EAR sample. Skip PERCLOS denominator when no face / no EAR."""
+        """Feed one EAR sample. Skip PERCLOS denominator when no face / no EAR.
+
+        yawn_detected=None keeps the previous yawn flag (used by high-rate EAR loop).
+        """
         t = time.time() if timestamp is None else float(timestamp)
         with self._lock:
             state = self._get_state(session_id)
             cfg = state.config or load_fatigue_config()
-            state.last_yawn = bool(yawn_detected)
+            if yawn_detected is not None:
+                state.last_yawn = bool(yawn_detected)
             state.last_faces = int(faces_detected)
             if landmarks is not None:
                 state.last_landmarks = landmarks
