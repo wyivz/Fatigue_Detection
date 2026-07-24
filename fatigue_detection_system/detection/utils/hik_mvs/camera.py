@@ -23,24 +23,22 @@ def _load_sdk():
     global _sdk, _sdk_error
     if _sdk is not None:
         return _sdk
-    if _sdk_error and _sdk is None and "MvCamCtrldll" in (_sdk_error or ""):
-        pass
     try:
-        from MvImport import MvCameraControl_class as mvs  # noqa: WPS433
-        from MvImport.CameraParams_const import (  # noqa: WPS433
+        from detection.utils.hik_mvs.MvImport import MvCameraControl_class as mvs  # noqa: WPS433
+        from detection.utils.hik_mvs.MvImport.CameraParams_const import (  # noqa: WPS433
             MV_ACCESS_Exclusive,
             MV_GIGE_DEVICE,
             MV_USB_DEVICE,
         )
-        from MvImport.CameraParams_header import (  # noqa: WPS433
+        from detection.utils.hik_mvs.MvImport.CameraParams_header import (  # noqa: WPS433
             MV_CC_DEVICE_INFO,
             MV_CC_DEVICE_INFO_LIST,
             MV_CC_PIXEL_CONVERT_PARAM,
             MV_FRAME_OUT_INFO_EX,
             MVCC_INTVALUE,
         )
-        from MvImport.MvErrorDefine_const import MV_OK  # noqa: WPS433
-        from MvImport.PixelType_header import (  # noqa: WPS433
+        from detection.utils.hik_mvs.MvImport.MvErrorDefine_const import MV_OK  # noqa: WPS433
+        from detection.utils.hik_mvs.MvImport.PixelType_header import (  # noqa: WPS433
             PixelType_Gvsp_BGR8_Packed,
             PixelType_Gvsp_BayerBG8,
             PixelType_Gvsp_BayerGB8,
