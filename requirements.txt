@@ -1,6 +1,6 @@
 Django
 Pillow
-opencv-python
+opencv-python==4.10.0.84
 dlib
 ultralytics
 numpy
