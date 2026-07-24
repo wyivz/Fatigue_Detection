@@ -232,26 +232,14 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'fatigue_detection_system.settin
 import django
 django.setup()
 from detection.models import SystemConfig
-obj, _ = SystemConfig.objects.get_or_create(pk=1)
-changed = False
-if hasattr(obj, 'yolo_device'):
-    if getattr(obj, 'yolo_device', None) != 'cuda:0':
-        obj.yolo_device = 'cuda:0'
-        changed = True
-if hasattr(obj, 'device'):
-    if getattr(obj, 'device', None) != 'cuda:0':
-        obj.device = 'cuda:0'
-        changed = True
-# common field name in this project
-for name, val in [('compute_device', 'cuda:0'), ('torch_device', 'cuda:0')]:
-    if hasattr(obj, name) and getattr(obj, name) != val:
-        setattr(obj, name, val)
-        changed = True
-if changed:
-    obj.save()
-    print('SYSTEM_CONFIG_CUDA_SET')
-else:
-    print('SYSTEM_CONFIG_CUDA_SKIP')
+obj, created = SystemConfig.objects.update_or_create(
+    config_key='device',
+    defaults={
+        'config_value': 'cuda:0',
+        'description': 'Inference device (cpu / cuda:0)',
+    },
+)
+print('SYSTEM_CONFIG_DEVICE', 'created' if created else 'updated', 'cuda:0')
 "@
         & $VenvPy -c $setCuda
     }
