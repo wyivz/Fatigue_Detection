@@ -206,10 +206,41 @@ class HikCamera:
         ret = cam.MV_CC_CreateHandle(info)
         if ret != sdk.MV_OK:
             raise RuntimeError("CreateHandle failed: 0x%x" % ret)
-        ret = cam.MV_CC_OpenDevice(sdk.MV_ACCESS_Exclusive, 0)
-        if ret != sdk.MV_OK:
+
+        access_modes = [
+            ("Exclusive", getattr(sdk, "MV_ACCESS_Exclusive", 1)),
+            ("ExclusiveWithSwitch", getattr(sdk, "MV_ACCESS_ExclusiveWithSwitch", 2)),
+            ("Control", getattr(sdk, "MV_ACCESS_Control", 3)),
+        ]
+        # Prefer values from CameraParams if imported on sdk bundle
+        try:
+            from CameraParams_const import (  # noqa: WPS433
+                MV_ACCESS_Control,
+                MV_ACCESS_Exclusive,
+                MV_ACCESS_ExclusiveWithSwitch,
+            )
+            access_modes = [
+                ("Exclusive", MV_ACCESS_Exclusive),
+                ("ExclusiveWithSwitch", MV_ACCESS_ExclusiveWithSwitch),
+                ("Control", MV_ACCESS_Control),
+            ]
+        except Exception:  # noqa: BLE001
+            pass
+
+        last_ret = None
+        opened = False
+        for name, mode in access_modes:
+            ret = cam.MV_CC_OpenDevice(mode, 0)
+            last_ret = ret
+            if ret == sdk.MV_OK:
+                opened = True
+                break
+        if not opened:
             cam.MV_CC_DestroyHandle()
-            raise RuntimeError("OpenDevice failed: 0x%x (close MVS client if open)" % ret)
+            raise RuntimeError(
+                "OpenDevice failed: 0x%x (close MVS client preview / free camera, then retry)"
+                % (last_ret or 0)
+            )
 
         # Prefer continuous acquisition if trigger mode exists
         try:
