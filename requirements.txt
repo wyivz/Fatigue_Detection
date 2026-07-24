@@ -1,0 +1,11 @@
+Django
+Pillow
+opencv-python
+dlib
+ultralytics
+numpy
+scipy
+matplotlib
+torch
+torchvision
+tqdm

@@ -1,0 +1,246 @@
+{% extends 'base.html' %}
+
+{% block title %}视频检测 - 疲劳驾驶检测系统{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="fas fa-file-video me-2"></i>视频检测</h2>
+        <div>
+            <a href="{% url 'detection:dashboard' %}" class="btn btn-outline-primary">
+                <i class="fas fa-arrow-left me-1"></i>返回仪表盘
+            </a>
+        </div>
+    </div>
+    
+    <div class="row justify-content-center">
+        <div class="col-lg-8">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-upload me-2"></i>上传视频文件</h5>
+                </div>
+                <div class="card-body p-4">
+                    <div class="alert alert-info mb-4">
+                        <i class="fas fa-info-circle me-2"></i>
+                        请上传包含驾驶员画面的视频，系统将自动检测视频中驾驶员的面部状态、疲劳程度和不良驾驶行为。
+                    </div>
+                    
+                    <form method="post" enctype="multipart/form-data" id="upload-form">
+                        {% csrf_token %}
+                        
+                        <div class="mb-4">
+                            <div class="video-upload-container border rounded p-4 text-center position-relative">
+                                <div id="preview-container" style="display: none;">
+                                    <video id="video-preview" class="img-fluid mb-3 rounded" style="max-height: 300px;" controls></video>
+                                    <button type="button" class="btn btn-sm btn-outline-danger position-absolute top-0 end-0 m-2" id="clear-preview">
+                                        <i class="fas fa-times"></i>
+                                    </button>
+                                </div>
+                                
+                                <div id="upload-placeholder">
+                                    <i class="fas fa-film fa-4x mb-3" style="color: var(--secondary-color);"></i>
+                                    <h5>拖放视频或点击选择</h5>
+                                    <p class="text-muted small">支持 .mp4, .avi, .mov 格式，最大 100MB</p>
+                                </div>
+                                
+                                <input type="file" name="video_file" id="video-file" class="position-absolute top-0 start-0 opacity-0" style="width: 100%; height: 100%; cursor: pointer;" accept="video/mp4,video/x-msvideo,video/quicktime">
+                            </div>
+                            <div class="progress mt-2" style="display: none;" id="upload-progress">
+                                <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        
+                        <div class="row mb-4">
+                            <div class="col-md-6 mb-3 mb-md-0">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="detect-fatigue" name="detect_fatigue" value="true" checked>
+                                    <label class="form-check-label" for="detect-fatigue">
+                                        <i class="fas fa-tired me-1"></i>检测疲劳状态
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="detect-behavior" name="detect_behavior" value="true" checked>
+                                    <label class="form-check-label" for="detect-behavior">
+                                        <i class="fas fa-smoking me-1"></i>检测不良行为
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="d-grid gap-2">
+                            <button type="submit" class="btn btn-primary btn-lg" id="upload-btn" disabled>
+                                <i class="fas fa-search me-1"></i>开始检测
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            
+            <div class="card shadow-sm mt-4">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-info-circle me-2"></i>视频检测说明</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-3 text-center mb-3 mb-md-0">
+                            <i class="fas fa-upload fa-3x mb-3" style="color: var(--primary-color);"></i>
+                            <h6>上传视频</h6>
+                            <p class="small text-muted">选择驾驶场景视频</p>
+                        </div>
+                        <div class="col-md-3 text-center mb-3 mb-md-0">
+                            <i class="fas fa-cogs fa-3x mb-3" style="color: var(--secondary-color);"></i>
+                            <h6>处理分析</h6>
+                            <p class="small text-muted">系统逐帧分析视频</p>
+                        </div>
+                        <div class="col-md-3 text-center mb-3 mb-md-0">
+                            <i class="fas fa-check-circle fa-3x mb-3" style="color: var(--success-color);"></i>
+                            <h6>完成检测</h6>
+                            <p class="small text-muted">生成详细分析报告</p>
+                        </div>
+                        <div class="col-md-3 text-center">
+                            <i class="fas fa-chart-bar fa-3x mb-3" style="color: var(--warning-color);"></i>
+                            <h6>查看统计</h6>
+                            <p class="small text-muted">查看统计数据和结果</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // 获取DOM元素
+    const videoFile = document.getElementById('video-file');
+    const videoPreview = document.getElementById('video-preview');
+    const previewContainer = document.getElementById('preview-container');
+    const uploadPlaceholder = document.getElementById('upload-placeholder');
+    const clearPreview = document.getElementById('clear-preview');
+    const uploadBtn = document.getElementById('upload-btn');
+    const uploadForm = document.getElementById('upload-form');
+    const progressBar = document.querySelector('.progress-bar');
+    const progressContainer = document.getElementById('upload-progress');
+    
+    // 处理文件选择
+    videoFile.addEventListener('change', function() {
+        if (this.files && this.files[0]) {
+            const file = this.files[0];
+            
+            // 检查文件类型
+            const acceptedTypes = ['video/mp4', 'video/x-msvideo', 'video/quicktime'];
+            if (!acceptedTypes.includes(file.type)) {
+                alert('请选择MP4、AVI或MOV格式的视频！');
+                this.value = '';
+                return;
+            }
+            
+            // 检查文件大小（最大100MB）
+            if (file.size > 100 * 1024 * 1024) {
+                alert('文件大小不能超过100MB！');
+                this.value = '';
+                return;
+            }
+            
+            // 显示预览
+            const url = URL.createObjectURL(file);
+            videoPreview.src = url;
+            previewContainer.style.display = 'block';
+            uploadPlaceholder.style.display = 'none';
+            uploadBtn.disabled = false;
+            
+            // 加载元数据
+            videoPreview.onloadedmetadata = function() {
+                // 显示视频信息
+                const duration = Math.round(videoPreview.duration);
+                const minutes = Math.floor(duration / 60);
+                const seconds = duration % 60;
+                
+                console.log(`视频时长: ${minutes}分${seconds}秒`);
+            };
+        }
+    });
+    
+    // 清除预览
+    clearPreview.addEventListener('click', function() {
+        videoFile.value = '';
+        videoPreview.src = '';
+        previewContainer.style.display = 'none';
+        uploadPlaceholder.style.display = 'block';
+        uploadBtn.disabled = true;
+    });
+    
+    // 拖放功能
+    const dropZone = document.querySelector('.video-upload-container');
+    
+    ['dragover', 'dragenter'].forEach(eventName => {
+        dropZone.addEventListener(eventName, function(e) {
+            e.preventDefault();
+            this.classList.add('border-primary');
+        });
+    });
+    
+    ['dragleave', 'dragend'].forEach(eventName => {
+        dropZone.addEventListener(eventName, function(e) {
+            this.classList.remove('border-primary');
+        });
+    });
+    
+    dropZone.addEventListener('drop', function(e) {
+        e.preventDefault();
+        this.classList.remove('border-primary');
+        
+        if (e.dataTransfer.files.length) {
+            videoFile.files = e.dataTransfer.files;
+            const event = new Event('change');
+            videoFile.dispatchEvent(event);
+        }
+    });
+    
+    // 表单提交处理
+    uploadForm.addEventListener('submit', function(e) {
+        // 检查是否有文件
+        if (!videoFile.files || !videoFile.files[0]) {
+            alert('请先选择要上传的视频文件');
+            e.preventDefault();
+            return;
+        }
+        
+        // 更新按钮状态
+        uploadBtn.disabled = true;
+        uploadBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>上传并处理中...';
+        
+        // 显示进度条
+        progressContainer.style.display = 'block';
+        
+        // 模拟上传和处理过程 - 视觉反馈
+        let progress = 0;
+        const loadingInterval = setInterval(() => {
+            progress += 1;
+            if (progress > 100) {
+                clearInterval(loadingInterval);
+            } else {
+                progressBar.style.width = progress + '%';
+                progressBar.setAttribute('aria-valuenow', progress);
+            }
+        }, 300);
+        
+        // 添加处理提示信息
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-info mt-3';
+        alertDiv.innerHTML = `
+            <div class="d-flex align-items-center">
+                <span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
+                <strong>视频处理中...</strong>
+                <span class="ms-2">请勿关闭页面，视频处理完成后将自动跳转到结果页面</span>
+            </div>
+        `;
+        uploadForm.insertAdjacentElement('afterend', alertDiv);
+        
+        // 不阻止表单提交，直接上传并处理
+    });
+</script>
+{% endblock %} 

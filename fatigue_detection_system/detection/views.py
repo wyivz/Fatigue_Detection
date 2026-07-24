@@ -1,0 +1,797 @@
+from django.shortcuts import render
+import os
+import json
+import cv2
+import base64
+import numpy as np
+from datetime import datetime, timedelta
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth.decorators import login_required
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.contrib import messages
+from django.conf import settings
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.utils import timezone
+
+from .models import DetectionSession, DetectionResult, SystemConfig
+from .utils.yolo_detector import YOLODetector
+from .utils.dlib_detector import DlibDetector
+
+# 检查权重文件是否存在
+yolo_weights_path = os.path.join(settings.BASE_DIR, 'weights', 'best.pt')
+dlib_weights_path = os.path.join(settings.BASE_DIR, 'weights', 'shape_predictor_68_face_landmarks.dat')
+
+yolo_weights_exist = os.path.exists(yolo_weights_path)
+dlib_weights_exist = os.path.exists(dlib_weights_path)
+
+# 创建检测器实例
+try:
+    if not yolo_weights_exist:
+        print(f"警告: YOLO权重文件不存在: {yolo_weights_path}")
+        print("请下载权重文件并放到weights目录")
+        yolo_detector = None
+    else:
+        yolo_detector = YOLODetector()
+        print("YOLO 检测器加载成功")
+except Exception as e:
+    yolo_detector = None
+    print(f"YOLO 检测器加载失败: {e}")
+
+try:
+    if not dlib_weights_exist:
+        print(f"警告: dlib面部特征点预测器文件不存在: {dlib_weights_path}")
+        print("请下载预测器文件并放到weights目录")
+        dlib_detector = None
+    else:
+        dlib_detector = DlibDetector()
+        print("dlib 检测器加载成功")
+except Exception as e:
+    dlib_detector = None
+    print(f"dlib 检测器加载失败: {e}")
+
+@login_required
+def dashboard(request):
+    """
+    用户仪表盘，显示检测统计信息和最近的检测记录
+    """
+    # 获取用户的检测会话
+    sessions = DetectionSession.objects.filter(user=request.user).order_by('-start_time')[:5]
+    
+    # 统计检测结果
+    all_results = DetectionResult.objects.filter(session__user=request.user)
+    
+    # 统计各种行为的检测次数
+    stats = {
+        'total_sessions': sessions.count(),
+        'total_detections': all_results.count(),
+        'smoking_count': all_results.filter(smoking_detected=True).count(),
+        'phone_count': all_results.filter(phone_detected=True).count(),
+        'drinking_count': all_results.filter(drinking_detected=True).count(),
+        'yawn_count': all_results.filter(yawn_detected=True).count(),
+        'fatigue_count': all_results.filter(fatigue_level__gte=2).count(),
+    }
+    
+    # 计算疲劳等级分布
+    fatigue_levels = {
+        'level0': all_results.filter(fatigue_level=0).count(),
+        'level1': all_results.filter(fatigue_level=1).count(),
+        'level2': all_results.filter(fatigue_level=2).count(),
+        'level3': all_results.filter(fatigue_level=3).count(),
+        'level4': all_results.filter(fatigue_level=4).count(),
+    }
+    
+    context = {
+        'sessions': sessions,
+        'stats': stats,
+        'fatigue_levels': fatigue_levels,
+    }
+    
+    return render(request, 'detection/dashboard.html', context)
+
+@login_required
+def realtime_detection(request):
+    """
+    实时检测页面，使用摄像头
+    """
+    # 创建新的检测会话
+    session = DetectionSession.objects.create(
+        user=request.user,
+        session_type='realtime',
+    )
+    
+    # 获取系统配置
+    configs = {}
+    system_configs = SystemConfig.objects.all()
+    for config in system_configs:
+        configs[config.config_key] = config.config_value
+    
+    # 设置默认配置
+    fatigue_alert_level = int(configs.get('fatigue_alert_level', 3))
+    alert_volume = int(configs.get('alert_volume', 80))
+    enable_voice = configs.get('enable_voice') == 'true'
+    detection_interval = int(configs.get('detection_interval', 500))
+    
+    context = {
+        'session': session,
+        'fatigue_alert_level': fatigue_alert_level,
+        'alert_volume': alert_volume,
+        'enable_voice': enable_voice,
+        'detection_interval': detection_interval,
+    }
+    
+    return render(request, 'detection/realtime.html', context)
+
+@login_required
+def video_detection(request):
+    """
+    视频文件检测页面
+    """
+    if request.method == 'POST' and request.FILES.get('video_file'):
+        video_file = request.FILES['video_file']
+        detect_fatigue = request.POST.get('detect_fatigue') == 'true'
+        detect_behaviors = request.POST.get('detect_behavior') == 'true'
+        
+        # 创建新的检测会话
+        session = DetectionSession.objects.create(
+            user=request.user,
+            session_type='video',
+            source_file=video_file,
+            status='in_progress'
+        )
+        
+        try:
+            # 打开视频文件进行处理
+            video_path = session.source_file.path
+            cap = cv2.VideoCapture(video_path)
+            
+            if not cap.isOpened():
+                raise Exception("无法打开视频文件")
+            
+            # 获取视频信息
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            
+            # 每隔多少帧提取一帧进行检测
+            frame_interval = 30  # 例如，每30帧检测一次
+            
+            frame_index = 0
+            detection_count = 0
+            
+            while cap.isOpened():
+                ret, frame = cap.read()
+                
+                if not ret:
+                    break
+                
+                # 每隔frame_interval帧进行一次检测
+                if frame_index % frame_interval == 0:
+                    # 处理当前帧
+                    process_image(frame, session, detect_fatigue, detect_behaviors)
+                    detection_count += 1
+                
+                frame_index += 1
+                
+                # 如果处理了足够的帧，就停止处理（避免过长的视频）
+                if detection_count >= 20:  # 最多处理20帧
+                    break
+            
+            # 释放视频对象
+            cap.release()
+            
+            # 更新会话状态
+            session.status = 'completed'
+            session.end_time = timezone.now()
+            session.save()
+            
+            messages.success(request, f'视频处理完成，共检测了{detection_count}帧。')
+            
+        except Exception as e:
+            # 处理出错
+            session.status = 'failed'
+            session.end_time = timezone.now()
+            session.save()
+            
+            messages.error(request, f'视频处理失败: {str(e)}')
+        
+        return redirect('detection:session_detail', session_id=session.id)
+    
+    return render(request, 'detection/video_upload.html')
+
+@login_required
+def session_detail(request, session_id):
+    """
+    检测会话详情页面
+    """
+    session = get_object_or_404(DetectionSession, id=session_id, user=request.user)
+    
+    return render(request, 'detection/session_detail.html', {'session': session})
+
+@login_required
+def detection_results(request, session_id):
+    """
+    检测结果页面
+    """
+    session = get_object_or_404(DetectionSession, id=session_id, user=request.user)
+    results = DetectionResult.objects.filter(session=session).order_by('timestamp')
+    
+    return render(request, 'detection/results.html', {
+        'session': session,
+        'results': results
+    })
+
+@login_required
+def statistics(request):
+    """
+    统计分析页面
+    """
+    # 获取当前用户的所有会话
+    all_sessions = DetectionSession.objects.filter(user=request.user)
+    
+    # 获取总会话数
+    total_sessions = all_sessions.count()
+    
+    # 获取今日会话数
+    today = timezone.now().date()
+    today_sessions = all_sessions.filter(start_time__date=today).count()
+    
+    # 获取疲劳检测结果
+    all_results = DetectionResult.objects.filter(session__user=request.user)
+    
+    # 获取疲劳检测次数 (疲劳等级大于等于2)
+    fatigue_count = all_results.filter(fatigue_level__gte=2).count()
+    
+    # 获取不良行为次数
+    bad_behavior_count = all_results.filter(
+        smoking_detected=True
+    ).count() + all_results.filter(
+        phone_detected=True
+    ).count() + all_results.filter(
+        drinking_detected=True
+    ).count() + all_results.filter(
+        yawn_detected=True
+    ).count()
+    
+    # 按会话类型统计
+    realtime_count = all_sessions.filter(session_type='realtime').count()
+    video_count = all_sessions.filter(session_type='video').count()
+    
+    # 按疲劳等级统计
+    normal_count = all_results.filter(fatigue_level=0).count()
+    mild_count = all_results.filter(fatigue_level=1).count()
+    moderate_count = all_results.filter(fatigue_level=2).count()
+    severe_count = all_results.filter(fatigue_level=3).count()
+    extreme_count = all_results.filter(fatigue_level=4).count()
+    
+    # 按不良行为统计
+    yawn_count = all_results.filter(yawn_detected=True).count()
+    smoking_count = all_results.filter(smoking_detected=True).count()
+    phone_count = all_results.filter(phone_detected=True).count()
+    drinking_count = all_results.filter(drinking_detected=True).count()
+    
+    # 获取近7天的数据
+    week_labels = []
+    week_data = []
+    
+    for i in range(6, -1, -1):
+        date = today - timedelta(days=i)
+        week_labels.append(date.strftime('%m-%d'))
+        week_data.append(all_sessions.filter(start_time__date=date).count())
+    
+    # 按小时段统计
+    hourly_data = [0] * 8  # 8个时间段：0-3, 3-6, 6-9, 9-12, 12-15, 15-18, 18-21, 21-24
+    
+    for result in all_results:
+        hour = result.timestamp.hour
+        hourly_data[hour // 3] += 1
+    
+    context = {
+        # 统计卡片数据
+        'total_sessions': total_sessions,
+        'today_sessions': today_sessions,
+        'fatigue_count': fatigue_count,
+        'bad_behavior_count': bad_behavior_count,
+        
+        # 会话类型统计
+        'realtime_count': realtime_count,
+        'video_count': video_count,
+        
+        # 疲劳等级统计
+        'normal_count': normal_count,
+        'mild_count': mild_count,
+        'moderate_count': moderate_count,
+        'severe_count': severe_count,
+        'extreme_count': extreme_count,
+        
+        # 不良行为统计
+        'yawn_count': yawn_count,
+        'smoking_count': smoking_count,
+        'phone_count': phone_count,
+        'drinking_count': drinking_count,
+        
+        # 近7天趋势
+        'week_labels': json.dumps(week_labels),
+        'week_data': week_data,
+        
+        # 时间段分布
+        'hourly_data': hourly_data,
+    }
+    
+    return render(request, 'detection/statistics.html', context)
+
+@login_required
+def system_config(request):
+    """
+    系统配置页面，仅管理员可访问
+    """
+    if not request.user.is_admin and not request.user.is_superuser:
+        messages.error(request, '您没有访问此页面的权限')
+        return redirect('detection:dashboard')
+    
+    if request.method == 'POST':
+        # 更新配置
+        for key, value in request.POST.items():
+            if key.startswith('config_'):
+                config_key = key[7:]  # 去除 'config_' 前缀
+                config, created = SystemConfig.objects.update_or_create(
+                    config_key=config_key,
+                    defaults={'config_value': value}
+                )
+        
+        messages.success(request, '系统配置已更新')
+        return redirect('detection:system_config')
+    
+    # 获取所有配置项并转换为字典
+    configs_dict = {}
+    configs = SystemConfig.objects.all()
+    
+    for config in configs:
+        configs_dict[config.config_key] = config.config_value
+    
+    return render(request, 'detection/system_config.html', {'configs': configs_dict})
+
+@csrf_exempt
+@login_required
+def start_detection(request):
+    """
+    API: 开始检测
+    """
+    if request.method == 'POST':
+        session_id = request.POST.get('session_id')
+        source_type = (request.POST.get('source_type') or 'browser').strip().lower()
+        
+        if not session_id:
+            return JsonResponse({'status': 'error', 'message': '缺少会话ID'})
+        
+        try:
+            session = DetectionSession.objects.get(id=session_id, user=request.user)
+            if source_type == 'mvs':
+                from .utils.hik_mvs.grabber import mvs_grabber
+                configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+                interval = int(configs.get('detection_interval', 500))
+                camera_ip = (request.POST.get('camera_ip') or '').strip() or None
+                device_index = request.POST.get('device_index')
+                idx = int(device_index) if device_index not in (None, '') else int(configs.get('default_mvs_index', 0))
+                try:
+                    if mvs_grabber.running:
+                        mvs_grabber.stop(complete_session=False)
+                    mvs_grabber.start(
+                        session_id=session.id,
+                        user_id=request.user.id,
+                        interval_ms=interval,
+                        device_index=idx if not camera_ip else None,
+                        camera_ip=camera_ip,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    return JsonResponse({'status': 'error', 'message': str(exc)})
+            return JsonResponse({
+                'status': 'success',
+                'session_id': session.id,
+                'source_type': source_type,
+            })
+        except DetectionSession.DoesNotExist:
+            return JsonResponse({'status': 'error', 'message': '无效的会话ID'})
+    
+    return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
+
+@csrf_exempt
+@login_required
+def stop_detection(request):
+    """
+    API: 停止检测
+    """
+    if request.method == 'POST':
+        session_id = request.POST.get('session_id')
+        
+        if not session_id:
+            return JsonResponse({'status': 'error', 'message': '缺少会话ID'})
+        
+        try:
+            session = DetectionSession.objects.get(id=session_id, user=request.user)
+            try:
+                from .utils.hik_mvs.grabber import mvs_grabber
+                if mvs_grabber.running and mvs_grabber.status().get('session_id') == session.id:
+                    mvs_grabber.stop(complete_session=True)
+                else:
+                    session.end_time = timezone.now()
+                    session.status = 'completed'
+                    session.save(update_fields=['end_time', 'status'])
+            except Exception:  # noqa: BLE001
+                session.end_time = timezone.now()
+                session.status = 'completed'
+                session.save(update_fields=['end_time', 'status'])
+            return JsonResponse({'status': 'success', 'session_id': session.id})
+        except DetectionSession.DoesNotExist:
+            return JsonResponse({'status': 'error', 'message': '无效的会话ID'})
+    
+    return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
+
+
+@login_required
+def list_sources(request):
+    """API: list GigE / industrial cameras from MVS SDK."""
+    from .utils.hik_mvs.camera import enumerate_devices
+    data = enumerate_devices()
+    return JsonResponse({'status': 'success', **data})
+
+
+@login_required
+def mvs_status(request):
+    """API: MVS grabber status + latest detection meta."""
+    from .utils.hik_mvs.grabber import mvs_grabber
+    session_id = request.GET.get('session_id')
+    st = mvs_grabber.status()
+    if session_id and st.get('session_id') and int(session_id) != int(st['session_id']):
+        return JsonResponse({'status': 'error', 'message': '会话与采集器不匹配'}, status=400)
+    return JsonResponse({'status': 'success', **st})
+
+
+@login_required
+def mvs_preview(request):
+    """MJPEG preview stream for MVS grabber annotated frames."""
+    import time
+    from django.http import StreamingHttpResponse, HttpResponse
+    from .utils.hik_mvs.grabber import mvs_grabber
+
+    session_id = request.GET.get('session_id')
+    if not session_id:
+        return HttpResponse('missing session_id', status=400)
+    try:
+        session = DetectionSession.objects.get(id=session_id, user=request.user)
+    except DetectionSession.DoesNotExist:
+        return HttpResponse('invalid session', status=404)
+
+    def frame_generator():
+            idle = 0
+            while True:
+                st = mvs_grabber.status()
+                if not st.get('running') or st.get('session_id') != session.id:
+                    idle += 1
+                    if idle > 50:
+                        break
+                    time.sleep(0.1)
+                    continue
+                idle = 0
+                jpeg = mvs_grabber.get_jpeg()
+                if jpeg:
+                    yield (
+                        b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n'
+                    )
+                time.sleep(0.05)
+
+    response = StreamingHttpResponse(
+        frame_generator(),
+        content_type='multipart/x-mixed-replace; boundary=frame',
+    )
+    return response
+
+@csrf_exempt
+@login_required
+def get_result(request):
+    """
+    API: 接收前端发送的图像帧，进行检测并返回结果
+    """
+    if request.method == 'POST':
+        session_id = request.POST.get('session_id')
+        image_data = request.POST.get('image_data')
+        detect_fatigue = request.POST.get('detect_fatigue') == 'true'
+        detect_behaviors = request.POST.get('detect_behaviors') == 'true'
+        
+        print(f"收到检测请求: session_id={session_id}, detect_fatigue={detect_fatigue}, detect_behaviors={detect_behaviors}")
+        
+        if not session_id or not image_data:
+            return JsonResponse({'status': 'error', 'message': '缺少必要参数'})
+        
+        try:
+            session = DetectionSession.objects.get(id=session_id, user=request.user)
+            
+            # 解码Base64图像
+            image_data = image_data.split(',')[1]
+            image_bytes = base64.b64decode(image_data)
+            np_arr = np.frombuffer(image_bytes, np.uint8)
+            image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            
+            # 处理图像
+            result = process_image(image, session, detect_fatigue, detect_behaviors)
+            
+            return JsonResponse(result)
+        except Exception as e:
+            print(f"检测过程出现错误: {e}")
+            return JsonResponse({'status': 'error', 'message': str(e)})
+    
+    return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
+
+def process_image(
+    image,
+    session,
+    detect_fatigue=True,
+    detect_behaviors=True,
+    include_image_data=True,
+    persist=True,
+):
+    """
+    处理图像，进行检测并保存结果
+    :param persist: False 时只推理不画图/写库（MVS 高频路径，显著降低延迟）
+    """
+    import time as _time
+
+    from .utils.fatigue_tracker import behavior_tracker, fatigue_tracker
+    from .utils.mono_preprocess import enhance_for_mono, load_mono_config
+
+    t0 = _time.perf_counter()
+    timing = {
+        'mono_ms': 0.0,
+        'yolo_ms': 0.0,
+        'dlib_ms': 0.0,
+        'draw_ms': 0.0,
+        'save_ms': 0.0,
+        'total_ms': 0.0,
+    }
+    results = {'status': 'success', 'face_bbox': None}
+    configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+    mono_cfg = load_mono_config(configs)
+
+    face_bbox = None
+    processed_yolo = None
+    if detect_behaviors and yolo_detector:
+        t_mono = _time.perf_counter()
+        if mono_cfg['enabled']:
+            yolo_input = enhance_for_mono(image, configs)
+            timing['mono_ms'] = round((_time.perf_counter() - t_mono) * 1000.0, 1)
+        else:
+            yolo_input = image
+            timing['mono_ms'] = 0.0
+
+        t_yolo = _time.perf_counter()
+        yolo_results = yolo_detector.detect(yolo_input)
+        processed_yolo = yolo_detector.process_results(yolo_results)
+        timing['yolo_ms'] = round((_time.perf_counter() - t_yolo) * 1000.0, 1)
+
+        confirmed = behavior_tracker.update(
+            session.id,
+            smoking=bool(processed_yolo['smoking_detected']),
+            phone=bool(processed_yolo['phone_detected']),
+            drinking=bool(processed_yolo['drinking_detected']),
+            configs=configs,
+        )
+
+        for det in processed_yolo.get('detections', []):
+            if det.get('class_name') == 'face':
+                face_bbox = det.get('bbox')
+                break
+
+        results.update({
+            'face_detected': bool(processed_yolo['face_detected']),
+            'smoking_detected': bool(confirmed['smoking_detected']),
+            'phone_detected': bool(confirmed['phone_detected']),
+            'drinking_detected': bool(confirmed['drinking_detected']),
+            'face_bbox': face_bbox,
+            'behavior_debug': processed_yolo.get('behavior_debug') or {},
+            'confirm_progress': confirmed.get('confirm_progress') or {},
+            'detections': processed_yolo.get('detections') or [],
+        })
+    else:
+        results.update({
+            'face_detected': False,
+            'smoking_detected': False,
+            'phone_detected': False,
+            'drinking_detected': False,
+            'face_bbox': None,
+            'behavior_debug': {},
+            'confirm_progress': {},
+            'detections': [],
+        })
+
+    draw_lm = None
+    draw_mar = None
+    if detect_fatigue and dlib_detector:
+        try:
+            t_dlib = _time.perf_counter()
+            dlib_results = dlib_detector.detect_fatigue(image, face_bbox=face_bbox)
+            timing['dlib_ms'] = round((_time.perf_counter() - t_dlib) * 1000.0, 1)
+
+            faces_n = int(dlib_results.get('faces_detected') or 0)
+            if faces_n <= 0 and results.get('face_detected') and face_bbox:
+                faces_n = 1
+
+            if update_ear_tracker:
+                snap = fatigue_tracker.update(
+                    session.id,
+                    ear=dlib_results.get('eye_aspect_ratio'),
+                    yawn_detected=bool(dlib_results.get('yawn_detected')),
+                    faces_detected=faces_n,
+                    landmarks=dlib_results.get('landmarks'),
+                )
+            else:
+                snap = fatigue_tracker.get_snapshot(session.id)
+                if dlib_results.get('yawn_detected') is not None:
+                    snap = fatigue_tracker.update(
+                        session.id,
+                        ear=dlib_results.get('eye_aspect_ratio'),
+                        yawn_detected=bool(dlib_results.get('yawn_detected')),
+                        faces_detected=faces_n,
+                        landmarks=dlib_results.get('landmarks'),
+                    )
+            draw_mar = dlib_results.get('mouth_aspect_ratio')
+            draw_lm = dlib_results.get('landmarks') or snap.landmarks
+        except Exception as e:
+            _safe_log(f'dlib检测失败(沿用tracker快照): {e}')
+            snap = fatigue_tracker.get_snapshot(session.id)
+            draw_lm = snap.landmarks
+            timing['dlib_ms'] = round(timing.get('dlib_ms') or 0.0, 1)
+
+        results.update({
+            'eye_aspect_ratio': float(snap.eye_aspect_ratio) if snap.eye_aspect_ratio is not None else None,
+            'mouth_aspect_ratio': float(draw_mar) if draw_mar is not None else None,
+            'yawn_detected': bool(snap.yawn_detected),
+            'fatigue_level': int(snap.fatigue_level),
+            'perclos': float(snap.perclos),
+            'eye_closed_ms': int(snap.eye_closed_ms),
+            'is_microsleep': bool(snap.is_microsleep),
+            'has_landmarks': draw_lm is not None,
+        })
+    else:
+        snap = fatigue_tracker.get_snapshot(session.id)
+        draw_lm = snap.landmarks
+        results.update({
+            'eye_aspect_ratio': float(snap.eye_aspect_ratio) if snap.eye_aspect_ratio is not None else None,
+            'mouth_aspect_ratio': None,
+            'yawn_detected': bool(snap.yawn_detected),
+            'fatigue_level': int(snap.fatigue_level),
+            'perclos': float(snap.perclos),
+            'eye_closed_ms': int(snap.eye_closed_ms),
+            'is_microsleep': bool(snap.is_microsleep),
+            'has_landmarks': snap.landmarks is not None,
+        })
+
+    if not persist:
+        timing['total_ms'] = round((_time.perf_counter() - t0) * 1000.0, 1)
+        results['timing'] = timing
+        results['result_image_url'] = None
+        results['detection_id'] = None
+        results['image_data'] = None
+        return results
+
+    t_draw = _time.perf_counter()
+    if processed_yolo is not None and yolo_detector:
+        image_with_yolo = yolo_detector.draw_results(image, processed_yolo)
+    else:
+        image_with_yolo = image
+
+    if dlib_detector and (
+        draw_lm is not None
+        or results.get('eye_aspect_ratio') is not None
+        or int(results.get('fatigue_level') or 0) > 0
+    ):
+        draw_payload = {
+            'landmarks': draw_lm,
+            'eye_aspect_ratio': results.get('eye_aspect_ratio'),
+            'mouth_aspect_ratio': draw_mar,
+            'yawn_detected': results.get('yawn_detected'),
+            'fatigue_level': results.get('fatigue_level'),
+            'perclos': results.get('perclos'),
+            'eye_closed_ms': results.get('eye_closed_ms'),
+        }
+        image_with_results = dlib_detector.draw_fatigue_results(image_with_yolo, draw_payload)
+    else:
+        image_with_results = image_with_yolo
+    timing['draw_ms'] = round((_time.perf_counter() - t_draw) * 1000.0, 1)
+
+    t_save = _time.perf_counter()
+    detection_result = DetectionResult(
+        session=session,
+        face_detected=results['face_detected'],
+        smoking_detected=results['smoking_detected'],
+        phone_detected=results['phone_detected'],
+        drinking_detected=results['drinking_detected'],
+        eye_aspect_ratio=results['eye_aspect_ratio'],
+        yawn_detected=results['yawn_detected'],
+        fatigue_level=results['fatigue_level'],
+        perclos=results.get('perclos'),
+        eye_closed_ms=results.get('eye_closed_ms'),
+    )
+
+    result_filename = f"result_{session.id}_{timezone.now().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}.jpg"
+    try:
+        ok, buffer = cv2.imencode('.jpg', image_with_results, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if ok:
+            detection_result.result_image.save(result_filename, ContentFile(buffer.tobytes()), save=False)
+        else:
+            _safe_log('结果图像 JPEG 编码失败')
+    except Exception as e:
+        _safe_log(f'保存结果图像失败: {e}')
+
+    detection_result.save()
+    timing['save_ms'] = round((_time.perf_counter() - t_save) * 1000.0, 1)
+    timing['total_ms'] = round((_time.perf_counter() - t0) * 1000.0, 1)
+    results['timing'] = timing
+    results['result_image_url'] = detection_result.result_image.url if detection_result.result_image else None
+    results['detection_id'] = detection_result.id
+
+    if include_image_data:
+        ok, buffer = cv2.imencode('.jpg', image_with_results, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if ok:
+            results['image_data'] = f"data:image/jpeg;base64,{base64.b64encode(buffer.tobytes()).decode('utf-8')}"
+        else:
+            results['image_data'] = None
+    else:
+        results['image_data'] = None
+
+    return results
+
+
+@login_required
+def history(request):
+    """
+    检测历史记录页面，以小红书卡片风格展示
+    """
+    # 获取用户的所有检测会话
+    sessions = DetectionSession.objects.filter(user=request.user).order_by('-start_time')
+    
+    # 获取查询参数
+    session_type = request.GET.get('type', '')
+    status = request.GET.get('status', '')
+    
+    # 根据筛选条件过滤会话
+    if session_type:
+        sessions = sessions.filter(session_type=session_type)
+    if status:
+        sessions = sessions.filter(status=status)
+    
+    # 为每个会话获取代表性图片和摘要数据
+    for session in sessions:
+        # 获取该会话的一张有代表性的图片（如果有）
+        representative_result = DetectionResult.objects.filter(
+            session=session, 
+            result_image__isnull=False
+        ).first()
+        
+        session.thumbnail = representative_result.result_image if representative_result else None
+        
+        # 获取会话的摘要数据
+        session.detection_count = session.get_detection_count()
+        session.fatigue_count = DetectionResult.objects.filter(
+            session=session, 
+            fatigue_level__gte=2
+        ).count()
+        session.behavior_count = DetectionResult.objects.filter(
+            session=session
+        ).filter(
+            smoking_detected=True
+        ).count() + DetectionResult.objects.filter(
+            session=session
+        ).filter(
+            phone_detected=True
+        ).count()
+    
+    context = {
+        'sessions': sessions,
+        'session_types': dict(DetectionSession.SESSION_TYPES),
+        'session_statuses': dict(DetectionSession.SESSION_STATUS),
+        'current_type': session_type,
+        'current_status': status,
+    }
+    
+    return render(request, 'detection/history.html', context)

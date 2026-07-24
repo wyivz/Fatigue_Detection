@@ -1,0 +1,364 @@
+{% extends 'base.html' %}
+
+{% block title %}统计分析 - 疲劳驾驶检测系统{% endblock %}
+
+{% block extra_css %}
+<style>
+    .card-counter{
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        padding: 20px 10px;
+        background-color: #fff;
+        height: 130px;
+        border-radius: 8px;
+        transition: 0.3s;
+        position: relative;
+    }
+    .card-counter:hover{
+        box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+    }
+    .card-counter .count-icon{
+        position: absolute;
+        right: 20px;
+        top: 15px;
+        font-size: 32px;
+        opacity: 0.3;
+    }
+    .card-counter .count-numbers{
+        position: absolute;
+        right: 20px;
+        top: 55px;
+        font-size: 32px;
+        display: block;
+    }
+    .card-counter .count-name{
+        position: absolute;
+        left: 20px;
+        top: 20px;
+        font-style: normal;
+        font-weight: 600;
+        text-transform: capitalize;
+        opacity: 0.6;
+        display: block;
+        font-size: 16px;
+    }
+    .card-counter.primary{
+        background-color: #007bff;
+        color: #FFF;
+    }
+    .card-counter.danger{
+        background-color: #ef5350;
+        color: #FFF;
+    }
+    .card-counter.success{
+        background-color: #66bb6a;
+        color: #FFF;
+    }
+    .card-counter.info{
+        background-color: #26c6da;
+        color: #FFF;
+    }
+    .card-counter.warning{
+        background-color: #ffca28;
+        color: #000;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="fas fa-chart-line me-2"></i>统计分析</h2>
+        <div>
+            <a href="{% url 'detection:dashboard' %}" class="btn btn-outline-primary">
+                <i class="fas fa-arrow-left me-1"></i>返回仪表盘
+            </a>
+        </div>
+    </div>
+    
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card-counter primary">
+                <i class="fas fa-video count-icon"></i>
+                <span class="count-numbers">{{ total_sessions }}</span>
+                <span class="count-name">检测会话总数</span>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card-counter danger">
+                <i class="fas fa-tired count-icon"></i>
+                <span class="count-numbers">{{ fatigue_count }}</span>
+                <span class="count-name">疲劳检测次数</span>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card-counter warning">
+                <i class="fas fa-smoking count-icon"></i>
+                <span class="count-numbers">{{ bad_behavior_count }}</span>
+                <span class="count-name">不良行为次数</span>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card-counter success">
+                <i class="fas fa-calendar-alt count-icon"></i>
+                <span class="count-numbers">{{ today_sessions }}</span>
+                <span class="count-name">今日会话数</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="row">
+        <div class="col-md-6 mb-4">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0">检测会话类型分布</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="sessionTypeChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6 mb-4">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0">疲劳等级分布</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="fatigueLevelChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="row">
+        <div class="col-md-12 mb-4">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0">近7天检测趋势</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="weekTrendChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="row">
+        <div class="col-md-6 mb-4">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0">不良驾驶行为分布</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="behaviorChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6 mb-4">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0">检测时段分布</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="hourlyChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // 会话类型分布
+        var sessionTypeCtx = document.getElementById('sessionTypeChart').getContext('2d');
+        var sessionTypeChart = new Chart(sessionTypeCtx, {
+            type: 'doughnut',
+            data: {
+                labels: ['实时检测', '视频检测'],
+                datasets: [{
+                    data: [{{ realtime_count }}, {{ video_count }}],
+                    backgroundColor: [
+                        '#4e73df',
+                        '#1cc88a'
+                    ],
+                    hoverBackgroundColor: [
+                        '#2e59d9',
+                        '#17a673'
+                    ],
+                    hoverBorderColor: "rgba(234, 236, 244, 1)",
+                }]
+            },
+            options: {
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
+                },
+                cutout: '70%',
+            },
+        });
+        
+        // 疲劳等级分布
+        var fatigueLevelCtx = document.getElementById('fatigueLevelChart').getContext('2d');
+        var fatigueLevelChart = new Chart(fatigueLevelCtx, {
+            type: 'bar',
+            data: {
+                labels: ['正常', '轻度疲劳', '中度疲劳', '较严重疲劳', '严重疲劳'],
+                datasets: [{
+                    label: '检测次数',
+                    data: [{{ normal_count }}, {{ mild_count }}, {{ moderate_count }}, {{ severe_count }}, {{ extreme_count }}],
+                    backgroundColor: [
+                        '#28a745',
+                        '#17a2b8',
+                        '#ffc107',
+                        '#fd7e14',
+                        '#dc3545'
+                    ]
+                }]
+            },
+            options: {
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: {
+                            drawBorder: false
+                        }
+                    },
+                    x: {
+                        grid: {
+                            display: false
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    }
+                },
+                barPercentage: 0.5
+            }
+        });
+        
+        // 近7天趋势
+        var weekTrendCtx = document.getElementById('weekTrendChart').getContext('2d');
+        var weekTrendChart = new Chart(weekTrendCtx, {
+            type: 'line',
+            data: {
+                labels: {{ week_labels|safe }},
+                datasets: [{
+                    label: '检测会话数',
+                    data: {{ week_data }},
+                    lineTension: 0.3,
+                    backgroundColor: "rgba(78, 115, 223, 0.05)",
+                    borderColor: "rgba(78, 115, 223, 1)",
+                    pointRadius: 3,
+                    pointBackgroundColor: "rgba(78, 115, 223, 1)",
+                    pointBorderColor: "rgba(78, 115, 223, 1)",
+                    pointHoverRadius: 3,
+                    pointHoverBackgroundColor: "rgba(78, 115, 223, 1)",
+                    pointHoverBorderColor: "rgba(78, 115, 223, 1)",
+                    pointHitRadius: 10,
+                    pointBorderWidth: 2,
+                    fill: true
+                }]
+            },
+            options: {
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: {
+                            borderDash: [2],
+                            drawBorder: false
+                        }
+                    },
+                    x: {
+                        grid: {
+                            display: false,
+                            drawBorder: false
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    }
+                }
+            }
+        });
+        
+        // 不良驾驶行为分布
+        var behaviorCtx = document.getElementById('behaviorChart').getContext('2d');
+        var behaviorChart = new Chart(behaviorCtx, {
+            type: 'polarArea',
+            data: {
+                labels: ['打哈欠', '抽烟', '打电话', '喝水'],
+                datasets: [{
+                    data: [{{ yawn_count }}, {{ smoking_count }}, {{ phone_count }}, {{ drinking_count }}],
+                    backgroundColor: [
+                        '#ffc107',
+                        '#dc3545',
+                        '#dc3545',
+                        '#ffc107'
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
+                },
+                scale: {
+                    ticks: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+        
+        // 检测时段分布
+        var hourlyCtx = document.getElementById('hourlyChart').getContext('2d');
+        var hourlyChart = new Chart(hourlyCtx, {
+            type: 'bar',
+            data: {
+                labels: ['0-3点', '3-6点', '6-9点', '9-12点', '12-15点', '15-18点', '18-21点', '21-24点'],
+                datasets: [{
+                    label: '检测次数',
+                    data: {{ hourly_data }},
+                    backgroundColor: '#6f42c1',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: {
+                            drawBorder: false
+                        }
+                    },
+                    x: {
+                        grid: {
+                            display: false
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    }
+                },
+                barPercentage: 0.6
+            }
+        });
+    });
+</script>
+{% endblock %} 

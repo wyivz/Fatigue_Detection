@@ -1,0 +1,76 @@
+{% extends 'base.html' %}
+
+{% block title %}个人资料 - 疲劳驾驶检测系统{% endblock %}
+
+{% block content %}
+<div class="container py-5">
+    <div class="row">
+        <div class="col-lg-4">
+            <div class="card mb-4">
+                <div class="card-body text-center">
+                    <h5 class="my-3">{{ user.username }}</h5>
+                    <p class="text-muted mb-1">{{ user.email }}</p>
+                    <p class="text-muted mb-4">驾驶员</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-8">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">个人资料信息</h5>
+                </div>
+                <div class="card-body">
+                    <form method="post" action="{% url 'accounts:update_profile' %}">
+                        {% csrf_token %}
+                        <div class="row mb-3">
+                            <div class="col-sm-3">
+                                <p class="mb-0">用户名</p>
+                            </div>
+                            <div class="col-sm-9">
+                                <input type="text" class="form-control" value="{{ user.username }}" readonly>
+                            </div>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-sm-3">
+                                <p class="mb-0">电子邮箱</p>
+                            </div>
+                            <div class="col-sm-9">
+                                <input type="email" class="form-control" name="email" value="{{ user.email }}">
+                            </div>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-sm-3">
+                                <p class="mb-0">姓名</p>
+                            </div>
+                            <div class="col-sm-9">
+                                <input type="text" class="form-control" name="first_name" value="{{ user.first_name }}">
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-sm-3">
+                                <p class="mb-0">密码</p>
+                            </div>
+                            <div class="col-sm-9">
+                                <a href="{% url 'accounts:password_change' %}" class="btn btn-outline-primary">修改密码</a>
+                            </div>
+                        </div>
+                        <div class="row mt-4">
+                            <div class="col-sm-12 text-end">
+                                <button type="submit" class="btn btn-primary">保存修改</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">检测历史概览</h5>
+                </div>
+                <div class="card-body">
+                    <p>您可以在<a href="{% url 'detection:dashboard' %}">控制面板</a>和<a href="{% url 'detection:statistics' %}">统计分析</a>页面查看详细的检测历史和统计数据。</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %} 

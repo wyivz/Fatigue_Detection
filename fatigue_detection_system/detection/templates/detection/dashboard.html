@@ -1,0 +1,197 @@
+{% extends 'base.html' %}
+
+{% block title %}仪表盘 - 疲劳驾驶检测系统{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="fas fa-tachometer-alt me-2"></i>仪表盘</h2>
+        <div>
+            <a href="{% url 'detection:realtime' %}" class="btn btn-primary">
+                <i class="fas fa-camera me-1"></i>开始检测
+            </a>
+        </div>
+    </div>
+    
+    <!-- 统计卡片 -->
+    <div class="row mb-4">
+        <div class="col-md-3 mb-3">
+            <div class="card dashboard-card">
+                <div class="card-body">
+                    <div class="d-flex align-items-center">
+                        <div class="stat-icon">
+                            <i class="fas fa-video"></i>
+                        </div>
+                        <div>
+                            <div class="stat-number">{{ stats.total_sessions }}</div>
+                            <div>检测会话</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3 mb-3">
+            <div class="card dashboard-card success">
+                <div class="card-body">
+                    <div class="d-flex align-items-center">
+                        <div class="stat-icon" style="color: var(--success-color);">
+                            <i class="fas fa-image"></i>
+                        </div>
+                        <div>
+                            <div class="stat-number">{{ stats.total_detections }}</div>
+                            <div>检测结果</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3 mb-3">
+            <div class="card dashboard-card warning">
+                <div class="card-body">
+                    <div class="d-flex align-items-center">
+                        <div class="stat-icon" style="color: var(--warning-color);">
+                            <i class="fas fa-smoking"></i>
+                        </div>
+                        <div>
+                            <div class="stat-number">{{ stats.smoking_count }}</div>
+                            <div>抽烟检测</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3 mb-3">
+            <div class="card dashboard-card danger">
+                <div class="card-body">
+                    <div class="d-flex align-items-center">
+                        <div class="stat-icon" style="color: var(--danger-color);">
+                            <i class="fas fa-bed"></i>
+                        </div>
+                        <div>
+                            <div class="stat-number">{{ stats.fatigue_count }}</div>
+                            <div>疲劳驾驶</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="row">
+        <!-- 统计图表 -->
+        <div class="col-md-8 mb-4">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-chart-pie me-2"></i>疲劳等级分布</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="fatigueChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 最近检测会话 -->
+        <div class="col-md-4 mb-4">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-history me-2"></i>最近检测会话</h5>
+                </div>
+                <div class="card-body p-0">
+                    <div class="list-group list-group-flush">
+                        {% for session in sessions %}
+                        <a href="{% url 'detection:session_detail' session.id %}" class="list-group-item list-group-item-action">
+                            <div class="d-flex w-100 justify-content-between">
+                                <h6 class="mb-1">{{ session.get_session_type_display }}</h6>
+                                <small>{{ session.start_time|date:"Y-m-d H:i" }}</small>
+                            </div>
+                            <p class="mb-1">检测结果: {{ session.get_detection_count }} 条</p>
+                        </a>
+                        {% empty %}
+                        <div class="list-group-item">
+                            <p class="mb-0 text-center text-muted">暂无检测会话</p>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                <div class="card-footer bg-white">
+                    <a href="{% url 'detection:statistics' %}" class="btn btn-sm btn-outline-primary w-100">
+                        查看全部统计
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 检测功能卡片 -->
+    <div class="row mb-4">
+        <div class="col-md-6 mb-3">
+            <div class="card shadow-sm h-100">
+                <div class="card-body text-center">
+                    <i class="fas fa-camera fa-4x mb-3" style="color: var(--primary-color);"></i>
+                    <h5>实时检测</h5>
+                    <p>使用摄像头进行实时疲劳驾驶行为检测，立即获取检测结果</p>
+                    <a href="{% url 'detection:realtime' %}" class="btn btn-primary">开始检测</a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-6 mb-3">
+            <div class="card shadow-sm h-100">
+                <div class="card-body text-center">
+                    <i class="fas fa-file-video fa-4x mb-3" style="color: var(--secondary-color);"></i>
+                    <h5>视频检测</h5>
+                    <p>上传视频文件，分析检测驾驶行为和疲劳状态</p>
+                    <a href="{% url 'detection:video' %}" class="btn btn-outline-primary">上传视频</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // 初始化疲劳等级分布图表
+    document.addEventListener('DOMContentLoaded', function() {
+        var ctx = document.getElementById('fatigueChart').getContext('2d');
+        var fatigueChart = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: ['正常', '轻度疲劳', '中度疲劳', '较严重疲劳', '严重疲劳'],
+                datasets: [{
+                    data: [
+                        {{ fatigue_levels.level0 }}, 
+                        {{ fatigue_levels.level1 }}, 
+                        {{ fatigue_levels.level2 }}, 
+                        {{ fatigue_levels.level3 }}, 
+                        {{ fatigue_levels.level4 }}
+                    ],
+                    backgroundColor: [
+                        '#66bb6a',  // 绿色 - 正常
+                        '#26c6da',  // 青色 - 轻度
+                        '#ffca28',  // 黄色 - 中度
+                        '#ff7043',  // 橙色 - 较严重
+                        '#ef5350'   // 红色 - 严重
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                    },
+                    title: {
+                        display: true,
+                        text: '疲劳程度统计'
+                    }
+                }
+            }
+        });
+    });
+</script>
+{% endblock %}

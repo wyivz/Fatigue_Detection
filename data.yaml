@@ -1,0 +1,4 @@
+train: /home/sm8206/usna/WYX/Yolov8-deepsort-driverDistracted-driving-behavior-detection/抽烟打电话喝水数据集/VOCData/images
+val: /home/sm8206/usna/WYX/Yolov8-deepsort-driverDistracted-driving-behavior-detection/抽烟打电话喝水数据集/VOCData/images    # 验证集图片路径，修改为 VOCDATA/images (或者你可能需要手动划分验证集)
+nc: 4  # 类别数量
+names: [ 'face', 'smoke', 'phone', 'water' ]  # 类别名称列表

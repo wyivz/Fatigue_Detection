@@ -1,0 +1,370 @@
+{% extends 'base.html' %}
+
+{% block title %}检测结果 - 疲劳驾驶检测系统{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0">
+            <i class="fas fa-clipboard-list me-2"></i>检测结果
+            <span class="badge bg-primary ms-2">{{ session.get_session_type_display }}</span>
+        </h2>
+        <div>
+            <a href="{% url 'detection:dashboard' %}" class="btn btn-outline-primary">
+                <i class="fas fa-arrow-left me-1"></i>返回仪表盘
+            </a>
+        </div>
+    </div>
+    
+    <!-- 会话信息卡片 -->
+    <div class="card shadow-sm mb-4">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="fas fa-info-circle me-2"></i>会话信息</h5>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-6">
+                    <table class="table table-borderless mb-0">
+                        <tr>
+                            <td width="40%"><strong>检测会话ID:</strong></td>
+                            <td>{{ session.id }}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>检测类型:</strong></td>
+                            <td>{{ session.get_session_type_display }}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>开始时间:</strong></td>
+                            <td>{{ session.start_time|date:"Y-m-d H:i:s" }}</td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <table class="table table-borderless mb-0">
+                        <tr>
+                            <td width="40%"><strong>结束时间:</strong></td>
+                            <td>{{ session.end_time|date:"Y-m-d H:i:s"|default:"进行中" }}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>检测结果数:</strong></td>
+                            <td>{{ results|length }} 条</td>
+                        </tr>
+                        <tr>
+                            <td><strong>操作用户:</strong></td>
+                            <td>{{ session.user.username }}</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 检测结果概览 -->
+    <div class="row mb-4">
+        <!-- 行为检测统计 -->
+        <div class="col-lg-6 mb-4">
+            <div class="card shadow-sm h-100">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-chart-pie me-2"></i>行为检测统计</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="behaviorChart" height="220"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 疲劳等级分布 -->
+        <div class="col-lg-6 mb-4">
+            <div class="card shadow-sm h-100">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-chart-bar me-2"></i>疲劳等级分布</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="fatigueChart" height="220"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 检测结果详情 -->
+    <div class="card shadow-sm mb-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0"><i class="fas fa-list-alt me-2"></i>检测结果详情</h5>
+            <div class="btn-group">
+                <button type="button" class="btn btn-sm btn-outline-primary" id="refresh-btn">
+                    <i class="fas fa-sync-alt me-1"></i>刷新
+                </button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="export-btn">
+                    <i class="fas fa-download me-1"></i>导出
+                </button>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover table-results mb-0">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>时间</th>
+                            <th>检测结果</th>
+                            <th>疲劳等级</th>
+                            <th>图像</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for result in results %}
+                        <tr>
+                            <td>{{ result.id }}</td>
+                            <td>{{ result.timestamp|date:"H:i:s" }}</td>
+                            <td>
+                                {% if result.face_detected %}
+                                    <span class="badge bg-success me-1">面部</span>
+                                {% endif %}
+                                
+                                {% if result.smoking_detected %}
+                                    <span class="badge bg-danger me-1">抽烟</span>
+                                {% endif %}
+                                
+                                {% if result.phone_detected %}
+                                    <span class="badge bg-danger me-1">打电话</span>
+                                {% endif %}
+                                
+                                {% if result.drinking_detected %}
+                                    <span class="badge bg-warning text-dark me-1">喝水</span>
+                                {% endif %}
+                                
+                                {% if result.yawn_detected %}
+                                    <span class="badge bg-warning text-dark me-1">打哈欠</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.fatigue_level == 0 %}
+                                    <span class="badge bg-success">正常</span>
+                                {% elif result.fatigue_level == 1 %}
+                                    <span class="badge bg-info">轻度</span>
+                                {% elif result.fatigue_level == 2 %}
+                                    <span class="badge bg-warning text-dark">中度</span>
+                                {% elif result.fatigue_level == 3 %}
+                                    <span class="badge bg-warning" style="background-color: #ff7043 !important;">较严重</span>
+                                {% elif result.fatigue_level == 4 %}
+                                    <span class="badge bg-danger">严重</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.result_image %}
+                                    <a href="{{ result.result_image.url }}" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#imageModal" data-img-src="{{ result.result_image.url }}">
+                                        <i class="fas fa-image me-1"></i>查看
+                                    </a>
+                                {% else %}
+                                    <span class="text-muted">无图像</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% empty %}
+                        <tr>
+                            <td colspan="5" class="text-center py-4">
+                                <p class="mb-0 text-muted">暂无检测结果</p>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 图像查看模态框 -->
+    <div class="modal fade" id="imageModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">检测结果图像</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body text-center p-0">
+                    <img src="" class="img-fluid" id="modalImage">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                    <a href="#" class="btn btn-primary" id="downloadImage" download>
+                        <i class="fas fa-download me-1"></i>下载图像
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // 图像模态框处理
+    const imageModal = document.getElementById('imageModal');
+    if (imageModal) {
+        imageModal.addEventListener('show.bs.modal', function (event) {
+            const button = event.relatedTarget;
+            const imgSrc = button.getAttribute('data-img-src');
+            const modalImage = document.getElementById('modalImage');
+            const downloadImage = document.getElementById('downloadImage');
+            
+            modalImage.src = imgSrc;
+            downloadImage.href = imgSrc;
+        });
+    }
+    
+    // 计算统计数据
+    function calculateStats() {
+        // 行为检测统计
+        const behaviorStats = {
+            face: 0,
+            smoke: 0,
+            phone: 0,
+            water: 0,
+            yawn: 0
+        };
+        
+        // 疲劳等级分布
+        const fatigueStats = [0, 0, 0, 0, 0];  // 0-4级分布
+        
+        // 获取所有检测结果
+        const results = [
+            {% for result in results %}
+            {
+                face_detected: {% if result.face_detected %}true{% else %}false{% endif %},
+                smoking_detected: {% if result.smoking_detected %}true{% else %}false{% endif %},
+                phone_detected: {% if result.phone_detected %}true{% else %}false{% endif %},
+                drinking_detected: {% if result.drinking_detected %}true{% else %}false{% endif %},
+                yawn_detected: {% if result.yawn_detected %}true{% else %}false{% endif %},
+                fatigue_level: {{ result.fatigue_level }}
+            },
+            {% endfor %}
+        ];
+        
+        // 统计数据
+        results.forEach(result => {
+            if (result.face_detected) behaviorStats.face++;
+            if (result.smoking_detected) behaviorStats.smoke++;
+            if (result.phone_detected) behaviorStats.phone++;
+            if (result.drinking_detected) behaviorStats.water++;
+            if (result.yawn_detected) behaviorStats.yawn++;
+            
+            fatigueStats[result.fatigue_level]++;
+        });
+        
+        return {
+            behaviorStats,
+            fatigueStats
+        };
+    }
+    
+    // 初始化图表
+    document.addEventListener('DOMContentLoaded', function() {
+        const stats = calculateStats();
+        
+        // 行为检测统计图表
+        const behaviorCtx = document.getElementById('behaviorChart').getContext('2d');
+        const behaviorChart = new Chart(behaviorCtx, {
+            type: 'bar',
+            data: {
+                labels: ['面部', '抽烟', '打电话', '喝水', '打哈欠'],
+                datasets: [{
+                    label: '检测次数',
+                    data: [
+                        stats.behaviorStats.face,
+                        stats.behaviorStats.smoke,
+                        stats.behaviorStats.phone,
+                        stats.behaviorStats.water,
+                        stats.behaviorStats.yawn
+                    ],
+                    backgroundColor: [
+                        '#1e88e5',  // 蓝色 - 面部
+                        '#ef5350',  // 红色 - 抽烟
+                        '#ef5350',  // 红色 - 打电话
+                        '#ffca28',  // 黄色 - 喝水
+                        '#ffca28'   // 黄色 - 打哈欠
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            precision: 0
+                        }
+                    }
+                }
+            }
+        });
+        
+        // 疲劳等级分布图表
+        const fatigueCtx = document.getElementById('fatigueChart').getContext('2d');
+        const fatigueChart = new Chart(fatigueCtx, {
+            type: 'doughnut',
+            data: {
+                labels: ['正常', '轻度疲劳', '中度疲劳', '较严重疲劳', '严重疲劳'],
+                datasets: [{
+                    data: stats.fatigueStats,
+                    backgroundColor: [
+                        '#66bb6a',  // 绿色 - 正常
+                        '#26c6da',  // 青色 - 轻度
+                        '#ffca28',  // 黄色 - 中度
+                        '#ff7043',  // 橙色 - 较严重
+                        '#ef5350'   // 红色 - 严重
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
+                }
+            }
+        });
+        
+        // 刷新按钮
+        const refreshBtn = document.getElementById('refresh-btn');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', function() {
+                location.reload();
+            });
+        }
+        
+        // 导出按钮
+        const exportBtn = document.getElementById('export-btn');
+        if (exportBtn) {
+            exportBtn.addEventListener('click', function() {
+                // 创建CSV内容
+                let csvContent = "data:text/csv;charset=utf-8,";
+                csvContent += "ID,时间,面部检测,抽烟,打电话,喝水,打哈欠,疲劳等级\n";
+                
+                // 添加数据行
+                {% for result in results %}
+                csvContent += `{{ result.id }},{{ result.timestamp|date:"Y-m-d H:i:s" }},`;
+                csvContent += `{{ result.face_detected|yesno:"是,否" }},`;
+                csvContent += `{{ result.smoking_detected|yesno:"是,否" }},`;
+                csvContent += `{{ result.phone_detected|yesno:"是,否" }},`;
+                csvContent += `{{ result.drinking_detected|yesno:"是,否" }},`;
+                csvContent += `{{ result.yawn_detected|yesno:"是,否" }},`;
+                csvContent += `{{ result.fatigue_level }}\n`;
+                {% endfor %}
+                
+                // 创建下载链接
+                const encodedUri = encodeURI(csvContent);
+                const link = document.createElement("a");
+                link.setAttribute("href", encodedUri);
+                link.setAttribute("download", "检测结果_{{ session.id }}.csv");
+                document.body.appendChild(link);
+                
+                // 点击下载
+                link.click();
+            });
+        }
+    });
+</script>
+{% endblock %} 

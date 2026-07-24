@@ -1,0 +1,1031 @@
+{% extends 'base.html' %}
+
+{% block title %}实时摄像头检测 - 疲劳驾驶检测系统{% endblock %}
+
+{% block extra_css %}
+<style>
+    #video-container {
+        position: relative;
+        max-width: 100%;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    
+    #video-stream {
+        width: 100%;
+        max-height: 480px;
+        background-color: #000;
+        border-radius: 8px;
+    }
+    
+    .status-indicator {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-right: 5px;
+    }
+    
+    .status-indicator.active {
+        background-color: #4caf50;
+    }
+    
+    .status-indicator.inactive {
+        background-color: #f44336;
+    }
+    
+    .status-indicator.warning {
+        background-color: #ff9800;
+    }
+    
+    .controls {
+        margin-top: 1rem;
+    }
+    
+    .result-panel {
+        height: 480px;
+        overflow-y: auto;
+    }
+    
+    .detection-alert {
+        animation: flash 1s linear infinite;
+    }
+    
+    @keyframes flash {
+        0% { opacity: 1; }
+        50% { opacity: 0.5; }
+        100% { opacity: 1; }
+    }
+    
+    .fatigue-indicator {
+        transition: all 0.3s ease;
+    }
+    
+    .overlay-canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 10;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0">
+            <i class="fas fa-video me-2"></i>实时摄像头检测
+        </h2>
+        <div>
+            <a href="{% url 'detection:dashboard' %}" class="btn btn-outline-primary">
+                <i class="fas fa-arrow-left me-1"></i>返回仪表盘
+            </a>
+        </div>
+    </div>
+    
+    <!-- 检测区域 -->
+    <div class="row">
+        <!-- 视频区域 -->
+        <div class="col-lg-8 mb-4">
+            <div class="card shadow-sm h-100">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">
+                        <span class="status-indicator inactive" id="camera-status"></span>
+                        摄像头视图
+                    </h5>
+                    <div>
+                        <span class="badge bg-info me-2" id="fps-indicator">0 FPS</span>
+                        <span class="badge bg-secondary" id="resolution-indicator">0x0</span>
+                    </div>
+                </div>
+                <div class="card-body p-0">
+                    <div id="video-container">
+                        <video id="video-stream" autoplay playsinline></video>
+                        <canvas id="overlay-canvas" class="overlay-canvas"></canvas>
+                    </div>
+                    <div class="controls p-3">
+                        <div class="row">
+                            <div class="col-md-6 mb-3 mb-md-0">
+                                <select class="form-select" id="camera-select">
+                                    <option value="">选择摄像头...</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 d-flex justify-content-end">
+                                <button class="btn btn-success me-2" id="start-btn">
+                                    <i class="fas fa-play me-1"></i>开始检测
+                                </button>
+                                <button class="btn btn-danger" id="stop-btn" disabled>
+                                    <i class="fas fa-stop me-1"></i>停止检测
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 检测结果区域 -->
+        <div class="col-lg-4 mb-4">
+            <div class="card shadow-sm h-100">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-clipboard-list me-2"></i>实时检测状态
+                    </h5>
+                </div>
+                <div class="card-body result-panel" id="result-panel">
+                    <!-- 检测会话信息 -->
+                    <div class="d-flex align-items-center mb-3">
+                        <div class="flex-shrink-0">
+                            <span class="status-indicator inactive" id="detection-status"></span>
+                        </div>
+                        <div class="flex-grow-1 ms-2">
+                            <h6 class="mb-0">检测状态</h6>
+                            <p class="text-muted mb-0" id="detection-info">未开始检测</p>
+                        </div>
+                    </div>
+                    
+                    <!-- 疲劳状态指示 -->
+                    <div class="card mb-3">
+                        <div class="card-body p-2">
+                            <h6 class="mb-2">疲劳状态</h6>
+                            <div class="progress mb-2" style="height: 25px;">
+                                <div class="progress-bar bg-success" id="fatigue-bar" role="progressbar" 
+                                     style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                                    正常 (0%)
+                                </div>
+                            </div>
+                            <div class="d-flex justify-content-between">
+                                <span class="badge bg-success">正常</span>
+                                <span class="badge bg-info">轻度</span>
+                                <span class="badge bg-warning text-dark">中度</span>
+                                <span class="badge" style="background-color: #ff7043; color: white;">较严重</span>
+                                <span class="badge bg-danger">严重</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 当前检测结果 -->
+                    <div class="card mb-3" id="current-results">
+                        <div class="card-header py-2">
+                            <h6 class="mb-0">当前检测结果</h6>
+                        </div>
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-2">
+                                面部检测
+                                <span class="badge bg-secondary" id="face-status">未检测</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-2">
+                                打哈欠
+                                <span class="badge bg-secondary" id="yawn-status">未检测</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-2">
+                                抽烟
+                                <span class="badge bg-secondary" id="smoke-status">未检测</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-2">
+                                打电话
+                                <span class="badge bg-secondary" id="phone-status">未检测</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-2">
+                                喝水
+                                <span class="badge bg-secondary" id="water-status">未检测</span>
+                            </li>
+                        </ul>
+                    </div>
+                    
+                    <!-- 检测事件记录 -->
+                    <div class="card">
+                        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+                            <h6 class="mb-0">检测事件记录</h6>
+                            <button class="btn btn-sm btn-outline-secondary" id="clear-events-btn">
+                                <i class="fas fa-trash-alt"></i>
+                            </button>
+                        </div>
+                        <div class="card-body p-0" style="max-height: 200px; overflow-y: auto;">
+                            <div id="events-container">
+                                <p class="text-center text-muted py-3">暂无检测事件</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 检测设置卡片 -->
+    <div class="card shadow-sm mb-4">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="fas fa-sliders-h me-2"></i>检测设置</h5>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <!-- 检测选项 -->
+                <div class="col-md-6">
+                    <h6>检测选项</h6>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" value="" id="detect-fatigue" checked>
+                        <label class="form-check-label" for="detect-fatigue">
+                            检测疲劳状态
+                        </label>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" value="" id="detect-behaviors" checked>
+                        <label class="form-check-label" for="detect-behaviors">
+                            检测不良驾驶行为
+                        </label>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" value="" id="save-screenshots" checked>
+                        <label class="form-check-label" for="save-screenshots">
+                            保存警告事件截图
+                        </label>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" value="" id="play-alerts" checked>
+                        <label class="form-check-label" for="play-alerts">
+                            播放语音提醒
+                        </label>
+                    </div>
+                </div>
+                
+                <!-- 阈值设置 -->
+                <div class="col-md-6">
+                    <h6>阈值设置</h6>
+                    <div class="mb-3">
+                        <label for="fatigue-threshold" class="form-label">疲劳警告阈值</label>
+                        <div class="d-flex align-items-center">
+                            <input type="range" class="form-range me-2" min="1" max="4" step="1" value="3" id="fatigue-threshold">
+                            <span class="badge bg-warning text-dark" id="fatigue-threshold-value">中度(2)</span>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="detection-frequency" class="form-label">检测频率 (帧/秒)</label>
+                        <div class="d-flex align-items-center">
+                            <input type="range" class="form-range me-2" min="1" max="30" step="1" value="15" id="detection-frequency">
+                            <span class="badge bg-primary" id="detection-frequency-value">15</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 警告模态框 -->
+    <div class="modal fade" id="alertModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header bg-danger text-white">
+                    <h5 class="modal-title" id="alert-title">警告</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="text-center mb-3">
+                        <i class="fas fa-exclamation-triangle text-danger" style="font-size: 3rem;"></i>
+                    </div>
+                    <h4 class="text-center mb-3" id="alert-message">检测到严重疲劳状态！</h4>
+                    <p class="text-center" id="alert-description">请立即停车休息，避免危险驾驶！</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">知道了</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // DOM元素
+    const videoElement = document.getElementById('video-stream');
+    const overlayCanvas = document.getElementById('overlay-canvas');
+    const cameraSelect = document.getElementById('camera-select');
+    const startBtn = document.getElementById('start-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    const cameraStatus = document.getElementById('camera-status');
+    const detectionStatus = document.getElementById('detection-status');
+    const detectionInfo = document.getElementById('detection-info');
+    const fpsIndicator = document.getElementById('fps-indicator');
+    const resolutionIndicator = document.getElementById('resolution-indicator');
+    const eventsContainer = document.getElementById('events-container');
+    const clearEventsBtn = document.getElementById('clear-events-btn');
+    const fatigueBar = document.getElementById('fatigue-bar');
+    
+    // 状态指示器
+    const faceStatus = document.getElementById('face-status');
+    const yawnStatus = document.getElementById('yawn-status');
+    const smokeStatus = document.getElementById('smoke-status');
+    const phoneStatus = document.getElementById('phone-status');
+    const waterStatus = document.getElementById('water-status');
+    
+    // 设置选项
+    const detectFatigue = document.getElementById('detect-fatigue');
+    const detectBehaviors = document.getElementById('detect-behaviors');
+    const saveScreenshots = document.getElementById('save-screenshots');
+    const playAlerts = document.getElementById('play-alerts');
+    const fatigueThreshold = document.getElementById('fatigue-threshold');
+    const fatigueThresholdValue = document.getElementById('fatigue-threshold-value');
+    const detectionFrequency = document.getElementById('detection-frequency');
+    const detectionFrequencyValue = document.getElementById('detection-frequency-value');
+    
+    // 全局变量
+    let stream = null;
+    let sessionId = null;
+    let isDetecting = false;
+    let detectInterval = null;
+    let lastDetectionTime = 0;
+    let frameCount = 0;
+    let fpsTime = 0;
+    let fps = 0;
+    
+    // 初始化摄像头下拉选择框
+    async function initCameraSelect() {
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const videoDevices = devices.filter(device => device.kind === 'videoinput');
+            
+            if (videoDevices.length === 0) {
+                cameraSelect.innerHTML = '<option value="">未检测到摄像头</option>';
+                return;
+            }
+            
+            // 清空现有选项
+            cameraSelect.innerHTML = '<option value="">选择摄像头...</option>';
+            
+            // 添加摄像头选项
+            videoDevices.forEach(device => {
+                const option = document.createElement('option');
+                option.value = device.deviceId;
+                option.text = device.label || `摄像头 ${cameraSelect.length}`;
+                cameraSelect.appendChild(option);
+            });
+            
+            // 如果只有一个摄像头，默认选择它
+            if (videoDevices.length === 1) {
+                cameraSelect.value = videoDevices[0].deviceId;
+            }
+        } catch (error) {
+            console.error('获取摄像头列表失败:', error);
+            alert('无法获取摄像头列表，请检查浏览器权限设置。');
+        }
+    }
+    
+    // 打开摄像头
+    async function openCamera() {
+        try {
+            // 关闭之前的摄像头
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            
+            // 获取选择的摄像头ID
+            const deviceId = cameraSelect.value;
+            if (!deviceId) {
+                alert('请选择一个摄像头');
+                return false;
+            }
+            
+            // 配置摄像头
+            const constraints = {
+                video: {
+                    deviceId: deviceId ? { exact: deviceId } : undefined,
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 },
+                    frameRate: { ideal: 30 }
+                }
+            };
+            
+            // 请求摄像头权限并获取流
+            stream = await navigator.mediaDevices.getUserMedia(constraints);
+            videoElement.srcObject = stream;
+            
+            // 设置Canvas大小
+            videoElement.onloadedmetadata = () => {
+                const width = videoElement.videoWidth;
+                const height = videoElement.videoHeight;
+                
+                overlayCanvas.width = width;
+                overlayCanvas.height = height;
+                
+                resolutionIndicator.textContent = `${width}x${height}`;
+            };
+            
+            // 更新UI
+            cameraStatus.classList.remove('inactive');
+            cameraStatus.classList.add('active');
+            
+            return true;
+        } catch (error) {
+            console.error('打开摄像头失败:', error);
+            alert('无法打开摄像头，请检查浏览器权限设置。');
+            return false;
+        }
+    }
+    
+    // 关闭摄像头
+    function closeCamera() {
+        if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+            stream = null;
+            videoElement.srcObject = null;
+            
+            // 更新UI
+            cameraStatus.classList.remove('active');
+            cameraStatus.classList.add('inactive');
+        }
+    }
+    
+    // 开始检测
+    async function startDetection() {
+        if (!stream) {
+            const opened = await openCamera();
+            if (!opened) return;
+        }
+        
+        try {
+            // 创建检测会话
+            const response = await fetch('/detection/api/start_detection/', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': getCsrfToken()
+                },
+                body: JSON.stringify({
+                    session_type: 'realtime',
+                    detect_fatigue: detectFatigue.checked,
+                    detect_behaviors: detectBehaviors.checked
+                })
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                sessionId = data.session_id;
+                isDetecting = true;
+                
+                // 更新UI
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                cameraSelect.disabled = true;
+                
+                detectionStatus.classList.remove('inactive');
+                detectionStatus.classList.add('active');
+                detectionInfo.textContent = `检测会话 #${sessionId} - 进行中`;
+                
+                // 清空事件记录
+                eventsContainer.innerHTML = '<p class="text-center text-muted py-3">暂无检测事件</p>';
+                
+                // 设置检测间隔
+                const intervalMs = 1000 / parseInt(detectionFrequency.value);
+                detectInterval = setInterval(detectFrame, intervalMs);
+                
+                // 重置FPS计数器
+                frameCount = 0;
+                fpsTime = performance.now();
+                fps = 0;
+                
+                // 开始FPS计算
+                requestAnimationFrame(calculateFps);
+            } else {
+                throw new Error(data.error || '创建检测会话失败');
+            }
+        } catch (error) {
+            console.error('开始检测失败:', error);
+            alert('开始检测失败: ' + error.message);
+        }
+    }
+    
+    // 停止检测
+    async function stopDetection() {
+        if (!isDetecting || !sessionId) return;
+        
+        try {
+            // 停止检测会话
+            const response = await fetch('/detection/api/stop_detection/', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': getCsrfToken()
+                },
+                body: JSON.stringify({
+                    session_id: sessionId
+                })
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                // 更新UI
+                detectionInfo.textContent = `检测会话 #${sessionId} - 已完成`;
+                
+                // 添加完成事件
+                addEventLog('检测会话已完成', 'info');
+                
+                // 提供查看结果链接
+                addEventLog(`<a href="/detection/results/${sessionId}/" class="link-primary">查看完整检测结果</a>`, 'info');
+            } else {
+                throw new Error(data.error || '停止检测会话失败');
+            }
+        } catch (error) {
+            console.error('停止检测失败:', error);
+            alert('停止检测失败: ' + error.message);
+        } finally {
+            // 清理资源
+            isDetecting = false;
+            clearInterval(detectInterval);
+            
+            // 重置UI
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            cameraSelect.disabled = false;
+            
+            detectionStatus.classList.remove('active');
+            detectionStatus.classList.add('inactive');
+            
+            // 重置状态指示器
+            resetStatusIndicators();
+        }
+    }
+    
+    // 重置状态指示器
+    function resetStatusIndicators() {
+        faceStatus.textContent = "未检测";
+        faceStatus.className = "badge bg-secondary";
+        
+        yawnStatus.textContent = "未检测";
+        yawnStatus.className = "badge bg-secondary";
+        
+        smokeStatus.textContent = "未检测";
+        smokeStatus.className = "badge bg-secondary";
+        
+        phoneStatus.textContent = "未检测";
+        phoneStatus.className = "badge bg-secondary";
+        
+        waterStatus.textContent = "未检测";
+        waterStatus.className = "badge bg-secondary";
+        
+        // 重置疲劳指示
+        fatigueBar.style.width = "0%";
+        fatigueBar.textContent = "正常 (0%)";
+        fatigueBar.className = "progress-bar bg-success";
+        fatigueBar.setAttribute("aria-valuenow", "0");
+    }
+    
+    // 帧检测
+    async function detectFrame() {
+        if (!isDetecting || !stream) return;
+        
+        try {
+            // 获取画布上下文
+            const ctx = overlayCanvas.getContext('2d');
+            ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            
+            // 获取当前帧
+            ctx.drawImage(videoElement, 0, 0, overlayCanvas.width, overlayCanvas.height);
+            
+            // 获取图像数据
+            const imageData = overlayCanvas.toDataURL('image/jpeg', 0.8);
+            
+            // 发送到后端进行检测
+            const response = await fetch('/detection/api/get_result/', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': getCsrfToken()
+                },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    image_data: imageData,
+                    detect_fatigue: detectFatigue.checked,
+                    detect_behaviors: detectBehaviors.checked
+                })
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                updateDetectionResults(data.result);
+                // 增加帧计数
+                frameCount++;
+            } else {
+                throw new Error(data.error || '获取检测结果失败');
+            }
+        } catch (error) {
+            console.error('检测失败:', error);
+            // 不中断检测流程，仅记录错误
+        }
+    }
+    
+    // 更新检测结果
+    function updateDetectionResults(result) {
+        // 更新面部检测状态
+        if (result.face_detected) {
+            faceStatus.textContent = "已检测";
+            faceStatus.className = "badge bg-success";
+        } else {
+            faceStatus.textContent = "未检测";
+            faceStatus.className = "badge bg-secondary";
+        }
+        
+        // 更新打哈欠状态
+        if (result.yawn_detected) {
+            yawnStatus.textContent = "检测到";
+            yawnStatus.className = "badge bg-warning text-dark";
+            
+            // 添加事件记录
+            if (result.yawn_detected) {
+                addEventLog('检测到打哈欠', 'warning');
+            }
+        } else {
+            yawnStatus.textContent = "未检测";
+            yawnStatus.className = "badge bg-secondary";
+        }
+        
+        // 更新抽烟状态
+        if (result.smoking_detected) {
+            smokeStatus.textContent = "检测到";
+            smokeStatus.className = "badge bg-danger";
+            
+            // 添加事件记录
+            addEventLog('检测到抽烟行为', 'danger');
+        } else {
+            smokeStatus.textContent = "未检测";
+            smokeStatus.className = "badge bg-secondary";
+        }
+        
+        // 更新打电话状态
+        if (result.phone_detected) {
+            phoneStatus.textContent = "检测到";
+            phoneStatus.className = "badge bg-danger";
+            
+            // 添加事件记录
+            addEventLog('检测到打电话行为', 'danger');
+        } else {
+            phoneStatus.textContent = "未检测";
+            phoneStatus.className = "badge bg-secondary";
+        }
+        
+        // 更新喝水状态
+        if (result.drinking_detected) {
+            waterStatus.textContent = "检测到";
+            waterStatus.className = "badge bg-warning text-dark";
+            
+            // 添加事件记录
+            addEventLog('检测到喝水行为', 'warning');
+        } else {
+            waterStatus.textContent = "未检测";
+            waterStatus.className = "badge bg-secondary";
+        }
+        
+        // 更新疲劳状态
+        updateFatigueStatus(result.fatigue_level);
+        
+        // 绘制检测结果
+        drawDetectionResults(result);
+    }
+    
+    // 更新疲劳状态
+    function updateFatigueStatus(level) {
+        let percentage = 0;
+        let barClass = "progress-bar bg-success";
+        let statusText = "正常";
+        
+        switch(level) {
+            case 0:
+                percentage = 0;
+                barClass = "progress-bar bg-success";
+                statusText = "正常";
+                break;
+            case 1:
+                percentage = 25;
+                barClass = "progress-bar bg-info";
+                statusText = "轻度疲劳";
+                break;
+            case 2:
+                percentage = 50;
+                barClass = "progress-bar bg-warning";
+                statusText = "中度疲劳";
+                
+                // 检查阈值，显示警告
+                if (parseInt(fatigueThreshold.value) <= 2) {
+                    showFatigueAlert(level);
+                }
+                
+                break;
+            case 3:
+                percentage = 75;
+                barClass = "progress-bar";
+                statusText = "较严重疲劳";
+                // 稍后会设置背景色
+                
+                // 添加事件记录
+                addEventLog('检测到较严重疲劳状态', 'warning');
+                
+                // 检查阈值，显示警告
+                if (parseInt(fatigueThreshold.value) <= 3) {
+                    showFatigueAlert(level);
+                }
+                
+                break;
+            case 4:
+                percentage = 100;
+                barClass = "progress-bar bg-danger detection-alert";
+                statusText = "严重疲劳";
+                
+                // 添加事件记录
+                addEventLog('检测到严重疲劳状态', 'danger');
+                
+                // 总是显示警告
+                showFatigueAlert(level);
+                
+                break;
+        }
+        
+        // 更新UI
+        fatigueBar.style.width = `${percentage}%`;
+        fatigueBar.textContent = `${statusText} (${percentage}%)`;
+        fatigueBar.className = barClass;
+        if (level === 3) {
+            fatigueBar.style.backgroundColor = "#ff7043";
+        }
+        fatigueBar.setAttribute("aria-valuenow", percentage);
+    }
+    
+    // 添加事件记录
+    function addEventLog(message, type = 'info') {
+        // 检查是否为第一条记录
+        if (eventsContainer.querySelector('.text-muted')) {
+            eventsContainer.innerHTML = '';
+        }
+        
+        // 创建时间戳
+        const now = new Date();
+        const timestamp = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+        
+        // 根据类型选择颜色
+        let colorClass = 'text-info';
+        if (type === 'warning') colorClass = 'text-warning';
+        if (type === 'danger') colorClass = 'text-danger';
+        if (type === 'success') colorClass = 'text-success';
+        
+        // 创建事件元素
+        const eventElement = document.createElement('div');
+        eventElement.className = 'p-2 border-bottom';
+        eventElement.innerHTML = `
+            <small class="text-muted">${timestamp}</small>
+            <div class="${colorClass}">${message}</div>
+        `;
+        
+        // 添加到容器开头
+        eventsContainer.insertBefore(eventElement, eventsContainer.firstChild);
+        
+        // 播放提示音
+        if (playAlerts.checked && (type === 'warning' || type === 'danger')) {
+            playAlertSound(type);
+        }
+    }
+    
+    // 显示疲劳警告
+    function showFatigueAlert(level) {
+        // 配置警告内容
+        let title = "疲劳警告";
+        let message = "检测到疲劳状态！";
+        let description = "请保持警觉，注意安全驾驶。";
+        
+        if (level >= 3) {
+            title = "严重疲劳警告";
+            message = "检测到严重疲劳状态！";
+            description = "请立即停车休息，避免危险驾驶！";
+        }
+        
+        // 设置警告内容
+        document.getElementById('alert-title').textContent = title;
+        document.getElementById('alert-message').textContent = message;
+        document.getElementById('alert-description').textContent = description;
+        
+        // 显示警告模态框
+        const alertModal = new bootstrap.Modal(document.getElementById('alertModal'));
+        alertModal.show();
+        
+        // 截图保存
+        if (saveScreenshots.checked) {
+            captureScreenshot();
+        }
+    }
+    
+    // 绘制检测结果
+    function drawDetectionResults(result) {
+        if (!result.detections || !result.detections.length) return;
+        
+        const ctx = overlayCanvas.getContext('2d');
+        
+        // 绘制检测框
+        result.detections.forEach(detection => {
+            const [x1, y1, x2, y2] = detection.bbox;
+            const label = detection.class_name;
+            const confidence = detection.confidence;
+            
+            // 根据类别选择颜色
+            let color = '#4caf50'; // 绿色 - 面部
+            if (label === 'smoke') color = '#f44336'; // 红色 - 抽烟
+            if (label === 'phone') color = '#f44336'; // 红色 - 打电话
+            if (label === 'water') color = '#ffca28'; // 黄色 - 喝水
+            
+            // 绘制边界框
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+            
+            // 绘制标签背景
+            ctx.fillStyle = color;
+            const textWidth = ctx.measureText(`${label} ${(confidence * 100).toFixed(0)}%`).width;
+            ctx.fillRect(x1, y1 - 20, textWidth + 10, 20);
+            
+            // 绘制标签文本
+            ctx.fillStyle = '#ffffff';
+            ctx.font = '12px Arial';
+            ctx.fillText(`${label} ${(confidence * 100).toFixed(0)}%`, x1 + 5, y1 - 5);
+        });
+        
+        // 绘制面部特征点（如果有）
+        if (result.landmarks) {
+            ctx.fillStyle = '#4caf50';
+            for (let i = 0; i < result.landmarks.length; i++) {
+                const [x, y] = result.landmarks[i];
+                ctx.beginPath();
+                ctx.arc(x, y, 2, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+        }
+    }
+    
+    // 截取屏幕截图
+    function captureScreenshot() {
+        const canvas = document.createElement('canvas');
+        canvas.width = videoElement.videoWidth;
+        canvas.height = videoElement.videoHeight;
+        
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+        
+        // 绘制状态信息
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(0, canvas.height - 60, canvas.width, 60);
+        
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '16px Arial';
+        const now = new Date();
+        const timestamp = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+        ctx.fillText(`时间: ${timestamp}`, 10, canvas.height - 35);
+        ctx.fillText(`检测会话: #${sessionId}`, 10, canvas.height - 15);
+        
+        // 将截图发送到服务器
+        fetch('/detection/api/save_screenshot/', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': getCsrfToken()
+            },
+            body: JSON.stringify({
+                session_id: sessionId,
+                image_data: canvas.toDataURL('image/png')
+            })
+        }).catch(error => {
+            console.error('保存截图失败:', error);
+        });
+    }
+    
+    // 计算FPS
+    function calculateFps() {
+        if (!isDetecting) return;
+        
+        const now = performance.now();
+        const elapsed = now - fpsTime;
+        
+        if (elapsed >= 1000) {
+            fps = Math.round((frameCount * 1000) / elapsed);
+            fpsIndicator.textContent = `${fps} FPS`;
+            
+            // 重置计数器
+            frameCount = 0;
+            fpsTime = now;
+        }
+        
+        requestAnimationFrame(calculateFps);
+    }
+    
+    // 播放警告声音
+    function playAlertSound(type) {
+        const audio = new Audio();
+        
+        if (type === 'danger') {
+            audio.src = '/static/sounds/danger_alert.mp3'; // 严重警告音
+        } else {
+            audio.src = '/static/sounds/warning_alert.mp3'; // 一般警告音
+        }
+        
+        audio.play().catch(error => {
+            console.error('播放警告声音失败:', error);
+        });
+    }
+    
+    // 获取CSRF令牌
+    function getCsrfToken() {
+        return document.querySelector('input[name="csrfmiddlewaretoken"]')?.value || '';
+    }
+    
+    // 事件监听器
+    document.addEventListener('DOMContentLoaded', function() {
+        // 获取CSRF令牌
+        const csrfToken = getCsrfToken();
+        if (!csrfToken) {
+            // 添加隐藏的CSRF令牌
+            const csrf = document.createElement('input');
+            csrf.type = 'hidden';
+            csrf.name = 'csrfmiddlewaretoken';
+            csrf.value = '{{ csrf_token }}';
+            document.body.appendChild(csrf);
+        }
+        
+        // 初始化摄像头选择框
+        initCameraSelect();
+        
+        // 摄像头选择变更时
+        cameraSelect.addEventListener('change', async function() {
+            if (this.value) {
+                await openCamera();
+            } else {
+                closeCamera();
+            }
+        });
+        
+        // 开始检测按钮
+        startBtn.addEventListener('click', function() {
+            startDetection();
+        });
+        
+        // 停止检测按钮
+        stopBtn.addEventListener('click', function() {
+            stopDetection();
+        });
+        
+        // 清除事件记录按钮
+        clearEventsBtn.addEventListener('click', function() {
+            eventsContainer.innerHTML = '<p class="text-center text-muted py-3">暂无检测事件</p>';
+        });
+        
+        // 监听阈值变更
+        fatigueThreshold.addEventListener('input', function() {
+            let text;
+            let colorClass;
+            
+            switch(parseInt(this.value)) {
+                case 1:
+                    text = "轻度(1)";
+                    colorClass = "bg-info";
+                    break;
+                case 2:
+                    text = "中度(2)";
+                    colorClass = "bg-warning text-dark";
+                    break;
+                case 3:
+                    text = "较严重(3)";
+                    colorClass = "badge";
+                    // 使用内联样式设置背景色
+                    setTimeout(() => {
+                        fatigueThresholdValue.style.backgroundColor = "#ff7043";
+                        fatigueThresholdValue.style.color = "white";
+                    }, 10);
+                    break;
+                case 4:
+                    text = "严重(4)";
+                    colorClass = "bg-danger";
+                    break;
+            }
+            
+            fatigueThresholdValue.textContent = text;
+            fatigueThresholdValue.className = `badge ${colorClass}`;
+        });
+        
+        // 监听检测频率变更
+        detectionFrequency.addEventListener('input', function() {
+            detectionFrequencyValue.textContent = this.value;
+            
+            // 如果正在检测，更新检测间隔
+            if (isDetecting) {
+                clearInterval(detectInterval);
+                const intervalMs = 1000 / parseInt(this.value);
+                detectInterval = setInterval(detectFrame, intervalMs);
+            }
+        });
+        
+        // 页面关闭前停止检测
+        window.addEventListener('beforeunload', function() {
+            if (isDetecting) {
+                stopDetection();
+            }
+            closeCamera();
+        });
+    });
+</script>
+{% endblock %} 

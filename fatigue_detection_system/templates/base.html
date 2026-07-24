@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+{% load static %}
+
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}疲劳驾驶检测系统{% endblock %}</title>
+    <!-- Bootstrap 5 CSS -->
+    <link href="{% static 'bootstrap.min.css' %}" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="{% static 'all.min.css' %}">
+    <!-- 自定义CSS -->
+    <style>
+        :root {
+            --primary-color: #1e88e5;
+            --secondary-color: #26c6da;
+            --success-color: #66bb6a;
+            --danger-color: #ef5350;
+            --warning-color: #ffca28;
+            --info-color: #29b6f6;
+            --dark-color: #263238;
+            --light-color: #eceff1;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f8f9fa;
+            margin: 0;
+            padding: 0;
+        }
+        
+        .navbar {
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            background: linear-gradient(to right, var(--primary-color), var(--secondary-color));
+        }
+        
+        .navbar-brand {
+            font-weight: bold;
+            color: white !important;
+        }
+        
+        .navbar-nav .nav-link {
+            color: rgba(255, 255, 255, 0.85) !important;
+            font-weight: 500;
+            padding: 0.7rem 1rem;
+            transition: all 0.3s;
+        }
+        
+        .navbar-nav .nav-link:hover,
+        .navbar-nav .nav-link.active {
+            color: white !important;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+        }
+        
+        .content-container {
+            min-height: calc(100vh - 70px - 60px);
+            padding: 2rem 0;
+        }
+        
+        .card {
+            border: none;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .card-header {
+            border-radius: 10px 10px 0 0 !important;
+            background: linear-gradient(to right, var(--primary-color), var(--secondary-color));
+            color: white;
+            font-weight: bold;
+        }
+        
+        .btn-primary {
+            background: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+        
+        .btn-primary:hover {
+            background: #1976d2;
+            border-color: #1976d2;
+        }
+        
+        .footer {
+            background-color: var(--dark-color);
+            color: white;
+            padding: 1rem 0;
+            text-align: center;
+        }
+        
+        /* 仪表盘样式 */
+        .dashboard-card {
+            height: 100%;
+            border-left: 4px solid var(--primary-color);
+        }
+        
+        .dashboard-card.warning {
+            border-left-color: var(--warning-color);
+        }
+        
+        .dashboard-card.danger {
+            border-left-color: var(--danger-color);
+        }
+        
+        .dashboard-card.success {
+            border-left-color: var(--success-color);
+        }
+        
+        .stat-icon {
+            font-size: 2.5rem;
+            margin-right: 1rem;
+            color: var(--primary-color);
+        }
+        
+        .stat-number {
+            font-size: 2rem;
+            font-weight: bold;
+        }
+        
+        /* 警告样式 */
+        .alert-fatigue {
+            background-color: #ff5252;
+            color: white;
+            font-weight: bold;
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        
+        /* 检测结果表格 */
+        .table-results th {
+            background-color: var(--primary-color);
+            color: white;
+        }
+    </style>
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    <!-- 导航栏 -->
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="{% url 'detection:dashboard' %}">
+                <i class="fas fa-car-crash me-2"></i>疲劳驾驶检测系统
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                {% if user.is_authenticated %}
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/detection/dashboard/' %}active{% endif %}" href="{% url 'detection:dashboard' %}">
+                            <i class="fas fa-tachometer-alt me-1"></i>仪表盘
+                        </a>
+                    </li>
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle" href="#" id="navbarDropdown" role="button" data-bs-toggle="dropdown">
+                            <i class="fas fa-camera me-1"></i>检测功能
+                        </a>
+                        <ul class="dropdown-menu">
+                            <li><a class="dropdown-item" href="{% url 'detection:realtime' %}">实时检测</a></li>
+                            <li><a class="dropdown-item" href="{% url 'detection:video' %}">视频检测</a></li>
+                        </ul>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/detection/history/' %}active{% endif %}" href="{% url 'detection:history' %}">
+                            <i class="fas fa-history me-1"></i>历史记录
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/detection/statistics/' %}active{% endif %}" href="{% url 'detection:statistics' %}">
+                            <i class="fas fa-chart-bar me-1"></i>统计分析
+                        </a>
+                    </li>
+                    {% if user.is_admin or user.is_superuser %}
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/detection/config/' %}active{% endif %}" href="{% url 'detection:system_config' %}">
+                            <i class="fas fa-cog me-1"></i>系统配置
+                        </a>
+                    </li>
+                    {% endif %}
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle" href="#" id="userDropdown" role="button" data-bs-toggle="dropdown">
+                            <i class="fas fa-user-circle me-1"></i>{{ user.username }}
+                        </a>
+                        <ul class="dropdown-menu">
+                            <li><a class="dropdown-item" href="{% url 'accounts:profile' %}">个人资料</a></li>
+                            <li><a class="dropdown-item" href="{% url 'accounts:password_change' %}">修改密码</a></li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li><a class="dropdown-item" href="{% url 'accounts:logout' %}">退出登录</a></li>
+                        </ul>
+                    </li>
+                </ul>
+                {% else %}
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'accounts:login' %}">登录</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'accounts:register' %}">注册</a>
+                    </li>
+                </ul>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+    
+    <!-- 消息提示 -->
+    {% if messages %}
+    <div class="container mt-3">
+        {% for message in messages %}
+        <div class="alert alert-{{ message.tags }} alert-dismissible fade show" role="alert">
+            {{ message }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    
+    <!-- 主内容区 -->
+    <div class="content-container">
+        {% block content %}{% endblock %}
+    </div>
+    
+    <!-- 页脚 -->
+    <footer class="footer">
+        <div class="container">
+            <p class="mb-0">&copy; 2025 疲劳驾驶检测系统 | 基于YOLO与dlib的智能驾驶辅助平台</p>
+        </div>
+    </footer>
+    
+    <!-- Bootstrap 5 JS Bundle -->
+    <script src="{% static 'bootstrap.bundle.min.js' %}"></script>
+    <!-- jQuery -->
+    <script src="{% static 'jquery-3.6.0.min.js' %}"></script>
+    <!-- Chart.js -->
+    <script src="{% static 'chart.js' %}"></script>
+    
+    {% block extra_js %}{% endblock %}
+</body>
+</html> 

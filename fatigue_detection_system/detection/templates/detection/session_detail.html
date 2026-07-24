@@ -1,0 +1,243 @@
+{% extends 'base.html' %}
+
+{% block title %}检测会话 #{{ session.id }} - 疲劳驾驶检测系统{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="fas fa-file-alt me-2"></i>检测会话 #{{ session.id }}</h2>
+        <div>
+            <a href="{% url 'detection:dashboard' %}" class="btn btn-outline-primary">
+                <i class="fas fa-arrow-left me-1"></i>返回仪表盘
+            </a>
+        </div>
+    </div>
+    
+    <div class="card shadow-sm mb-4">
+        <div class="card-header">
+            <h5 class="mb-0">会话信息</h5>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-6">
+                    <table class="table table-borderless">
+                        <tr>
+                            <th width="40%">会话ID</th>
+                            <td>{{ session.id }}</td>
+                        </tr>
+                        <tr>
+                            <th>会话类型</th>
+                            <td>
+                                {% if session.session_type == 'realtime' %}
+                                    <span class="badge bg-primary">实时检测</span>
+                                {% elif session.session_type == 'video' %}
+                                    <span class="badge bg-info">视频检测</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>开始时间</th>
+                            <td>{{ session.start_time|date:"Y-m-d H:i:s" }}</td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <table class="table table-borderless">
+                        <tr>
+                            <th width="40%">结束时间</th>
+                            <td>
+                                {% if session.end_time %}
+                                    {{ session.end_time|date:"Y-m-d H:i:s" }}
+                                {% else %}
+                                    <span class="badge bg-warning text-dark">进行中</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>状态</th>
+                            <td>
+                                {% if session.status == 'completed' %}
+                                    <span class="badge bg-success">已完成</span>
+                                {% elif session.status == 'in_progress' %}
+                                    <span class="badge bg-warning text-dark">进行中</span>
+                                {% elif session.status == 'failed' %}
+                                    <span class="badge bg-danger">失败</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>用户</th>
+                            <td>{{ session.user.username }}</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card shadow-sm mb-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">检测结果统计</h5>
+            {% if session.detection_results.count > 0 %}
+            <div>
+                <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#statsCollapse">
+                    <i class="fas fa-chart-bar me-1"></i>显示/隐藏统计
+                </button>
+            </div>
+            {% endif %}
+        </div>
+        <div class="collapse show" id="statsCollapse">
+            <div class="card-body">
+                {% if session.detection_results.count > 0 %}
+                <div class="row">
+                    <div class="col-md-6 mb-4">
+                        <h6>疲劳状态分布</h6>
+                        <div class="progress" style="height: 25px;">
+                            <div class="progress-bar bg-success" style="width: {{ session.normal_percentage }}%;" title="正常">
+                                正常 ({{ session.normal_percentage }}%)
+                            </div>
+                            <div class="progress-bar bg-info" style="width: {{ session.mild_fatigue_percentage }}%;" title="轻度疲劳">
+                                轻度 ({{ session.mild_fatigue_percentage }}%)
+                            </div>
+                            <div class="progress-bar bg-warning" style="width: {{ session.moderate_fatigue_percentage }}%;" title="中度疲劳">
+                                中度 ({{ session.moderate_fatigue_percentage }}%)
+                            </div>
+                            <div class="progress-bar" style="width: {{ session.severe_fatigue_percentage }}%; background-color: #ff7043;" title="较严重疲劳">
+                                较严重 ({{ session.severe_fatigue_percentage }}%)
+                            </div>
+                            <div class="progress-bar bg-danger" style="width: {{ session.extreme_fatigue_percentage }}%;" title="严重疲劳">
+                                严重 ({{ session.extreme_fatigue_percentage }}%)
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-6 mb-4">
+                        <h6>不良行为检测</h6>
+                        <div class="row">
+                            <div class="col-6">
+                                <div class="d-flex justify-content-between">
+                                    <span>打哈欠:</span>
+                                    <span class="badge bg-warning text-dark">{{ session.yawn_count }}次</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="d-flex justify-content-between">
+                                    <span>抽烟:</span>
+                                    <span class="badge bg-danger">{{ session.smoking_count }}次</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="d-flex justify-content-between">
+                                    <span>打电话:</span>
+                                    <span class="badge bg-danger">{{ session.phone_count }}次</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="d-flex justify-content-between">
+                                    <span>喝水:</span>
+                                    <span class="badge bg-warning text-dark">{{ session.drinking_count }}次</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% else %}
+                <div class="text-center py-4 text-muted">
+                    <i class="fas fa-info-circle fa-2x mb-3"></i>
+                    <h6>暂无检测结果数据</h6>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <div class="card shadow-sm">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">检测结果列表</h5>
+            <div>
+                <span class="badge bg-secondary">共 {{ session.detection_results.count }} 条结果</span>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            {% if session.detection_results.count > 0 %}
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>#</th>
+                            <th>时间</th>
+                            <th>面部检测</th>
+                            <th>疲劳等级</th>
+                            <th>不良行为</th>
+                            <th>结果图像</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for result in session.detection_results.all %}
+                        <tr>
+                            <td>{{ forloop.counter }}</td>
+                            <td>{{ result.timestamp|date:"H:i:s" }}</td>
+                            <td>
+                                {% if result.face_detected %}
+                                <span class="badge bg-success">已检测</span>
+                                {% else %}
+                                <span class="badge bg-secondary">未检测</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.fatigue_level == 0 %}
+                                <span class="badge bg-success">正常</span>
+                                {% elif result.fatigue_level == 1 %}
+                                <span class="badge bg-info">轻度疲劳</span>
+                                {% elif result.fatigue_level == 2 %}
+                                <span class="badge bg-warning text-dark">中度疲劳</span>
+                                {% elif result.fatigue_level == 3 %}
+                                <span class="badge" style="background-color: #ff7043; color: white;">较严重疲劳</span>
+                                {% elif result.fatigue_level == 4 %}
+                                <span class="badge bg-danger">严重疲劳</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.smoking_detected or result.phone_detected or result.yawn_detected or result.drinking_detected %}
+                                <div>
+                                    {% if result.smoking_detected %}
+                                    <span class="badge bg-danger me-1">抽烟</span>
+                                    {% endif %}
+                                    {% if result.phone_detected %}
+                                    <span class="badge bg-danger me-1">打电话</span>
+                                    {% endif %}
+                                    {% if result.yawn_detected %}
+                                    <span class="badge bg-warning text-dark me-1">打哈欠</span>
+                                    {% endif %}
+                                    {% if result.drinking_detected %}
+                                    <span class="badge bg-warning text-dark">喝水</span>
+                                    {% endif %}
+                                </div>
+                                {% else %}
+                                <span class="text-muted">无</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if result.result_image %}
+                                <a href="{{ result.result_image.url }}" class="btn btn-sm btn-outline-info" target="_blank">
+                                    <i class="fas fa-eye me-1"></i>查看
+                                </a>
+                                {% else %}
+                                <span class="text-muted">无图像</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="text-center py-5 text-muted">
+                <i class="fas fa-search fa-3x mb-3"></i>
+                <h5>暂无检测结果</h5>
+                <p>检测完成后，结果将显示在这里</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %} 

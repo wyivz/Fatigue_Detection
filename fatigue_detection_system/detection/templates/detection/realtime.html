@@ -1,0 +1,1040 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block title %}实时检测 - 疲劳驾驶检测系统{% endblock %}
+
+{% block extra_css %}
+<style>
+    #video-container {
+        position: relative;
+        margin: 0 auto;
+        width: 100%;
+        max-width: 640px;
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+    }
+    
+    #video-stream {
+        width: 100%;
+        height: auto;
+        display: block;
+    }
+    
+    #canvas {
+        display: none;
+    }
+    
+    #result-container {
+        padding: 1rem;
+        border-radius: 10px;
+        background-color: white;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+    }
+    
+    .status-indicator {
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-right: 5px;
+    }
+    
+    .status-indicator.active {
+        background-color: #4CAF50;
+    }
+    
+    .status-indicator.inactive {
+        background-color: #F44336;
+    }
+    
+    .result-item {
+        padding: 10px;
+        margin-bottom: 10px;
+        border-radius: 5px;
+        transition: all 0.3s;
+    }
+    
+    .result-item.warning {
+        background-color: rgba(255, 202, 40, 0.1);
+        border-left: 4px solid #ffca28;
+    }
+    
+    .result-item.danger {
+        background-color: rgba(239, 83, 80, 0.1);
+        border-left: 4px solid #ef5350;
+    }
+    
+    .result-item.success {
+        background-color: rgba(102, 187, 106, 0.1);
+        border-left: 4px solid #66bb6a;
+    }
+    
+    .fatigue-meter {
+        height: 30px;
+        background-color: #eceff1;
+        border-radius: 15px;
+        position: relative;
+        overflow: hidden;
+        margin: 1rem 0;
+    }
+    
+    .fatigue-level {
+        height: 100%;
+        border-radius: 15px;
+        transition: width 0.5s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+    }
+    
+    .chart-container {
+        position: relative;
+        height: 220px;
+        width: 100%;
+    }
+    
+    .stats-card {
+        border-radius: 10px;
+        background-color: white;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+    }
+    
+    .stats-item {
+        text-align: center;
+        padding: 10px;
+    }
+    
+    .stats-number {
+        font-size: 24px;
+        font-weight: bold;
+        color: var(--primary-color);
+    }
+    
+    .stats-label {
+        font-size: 14px;
+        color: #666;
+    }
+    
+    @media (max-width: 767px) {
+        #video-container {
+            max-width: 100%;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="fas fa-camera me-2"></i>实时疲劳检测</h2>
+        <div>
+            <a href="{% url 'detection:dashboard' %}" class="btn btn-outline-primary">
+                <i class="fas fa-arrow-left me-1"></i>返回仪表盘
+            </a>
+        </div>
+    </div>
+    
+    <div class="row">
+        <!-- 视频显示区域 -->
+        <div class="col-lg-6 mb-4">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0"><i class="fas fa-video me-2"></i>摄像头画面</h5>
+                    <div>
+                        <span class="status-indicator inactive" id="camera-status"></span>
+                        <span id="camera-status-text">未启动</span>
+                    </div>
+                </div>
+                <div class="card-body p-0">
+                    <div id="video-container">
+                        <video id="video-stream" autoplay playsinline></video>
+                        <canvas id="canvas"></canvas>
+                    </div>
+                </div>
+                <div class="card-footer">
+                    <div class="row">
+                        <div class="col-6">
+                            <button id="start-btn" class="btn btn-success w-100">
+                                <i class="fas fa-play me-1"></i>开始检测
+                            </button>
+                        </div>
+                        <div class="col-6">
+                            <button id="stop-btn" class="btn btn-danger w-100" disabled>
+                                <i class="fas fa-stop me-1"></i>停止检测
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 实时统计卡片 -->
+            <div class="stats-card mt-4">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-chart-bar me-2"></i>实时统计</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-3 stats-item">
+                            <div class="stats-number" id="face-count">0</div>
+                            <div class="stats-label">人脸检测</div>
+                        </div>
+                        <div class="col-3 stats-item">
+                            <div class="stats-number" id="fatigue-count">0</div>
+                            <div class="stats-label">疲劳检出</div>
+                        </div>
+                        <div class="col-3 stats-item">
+                            <div class="stats-number" id="yawn-count">0</div>
+                            <div class="stats-label">打哈欠</div>
+                        </div>
+                        <div class="col-3 stats-item">
+                            <div class="stats-number" id="behavior-count">0</div>
+                            <div class="stats-label">不良行为</div>
+                        </div>
+                    </div>
+                    
+                    <div class="chart-container mt-3">
+                        <canvas id="stats-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 检测结果区域 -->
+        <div class="col-lg-6 mb-4">
+            <div class="card h-100">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-clipboard-list me-2"></i>检测结果</h5>
+                </div>
+                <div class="card-body" id="result-container">
+                    <div class="alert alert-info" id="detection-alert">
+                        <i class="fas fa-info-circle me-2"></i>点击"开始检测"按钮启动摄像头
+                    </div>
+                    
+                    <h6 class="mt-4 mb-2">疲劳指数</h6>
+                    <div class="fatigue-meter">
+                        <div class="fatigue-level" id="fatigue-level" style="width: 0%; background-color: #4CAF50;">
+                            0%
+                        </div>
+                    </div>
+                    
+                    <div class="row mt-4">
+                        <div class="col-6">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="alert-sound" checked>
+                                <label class="form-check-label" for="alert-sound">声音提醒</label>
+                            </div>
+                        </div>
+                        <div class="col-6 text-end">
+                            <a href="#" id="view-results-link" class="btn btn-sm btn-outline-primary" style="display: none;">
+                                查看记录
+                            </a>
+                        </div>
+                    </div>
+                    
+                    <hr>
+                    
+                    <h6 class="mb-3">检测详情</h6>
+                    <div id="detection-details">
+                        <div class="text-center text-muted">
+                            <i class="fas fa-hourglass me-2"></i>等待检测结果...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 警告弹窗 -->
+    <div class="modal fade" id="warning-modal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header bg-danger text-white">
+                    <h5 class="modal-title">
+                        <i class="fas fa-exclamation-triangle me-2"></i>疲劳驾驶警告
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-0" id="warning-message">您可能处于疲劳状态，请注意休息！</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">知道了</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+    // 会话ID
+    const sessionId = {{ session.id }};
+    
+    // DOM元素
+    const videoElement = document.getElementById('video-stream');
+    const canvasElement = document.getElementById('canvas');
+    const startButton = document.getElementById('start-btn');
+    const stopButton = document.getElementById('stop-btn');
+    const cameraStatus = document.getElementById('camera-status');
+    const cameraStatusText = document.getElementById('camera-status-text');
+    const detectionDetails = document.getElementById('detection-details');
+    const fatigueLevel = document.getElementById('fatigue-level');
+    const viewResultsLink = document.getElementById('view-results-link');
+    const alertSound = document.getElementById('alert-sound');
+    const warningModal = new bootstrap.Modal(document.getElementById('warning-modal'));
+    const detectionAlert = document.getElementById('detection-alert');
+    
+    // 统计元素
+    const faceCountElement = document.getElementById('face-count');
+    const fatigueCountElement = document.getElementById('fatigue-count');
+    const yawnCountElement = document.getElementById('yawn-count');
+    const behaviorCountElement = document.getElementById('behavior-count');
+    
+    // 统计数据
+    let statsData = {
+        faceCount: 0,
+        fatigueCount: 0,
+        yawnCount: 0,
+        behaviorCount: 0,
+        timeLabels: [],
+        fatigueValues: [],
+        behaviorValues: []
+    };
+    
+    // 图表
+    let statsChart = null;
+    
+    // 初始化图表
+    function initStatsChart() {
+        const ctx = document.getElementById('stats-chart').getContext('2d');
+        
+        statsChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: '疲劳指数',
+                        data: [],
+                        borderColor: '#FF9800',
+                        backgroundColor: 'rgba(255, 152, 0, 0.1)',
+                        borderWidth: 2,
+                        tension: 0.3,
+                        fill: true
+                    },
+                    {
+                        label: '不良行为',
+                        data: [],
+                        borderColor: '#F44336',
+                        backgroundColor: 'rgba(244, 67, 54, 0.1)',
+                        borderWidth: 2,
+                        tension: 0.3,
+                        fill: true
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'top',
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 5
+                    }
+                },
+                animation: {
+                    duration: 0
+                }
+            }
+        });
+    }
+    
+    // 警告音效相关
+    let audioContext = null;
+    let audioInitialized = false;
+    let alertAudio = null;
+    let fatigueAlertAudio = null;
+    let phoneAlertAudio = null;
+    let smokingAlertAudio = null;
+    
+    // 初始化音频
+    function initAudio() {
+        if (!audioInitialized) {
+            try {
+                // 预加载所有声音文件
+                alertAudio = new Audio("{% static 'sounds/alert.mp3' %}");
+                fatigueAlertAudio = new Audio("{% static 'sounds/fatigue_alert.mp3' %}");
+                phoneAlertAudio = new Audio("{% static 'sounds/phone_alert.mp3' %}");
+                smokingAlertAudio = new Audio("{% static 'sounds/smoking_alert.mp3' %}");
+                
+                // 设置音量
+                const volume = {{ alert_volume|default:80 }} / 100;
+                alertAudio.volume = volume;
+                fatigueAlertAudio.volume = volume;
+                phoneAlertAudio.volume = volume;
+                smokingAlertAudio.volume = volume;
+                
+                audioInitialized = true;
+                console.log('音频文件加载成功');
+            } catch (e) {
+                console.error('初始化音频文件失败:', e);
+            }
+        }
+    }
+    
+    // 检测状态
+    let isDetecting = false;
+    let detectionInterval = null;
+    let stream = null;
+    let isRequestInFlight = false;
+    let activeSourceType = 'browser';
+    let mvsStatusTimer = null;
+    let gigeDevices = [];
+    const defaultMvsIndex = {{ default_mvs_index|default:0 }};
+    const sourceTypeSelect = document.getElementById('source-type');
+    const deviceSelect = document.getElementById('device-select');
+    const refreshSourcesBtn = document.getElementById('refresh-sources-btn');
+    const sourceHint = document.getElementById('source-hint');
+    const mvsPreviewImg = document.getElementById('mvs-preview');
+    
+    function setSourceControlsEnabled(enabled) {
+        sourceTypeSelect.disabled = !enabled;
+        deviceSelect.disabled = !enabled;
+        refreshSourcesBtn.disabled = !enabled;
+    }
+    
+    function fillDeviceOptions(items, valueKey, labelKey) {
+        deviceSelect.innerHTML = '';
+        if (!items.length) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = '无可用设备';
+            deviceSelect.appendChild(opt);
+            return;
+        }
+        items.forEach((item, i) => {
+            const opt = document.createElement('option');
+            opt.value = item[valueKey];
+            opt.textContent = item[labelKey] || item[valueKey] || ('Device ' + (i + 1));
+            if (item.ip) opt.dataset.ip = item.ip;
+            deviceSelect.appendChild(opt);
+        });
+    }
+    
+    async function loadBrowserCameras() {
+        sourceHint.textContent = '正在枚举系统摄像头...';
+        try {
+            // Permission probe so labels become available
+            const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            tmp.getTracks().forEach(t => t.stop());
+        } catch (e) {
+            console.warn('camera permission probe failed', e);
+        }
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === 'videoinput').map((d, i) => ({
+            deviceId: d.deviceId,
+            label: d.label || ('Camera ' + (i + 1))
+        }));
+        fillDeviceOptions(cams, 'deviceId', 'label');
+        sourceHint.textContent = cams.length ? '已选择系统摄像头' : '未找到系统摄像头，请检查权限/驱动';
+    }
+    
+    async function loadGigECameras() {
+        sourceHint.textContent = '正在枚举工业相机 (MVS)...';
+        try {
+            const resp = await fetch("{% url 'detection:list_sources' %}");
+            const data = await resp.json();
+            gigeDevices = data.gige || [];
+            if (!data.mvs_available) {
+                fillDeviceOptions([], 'index', 'display_name');
+                sourceHint.textContent = data.mvs_error || 'MVS 不可用，请安装 Runtime 或改用系统摄像头';
+                return;
+            }
+            fillDeviceOptions(gigeDevices, 'index', 'display_name');
+            if (gigeDevices.length) {
+                const preferred = String(defaultMvsIndex);
+                if ([...deviceSelect.options].some(o => o.value === preferred)) {
+                    deviceSelect.value = preferred;
+                }
+                sourceHint.textContent = '已找到 ' + gigeDevices.length + ' 台工业相机（开始前请关闭 MVS 客户端预览）';
+            } else {
+                sourceHint.textContent = data.mvs_error || '未枚举到 GigE 相机';
+            }
+        } catch (e) {
+            console.error(e);
+            fillDeviceOptions([], 'index', 'display_name');
+            sourceHint.textContent = '枚举工业相机失败: ' + e;
+        }
+    }
+    
+    async function refreshSources() {
+        if (sourceTypeSelect.value === 'mvs') {
+            await loadGigECameras();
+        } else {
+            await loadBrowserCameras();
+        }
+    }
+    
+    sourceTypeSelect.addEventListener('change', refreshSources);
+    refreshSourcesBtn.addEventListener('click', refreshSources);
+    refreshSources();
+    
+    function startDetectionLoop() {
+        if (detectionInterval) {
+            clearInterval(detectionInterval);
+            detectionInterval = null;
+        }
+        let started = false;
+        const kickoff = () => {
+            if (!isDetecting || started) return;
+            started = true;
+            videoElement.onloadedmetadata = null;
+            detectFrame();
+            detectionInterval = setInterval(detectFrame, detectionIntervalMs);
+        };
+        if (videoElement.videoWidth > 0 && videoElement.videoHeight > 0) {
+            kickoff();
+        } else {
+            videoElement.onloadedmetadata = kickoff;
+            setTimeout(kickoff, 500);
+        }
+    }
+    
+    function startMvsStatusPolling() {
+        if (mvsStatusTimer) clearInterval(mvsStatusTimer);
+        let lastDetectionId = null;
+        mvsStatusTimer = setInterval(async () => {
+            if (!isDetecting || activeSourceType !== 'mvs') return;
+            try {
+                const resp = await fetch("{% url 'detection:mvs_status' %}?session_id=" + sessionId);
+                const data = await resp.json();
+                if (data.status !== 'success') return;
+                if (data.error) {
+                    detectionAlert.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>' + data.error;
+                    detectionAlert.className = 'alert alert-warning';
+                }
+                if (data.meta && data.meta.timing) {
+                    updateTimingPanel(data.meta.timing);
+                }
+                if (data.meta) {
+                    const did = data.meta.detection_id;
+                    const behaviorChanged = (
+                        !!data.meta.smoking_detected || !!data.meta.phone_detected || !!data.meta.drinking_detected
+                    );
+                    // Persist frames (detection_id change) or confirmed behavior => full update
+                    if ((did != null && did !== lastDetectionId) || behaviorChanged) {
+                        if (did != null) lastDetectionId = did;
+                        updateDetectionResults(Object.assign({ status: 'success' }, data.meta));
+                    } else if (data.meta.eye_aspect_ratio !== undefined || data.meta.perclos !== undefined || data.meta.fatigue_level !== undefined) {
+                        updateDetectionResults(Object.assign({ status: 'success' }, data.meta, {
+                            _softUpdate: true
+                        }));
+                    }
+                }
+            } catch (e) {
+                console.warn('mvs_status failed', e);
+            }
+        }, Math.max(200, Math.min(earSampleIntervalMs, detectionIntervalMs)));
+    }
+    
+    // 开始检测
+    startButton.addEventListener('click', async () => {
+        initAudio();
+        const sourceType = sourceTypeSelect.value;
+        activeSourceType = sourceType;
+        const deviceValue = deviceSelect.value;
+        if (!deviceValue) {
+            alert('请先选择可用设备');
+            return;
+        }
+        
+        try {
+            resetStats();
+            initStatsChart();
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            setSourceControlsEnabled(false);
+            cameraStatus.classList.remove('inactive');
+            cameraStatus.classList.add('active');
+            cameraStatusText.textContent = '已启动';
+            detectionAlert.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>检测中...';
+            detectionAlert.className = 'alert alert-primary';
+            viewResultsLink.href = `/detection/results/${sessionId}/`;
+            viewResultsLink.style.display = 'inline-block';
+            isDetecting = true;
+            
+            if (sourceType === 'mvs') {
+                videoElement.style.display = 'none';
+                videoElement.srcObject = null;
+                mvsPreviewImg.style.display = 'block';
+                const selected = deviceSelect.options[deviceSelect.selectedIndex];
+                const payload = {
+                    session_id: sessionId,
+                    source_type: 'mvs',
+                    device_index: deviceValue
+                };
+                if (selected && selected.dataset.ip) {
+                    payload.camera_ip = selected.dataset.ip;
+                }
+                const startResp = await $.post("{% url 'detection:start_detection' %}", payload);
+                if (startResp.status !== 'success') {
+                    throw new Error(startResp.message || '启动工业相机失败');
+                }
+                mvsPreviewImg.src = "{% url 'detection:mvs_preview' %}?session_id=" + sessionId + "&t=" + Date.now();
+                startMvsStatusPolling();
+            } else {
+                mvsPreviewImg.style.display = 'none';
+                mvsPreviewImg.removeAttribute('src');
+                videoElement.style.display = 'block';
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        deviceId: { exact: deviceValue },
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    },
+                    audio: false
+                });
+                videoElement.srcObject = stream;
+                canvasElement.style.display = 'none';
+                await $.post("{% url 'detection:start_detection' %}", {
+                    session_id: sessionId,
+                    source_type: 'browser'
+                });
+                startDetectionLoop();
+            }
+        } catch (error) {
+            console.error(error);
+            alert('启动失败: ' + (error.message || error));
+            stopDetection();
+        }
+    });
+    
+    // 停止检测
+    stopButton.addEventListener('click', () => {
+        stopDetection();
+    });
+    
+    // 重置统计数据
+    function resetStats() {
+        statsData = {
+            faceCount: 0,
+            fatigueCount: 0,
+            yawnCount: 0,
+            behaviorCount: 0,
+            timeLabels: [],
+            fatigueValues: [],
+            behaviorValues: []
+        };
+        
+        // 更新统计显示
+        updateStatsDisplay();
+    }
+    
+    // 更新统计显示
+    function updateStatsDisplay() {
+        faceCountElement.textContent = statsData.faceCount;
+        fatigueCountElement.textContent = statsData.fatigueCount;
+        yawnCountElement.textContent = statsData.yawnCount;
+        behaviorCountElement.textContent = statsData.behaviorCount;
+        
+        // 更新图表
+        if (statsChart) {
+            statsChart.data.labels = statsData.timeLabels;
+            statsChart.data.datasets[0].data = statsData.fatigueValues;
+            statsChart.data.datasets[1].data = statsData.behaviorValues;
+            statsChart.update();
+        }
+    }
+    
+    // 停止检测函数
+    function stopDetection() {
+        if (detectionInterval) {
+            clearInterval(detectionInterval);
+            detectionInterval = null;
+        }
+        if (mvsStatusTimer) {
+            clearInterval(mvsStatusTimer);
+            mvsStatusTimer = null;
+        }
+        
+        if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+            videoElement.srcObject = null;
+        }
+        mvsPreviewImg.removeAttribute('src');
+        mvsPreviewImg.style.display = 'none';
+        videoElement.style.display = 'block';
+        
+        canvasElement.style.display = 'none';
+        
+        isDetecting = false;
+        isRequestInFlight = false;
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        setSourceControlsEnabled(true);
+        cameraStatus.classList.remove('active');
+        cameraStatus.classList.add('inactive');
+        cameraStatusText.textContent = '已停止';
+        
+        detectionAlert.innerHTML = '<i class="fas fa-check-circle me-2"></i>检测已完成';
+        detectionAlert.className = 'alert alert-success';
+        
+        $.post("{% url 'detection:stop_detection' %}", {
+            session_id: sessionId
+        }).done((response) => {
+            console.log('检测已停止:', response);
+        });
+    }
+    
+    // 检测当前帧
+    function detectFrame() {
+        if (!isDetecting || isRequestInFlight) return;
+        if (!videoElement.videoWidth || !videoElement.videoHeight) {
+            console.warn('视频尚未就绪，跳过本帧');
+            return;
+        }
+        
+        // 用离屏 canvas 抓帧，避免覆盖正在显示的检测结果画布尺寸逻辑混乱
+        const captureCanvas = document.createElement('canvas');
+        captureCanvas.width = videoElement.videoWidth;
+        captureCanvas.height = videoElement.videoHeight;
+        const context = captureCanvas.getContext('2d');
+        context.drawImage(videoElement, 0, 0, captureCanvas.width, captureCanvas.height);
+        const imageData = captureCanvas.toDataURL('image/jpeg', 0.85);
+        
+        // 请求参数
+        const requestData = {
+            session_id: sessionId,
+            image_data: imageData,
+            detect_fatigue: 'true',
+            detect_behaviors: 'true'
+        };
+        
+        console.log('发送检测请求，会话ID:', sessionId);
+        isRequestInFlight = true;
+        
+        // 发送到服务器进行检测
+        $.ajax({
+            url: "{% url 'detection:get_result' %}",
+            type: "POST",
+            data: requestData,
+            dataType: "json",
+            success: function(result) {
+                console.log('收到检测结果响应:', result);
+                if (result.status === 'success') {
+                    updateDetectionResults(result);
+                } else {
+                    console.error('检测失败:', result.message);
+                    displayEmptyResults();
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('请求失败:', status, error);
+                console.log('错误详情:', xhr && xhr.responseText);
+                displayEmptyResults();
+            },
+            complete: function() {
+                isRequestInFlight = false;
+            }
+        });
+    }
+    
+    // 显示空的检测结果
+    function displayEmptyResults() {
+        // 更新检测详情
+        let detailsHTML = '';
+        
+        // 面部检测
+        detailsHTML += `<div class="result-item">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-user me-2"></i>面部检测</span>
+                <span>未检测到</span>
+            </div>
+        </div>`;
+        
+        // 其他项目
+        detailsHTML += `<div class="result-item">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-eye me-2"></i>眼睛状态</span>
+                <span>未检测</span>
+            </div>
+        </div>`;
+        
+        detailsHTML += `<div class="result-item">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-tired me-2"></i>打哈欠</span>
+                <span>未检测</span>
+            </div>
+        </div>`;
+        
+        detailsHTML += `<div class="result-item">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-bed me-2"></i>疲劳等级</span>
+                <span>0/4</span>
+            </div>
+        </div>`;
+        
+        detectionDetails.innerHTML = detailsHTML;
+    }
+    
+    // 更新检测结果
+    function updateDetectionResults(result) {
+        console.log('检测结果:', result);  // 添加调试输出
+        
+        // 更新统计数据
+        if (result.face_detected) {
+            statsData.faceCount++;
+        }
+        if (result.fatigue_level >= 2) {
+            statsData.fatigueCount++;
+        }
+        if (result.yawn_detected) {
+            statsData.yawnCount++;
+        }
+        if (result.smoking_detected || result.phone_detected || result.drinking_detected) {
+            statsData.behaviorCount++;
+        }
+        
+        // 添加图表数据点
+        const now = new Date();
+        const timeLabel = now.getHours() + ':' + now.getMinutes() + ':' + now.getSeconds();
+        statsData.timeLabels.push(timeLabel);
+        statsData.fatigueValues.push(result.fatigue_level);
+        
+        // 不良行为数据点
+        const behaviorValue = (result.smoking_detected ? 1 : 0) + 
+                             (result.phone_detected ? 1 : 0) + 
+                             (result.drinking_detected ? 1 : 0) +
+                             (result.yawn_detected ? 1 : 0);
+        statsData.behaviorValues.push(behaviorValue);
+        
+        // 限制数据点数量
+        if (statsData.timeLabels.length > 10) {
+            statsData.timeLabels.shift();
+            statsData.fatigueValues.shift();
+            statsData.behaviorValues.shift();
+        }
+        
+        // 更新统计显示
+        updateStatsDisplay();
+        
+        // 更新疲劳等级
+        const level = result.fatigue_level;
+        let levelPercent = (level / 4) * 100;
+        fatigueLevel.style.width = `${levelPercent}%`;
+        fatigueLevel.textContent = `${Math.round(levelPercent)}%`;
+        
+        // 根据疲劳等级设置颜色与告警
+        // soft 刷新也允许告警（MVS 主要靠 EAR 环 soft更新）；用冷却避免连弹
+        if (level >= 3) {
+            fatigueLevel.style.backgroundColor = '#F44336'; // 红色
+
+            const alertLevel = {{ fatigue_alert_level|default:3 }};
+            if (level >= alertLevel && alertSound.checked) {
+                const nowMs = Date.now();
+                if (nowMs - lastFatigueAlertAt >= FATIGUE_ALERT_COOLDOWN_MS) {
+                    lastFatigueAlertAt = nowMs;
+                    playAlertSound('fatigue');
+                    warningModal.show();
+                    fatigueAckPending = true;
+                }
+            }
+        } else if (level >= 1) {
+            fatigueLevel.style.backgroundColor = '#FF9800'; // 橙色
+        } else {
+            fatigueLevel.style.backgroundColor = '#4CAF50'; // 绿色
+        }
+        
+        // 更新检测详情
+        let detailsHTML = '';
+        
+        // 面部检测
+        detailsHTML += `<div class="result-item ${result.face_detected ? 'success' : ''}">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-user me-2"></i>面部检测</span>
+                <span>${result.face_detected ? '已检测到' : '未检测到'}</span>
+            </div>
+        </div>`;
+        
+        // 眼睛状态 - 无论是否检测到人脸都显示
+        let eyeText = '未检测';
+        let eyeWarning = false;
+        
+        if (result.eye_aspect_ratio !== null && result.eye_aspect_ratio !== undefined) {
+            eyeText = 'EAR: ' + result.eye_aspect_ratio.toFixed(2);
+            eyeWarning = result.eye_aspect_ratio < 0.25;
+        }
+        
+        detailsHTML += `<div class="result-item ${eyeWarning ? 'warning' : ''}">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-eye me-2"></i>眼睛状态</span>
+                <span>${eyeText}</span>
+            </div>
+        </div>`;
+        
+        // 打哈欠检测 - 无论是否检测到人脸都显示
+        let yawnText = '未检测';
+        let yawnWarning = false;
+        
+        if (result.yawn_detected !== undefined) {
+            yawnText = result.yawn_detected ? '是' : '否';
+            yawnWarning = result.yawn_detected;
+        }
+        
+        detailsHTML += `<div class="result-item ${yawnWarning ? 'warning' : ''}">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-tired me-2"></i>打哈欠</span>
+                <span>${yawnText}</span>
+            </div>
+        </div>`;
+        
+        // 疲劳等级 - 无论是否检测到人脸都显示
+        let fatigueLevelText = '0/4';
+        let fatigueLevelWarning = false;
+        
+        if (result.fatigue_level !== undefined) {
+            fatigueLevelText = result.fatigue_level + '/4';
+            fatigueLevelWarning = result.fatigue_level >= 2;
+        }
+        
+        detailsHTML += `<div class="result-item ${fatigueLevelWarning ? (result.fatigue_level >= 3 ? 'danger' : 'warning') : ''}">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-bed me-2"></i>疲劳等级</span>
+                <span>${fatigueLevelText}</span>
+            </div>
+        </div>`;
+        
+        // 不良行为检测 - 无论是否检测到人脸都显示
+        // 抽烟检测
+        let smokingText = '未检测';
+        let smokingWarning = false;
+        
+        if (result.smoking_detected !== undefined) {
+            smokingText = result.smoking_detected ? '是' : '否';
+            smokingWarning = result.smoking_detected;
+            
+            // 如果检测到抽烟且启用了声音提醒
+            if (result.smoking_detected && alertSound.checked) {
+                playAlertSound('smoking');
+            }
+        }
+        
+        detailsHTML += `<div class="result-item ${smokingWarning ? 'danger' : ''}">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-smoking me-2"></i>抽烟</span>
+                <span>${smokingText}</span>
+            </div>
+        </div>`;
+        
+        // 打电话检测
+        let phoneText = '未检测';
+        let phoneWarning = false;
+        
+        if (result.phone_detected !== undefined) {
+            phoneText = result.phone_detected ? '是' : '否';
+            phoneWarning = result.phone_detected;
+            
+            // 如果检测到打电话且启用了声音提醒
+            if (result.phone_detected && alertSound.checked) {
+                playAlertSound('phone');
+            }
+        }
+        
+        detailsHTML += `<div class="result-item ${phoneWarning ? 'danger' : ''}">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-phone me-2"></i>打电话</span>
+                <span>${phoneText}</span>
+            </div>
+        </div>`;
+        
+        // 喝水检测
+        let drinkingText = '未检测';
+        let drinkingWarning = false;
+        
+        if (result.drinking_detected !== undefined) {
+            drinkingText = result.drinking_detected ? '是' : '否';
+            drinkingWarning = result.drinking_detected;
+        }
+        
+        detailsHTML += `<div class="result-item ${drinkingWarning ? 'warning' : ''}">
+            <div class="d-flex justify-content-between">
+                <span><i class="fas fa-coffee me-2"></i>喝水</span>
+                <span>${drinkingText}</span>
+            </div>
+        </div>`;
+        
+        detectionDetails.innerHTML = detailsHTML;
+        
+        // 如果有结果图像，显示在视频区域
+        if (result.image_data) {
+            const resultImage = new Image();
+            resultImage.src = result.image_data;
+            resultImage.onload = () => {
+                const context = canvasElement.getContext('2d');
+                context.drawImage(resultImage, 0, 0, canvasElement.width, canvasElement.height);
+            };
+        }
+    }
+    
+    // 播放警告音效
+    function playAlertSound(type = 'alert') {
+        if (!audioInitialized) {
+            console.error('音频未初始化');
+            return;
+        }
+        
+        try {
+            // 根据不同的警报类型播放不同的声音
+            let audio;
+            switch (type) {
+                case 'fatigue':
+                    audio = fatigueAlertAudio;
+                    break;
+                case 'smoking':
+                    audio = smokingAlertAudio;
+                    break;
+                case 'phone':
+                    audio = phoneAlertAudio;
+                    break;
+                default:
+                    audio = alertAudio;
+            }
+            
+            // 重置音频（可能正在播放中）
+            audio.pause();
+            audio.currentTime = 0;
+            
+            // 设置最新的音量值
+            const volume = {{ alert_volume|default:80 }} / 100;
+            audio.volume = volume;
+            
+            // 播放声音
+            audio.play().catch(err => {
+                console.error('播放声音失败:', err);
+            });
+            
+            console.log(`已播放${type}警报声音`);
+        } catch (error) {
+            console.error('无法播放警告音效:', error);
+        }
+    }
+    
+    // 页面关闭前停止检测
+    window.addEventListener('beforeunload', () => {
+        if (isDetecting) {
+            stopDetection();
+        }
+    });
+</script>
+{% endblock %} 
