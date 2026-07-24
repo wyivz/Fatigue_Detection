@@ -1,0 +1,9 @@
+# App deps (torch / torchvision / dlib installed separately by install.ps1)
+Django>=4.2,<5.0
+Pillow
+opencv-python==4.10.0.84
+ultralytics
+numpy
+scipy
+matplotlib
+tqdm
