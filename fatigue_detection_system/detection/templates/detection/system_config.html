@@ -1,0 +1,266 @@
+{% extends 'base.html' %}
+
+{% block title %}系统配置 - 疲劳驾驶检测系统{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="fas fa-cog me-2"></i>系统配置</h2>
+        <div>
+            <a href="{% url 'detection:dashboard' %}" class="btn btn-outline-primary">
+                <i class="fas fa-arrow-left me-1"></i>返回仪表盘
+            </a>
+        </div>
+    </div>
+    
+    <div class="row">
+        <div class="col-md-8 mx-auto">
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <h5 class="mb-0">检测参数配置</h5>
+                </div>
+                <div class="card-body">
+                    <form method="post">
+                        {% csrf_token %}
+                        
+                        <div class="mb-4">
+                            <h6 class="border-bottom pb-2">疲劳检测参数</h6>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">眼睛纵横比阈值</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="0.01" min="0.1" max="0.5" name="config_eye_ar_thresh" 
+                                           class="form-control" value="{{ configs.eye_ar_thresh|default:'0.25' }}">
+                                    <div class="form-text">EAR 低于该值视为闭眼，建议值：0.25</div>
+                                </div>
+                            </div>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">嘴巴纵横比阈值</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="0.01" min="0.3" max="1.0" name="config_mouth_ar_thresh" 
+                                           class="form-control" value="{{ configs.mouth_ar_thresh|default:'0.6' }}">
+                                    <div class="form-text">用于判断打哈欠的阈值，建议值：0.6</div>
+                                </div>
+                            </div>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">检测间隔（毫秒）</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="50" min="50" max="2000" name="config_detection_interval" 
+                                           class="form-control" value="{{ configs.detection_interval|default:'500' }}">
+                                    <div class="form-text">YOLO/落库周期。工业相机 EAR 另有独立采样；浏览器源建议 ≤150ms 以分辨眨眼</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mb-4">
+                            <h6 class="border-bottom pb-2">多帧疲劳 / PERCLOS</h6>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">眨眼上限（毫秒）</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="10" min="50" max="500" name="config_blink_max_ms"
+                                           class="form-control" value="{{ configs.blink_max_ms|default:'250' }}">
+                                    <div class="form-text">闭眼持续不超过该值视为正常眨眼（通常 100–250ms）</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">微睡下限（毫秒）</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="50" min="300" max="5000" name="config_microsleep_min_ms"
+                                           class="form-control" value="{{ configs.microsleep_min_ms|default:'500' }}">
+                                    <div class="form-text">单次闭眼超过该值判定为微睡/疲劳闭眼，建议 500ms</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">PERCLOS 窗口（秒）</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="5" min="10" max="300" name="config_perclos_window_sec"
+                                           class="form-control" value="{{ configs.perclos_window_sec|default:'60' }}">
+                                    <div class="form-text">统计闭眼占比的滑动时间窗，建议 60 秒</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">PERCLOS 警报阈值（%）</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="1" min="5" max="80" name="config_perclos_alert_pct"
+                                           class="form-control" value="{{ configs.perclos_alert_pct|default:'20' }}">
+                                    <div class="form-text">窗口内闭眼累计占比达到该值触发正式疲劳警报（常用 15–30%）</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">EAR 采样间隔（毫秒）</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="10" min="50" max="500" name="config_ear_sample_interval_ms"
+                                           class="form-control" value="{{ configs.ear_sample_interval_ms|default:'100' }}">
+                                    <div class="form-text">仅工业相机（MVS）生效：独立于 YOLO 周期的 EAR 采样，建议 100ms</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mb-4">
+                            <h6 class="border-bottom pb-2">黑白相机 / 行为检测</h6>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">黑白相机增强</label>
+                                <div class="col-md-8">
+                                    <div class="form-check form-switch">
+                                        <input type="hidden" name="config_mono_camera_mode" value="false">
+                                        <input class="form-check-input" type="checkbox" name="config_mono_camera_mode"
+                                               value="true" id="monoCameraMode"
+                                               {% if configs.mono_camera_mode != 'false' %}checked{% endif %}>
+                                        <label class="form-check-label" for="monoCameraMode">YOLO 前对灰度图做 CLAHE 增强</label>
+                                    </div>
+                                    <div class="form-text">工业黑白相机建议开启；真彩色摄像头可关闭</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">CLAHE clipLimit</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="0.1" min="0.5" max="8" name="config_mono_clahe_clip"
+                                           class="form-control" value="{{ configs.mono_clahe_clip|default:'2.0' }}">
+                                    <div class="form-text">对比度限制，越大增强越强，建议 1.5–3.0</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">CLAHE 网格大小</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="1" min="2" max="16" name="config_mono_clahe_tile"
+                                           class="form-control" value="{{ configs.mono_clahe_tile|default:'8' }}">
+                                    <div class="form-text">tileGridSize，建议 8</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">行为确认帧数</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="1" min="1" max="10" name="config_behavior_confirm_frames"
+                                           class="form-control" value="{{ configs.behavior_confirm_frames|default:'2' }}">
+                                    <div class="form-text">抽烟/手机/喝水需连续检出该帧数才告警，用于抑制闪烁误报</div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="mb-4">
+                            <h6 class="border-bottom pb-2">警报设置</h6>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">疲劳警报阈值</label>
+                                <div class="col-md-8">
+                                    <select name="config_fatigue_alert_level" class="form-select">
+                                        <option value="1" {% if configs.fatigue_alert_level == '1' %}selected{% endif %}>轻度疲劳</option>
+                                        <option value="2" {% if configs.fatigue_alert_level == '2' or not configs.fatigue_alert_level %}selected{% endif %}>中度疲劳</option>
+                                        <option value="3" {% if configs.fatigue_alert_level == '3' %}selected{% endif %}>较严重疲劳</option>
+                                        <option value="4" {% if configs.fatigue_alert_level == '4' %}selected{% endif %}>严重疲劳</option>
+                                    </select>
+                                    <div class="form-text">触发疲劳警报的最低等级（PERCLOS 正式警报约为 3 级）</div>
+                                </div>
+                            </div>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">警报音量</label>
+                                <div class="col-md-8">
+                                    <input type="range" class="form-range" min="0" max="100" step="10" name="config_alert_volume" 
+                                           value="{{ configs.alert_volume|default:'80' }}" id="alertVolumeSlider">
+                                    <div class="d-flex justify-content-between">
+                                        <span>静音</span>
+                                        <span id="volumeValue">{{ configs.alert_volume|default:'80' }}%</span>
+                                        <span>最大</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">启用语音提醒</label>
+                                <div class="col-md-8">
+                                    <div class="form-check form-switch">
+                                        <input type="hidden" name="config_enable_voice" value="false">
+                                        <input class="form-check-input" type="checkbox" name="config_enable_voice" 
+                                               value="true" id="enableVoice" {% if configs.enable_voice == 'true' %}checked{% endif %}>
+                                        <label class="form-check-label" for="enableVoice">语音播报检测结果</label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="mb-4">
+                            <h6 class="border-bottom pb-2">视频源默认偏好</h6>
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">默认源类型</label>
+                                <div class="col-md-8">
+                                    <select name="config_default_source_type" class="form-select">
+                                        <option value="mvs" {% if configs.default_source_type == 'mvs' or not configs.default_source_type %}selected{% endif %}>工业相机 (GigE / MVS)</option>
+                                        <option value="browser" {% if configs.default_source_type == 'browser' %}selected{% endif %}>系统摄像头</option>
+                                    </select>
+                                    <div class="form-text">实时页加载时的默认选项，可在页面临时更改</div>
+                                </div>
+                            </div>
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">默认工业相机序号</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="1" min="0" max="64" name="config_default_mvs_index"
+                                           class="form-control" value="{{ configs.default_mvs_index|default:'0' }}">
+                                    <div class="form-text">枚举列表中的 index，通常 0 为第一台</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mb-4">
+                            <h6 class="border-bottom pb-2">检测模型设置</h6>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">YOLO置信度阈值</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="0.05" min="0.1" max="0.95" name="config_yolo_conf_thresh" 
+                                           class="form-control" value="{{ configs.yolo_conf_thresh|default:'0.5' }}">
+                                    <div class="form-text">YOLO检测的置信度阈值，建议值：0.5</div>
+                                </div>
+                            </div>
+                            
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">运行设备</label>
+                                <div class="col-md-8">
+                                    <select name="config_device" class="form-select">
+                                        <option value="cpu" {% if configs.device == 'cpu' or not configs.device %}selected{% endif %}>CPU</option>
+                                        <option value="cuda:0" {% if configs.device == 'cuda:0' %}selected{% endif %}>GPU (CUDA)</option>
+                                    </select>
+                                    <div class="form-text">检测模型运行的硬件设备</div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="d-grid gap-2">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="fas fa-save me-1"></i>保存配置
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // 设置音量滑块值显示
+        const volumeSlider = document.getElementById('alertVolumeSlider');
+        const volumeValue = document.getElementById('volumeValue');
+        
+        if (volumeSlider && volumeValue) {
+            volumeSlider.addEventListener('input', function() {
+                volumeValue.textContent = this.value + '%';
+            });
+        }
+    });
+</script>
+{% endblock %}

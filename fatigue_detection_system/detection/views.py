@@ -347,14 +347,23 @@ def system_config(request):
         messages.error(request, '您没有访问此页面的权限')
         return redirect('detection:dashboard')
     
+    bool_keys = {'enable_voice', 'mono_camera_mode'}
+
     if request.method == 'POST':
-        # 更新配置
+        # 未勾选的 checkbox 不会出现在 POST 中，先写入 false
+        for key in bool_keys:
+            SystemConfig.objects.update_or_create(
+                config_key=key,
+                defaults={'config_value': 'false'},
+            )
         for key, value in request.POST.items():
             if key.startswith('config_'):
                 config_key = key[7:]  # 去除 'config_' 前缀
-                config, created = SystemConfig.objects.update_or_create(
+                if config_key in bool_keys:
+                    value = 'true' if str(value).lower() in ('1', 'true', 'on', 'yes') else 'false'
+                SystemConfig.objects.update_or_create(
                     config_key=config_key,
-                    defaults={'config_value': value}
+                    defaults={'config_value': value},
                 )
         
         messages.success(request, '系统配置已更新')
@@ -384,9 +393,16 @@ def start_detection(request):
         
         try:
             session = DetectionSession.objects.get(id=session_id, user=request.user)
+            configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+            from .utils.fatigue_tracker import behavior_tracker, fatigue_tracker
+
+            fatigue_tracker.reset(session.id)
+            behavior_tracker.reset(session.id)
+            fatigue_tracker.configure(session.id, configs)
+            behavior_tracker.configure(session.id, configs)
+
             if source_type == 'mvs':
                 from .utils.hik_mvs.grabber import mvs_grabber
-                configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
                 interval = int(configs.get('detection_interval', 500))
                 camera_ip = (request.POST.get('camera_ip') or '').strip() or None
                 device_index = request.POST.get('device_index')
@@ -429,12 +445,16 @@ def stop_detection(request):
             session = DetectionSession.objects.get(id=session_id, user=request.user)
             try:
                 from .utils.hik_mvs.grabber import mvs_grabber
+                from .utils.fatigue_tracker import behavior_tracker, fatigue_tracker
+
                 if mvs_grabber.running and mvs_grabber.status().get('session_id') == session.id:
                     mvs_grabber.stop(complete_session=True)
                 else:
                     session.end_time = timezone.now()
                     session.status = 'completed'
                     session.save(update_fields=['end_time', 'status'])
+                fatigue_tracker.reset(session.id)
+                behavior_tracker.reset(session.id)
             except Exception:  # noqa: BLE001
                 session.end_time = timezone.now()
                 session.status = 'completed'
@@ -640,24 +660,13 @@ def process_image(
             if faces_n <= 0 and results.get('face_detected') and face_bbox:
                 faces_n = 1
 
-            if update_ear_tracker:
-                snap = fatigue_tracker.update(
-                    session.id,
-                    ear=dlib_results.get('eye_aspect_ratio'),
-                    yawn_detected=bool(dlib_results.get('yawn_detected')),
-                    faces_detected=faces_n,
-                    landmarks=dlib_results.get('landmarks'),
-                )
-            else:
-                snap = fatigue_tracker.get_snapshot(session.id)
-                if dlib_results.get('yawn_detected') is not None:
-                    snap = fatigue_tracker.update(
-                        session.id,
-                        ear=dlib_results.get('eye_aspect_ratio'),
-                        yawn_detected=bool(dlib_results.get('yawn_detected')),
-                        faces_detected=faces_n,
-                        landmarks=dlib_results.get('landmarks'),
-                    )
+            snap = fatigue_tracker.update(
+                session.id,
+                ear=dlib_results.get('eye_aspect_ratio'),
+                yawn_detected=bool(dlib_results.get('yawn_detected')),
+                faces_detected=faces_n,
+                landmarks=dlib_results.get('landmarks'),
+            )
             draw_mar = dlib_results.get('mouth_aspect_ratio')
             draw_lm = dlib_results.get('landmarks') or snap.landmarks
         except Exception as e:
