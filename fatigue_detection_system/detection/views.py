@@ -158,6 +158,13 @@ def video_detection(request):
             source_file=video_file,
             status='in_progress'
         )
+
+        from .utils.fatigue_tracker import behavior_tracker, fatigue_tracker
+        configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+        fatigue_tracker.reset(session.id)
+        behavior_tracker.reset(session.id)
+        fatigue_tracker.configure(session.id, configs)
+        behavior_tracker.configure(session.id, configs)
         
         try:
             # 打开视频文件进行处理
@@ -202,6 +209,8 @@ def video_detection(request):
             session.status = 'completed'
             session.end_time = timezone.now()
             session.save()
+            fatigue_tracker.reset(session.id)
+            behavior_tracker.reset(session.id)
             
             messages.success(request, f'视频处理完成，共检测了{detection_count}帧。')
             
@@ -210,6 +219,11 @@ def video_detection(request):
             session.status = 'failed'
             session.end_time = timezone.now()
             session.save()
+            try:
+                fatigue_tracker.reset(session.id)
+                behavior_tracker.reset(session.id)
+            except Exception:  # noqa: BLE001
+                pass
             
             messages.error(request, f'视频处理失败: {str(e)}')
         
@@ -350,21 +364,23 @@ def system_config(request):
     bool_keys = {'enable_voice', 'mono_camera_mode'}
 
     if request.method == 'POST':
-        # 未勾选的 checkbox 不会出现在 POST 中，先写入 false
-        for key in bool_keys:
-            SystemConfig.objects.update_or_create(
-                config_key=key,
-                defaults={'config_value': 'false'},
-            )
-        for key, value in request.POST.items():
+        # 先收集 POST（同名 hidden+checkbox 取最后一个）
+        posted = {}
+        for key in request.POST.keys():
             if key.startswith('config_'):
-                config_key = key[7:]  # 去除 'config_' 前缀
-                if config_key in bool_keys:
-                    value = 'true' if str(value).lower() in ('1', 'true', 'on', 'yes') else 'false'
-                SystemConfig.objects.update_or_create(
-                    config_key=config_key,
-                    defaults={'config_value': value},
-                )
+                posted[key[7:]] = request.POST.get(key)
+
+        for key in bool_keys:
+            if key not in posted:
+                posted[key] = 'false'
+
+        for config_key, value in posted.items():
+            if config_key in bool_keys:
+                value = 'true' if str(value).lower() in ('1', 'true', 'on', 'yes') else 'false'
+            SystemConfig.objects.update_or_create(
+                config_key=config_key,
+                defaults={'config_value': value},
+            )
         
         messages.success(request, '系统配置已更新')
         return redirect('detection:system_config')
@@ -400,6 +416,13 @@ def start_detection(request):
             behavior_tracker.reset(session.id)
             fatigue_tracker.configure(session.id, configs)
             behavior_tracker.configure(session.id, configs)
+            try:
+                if yolo_detector is not None:
+                    yolo_detector.load_config()
+                if dlib_detector is not None:
+                    dlib_detector.load_config()
+            except Exception:  # noqa: BLE001
+                pass
 
             if source_type == 'mvs':
                 from .utils.hik_mvs.grabber import mvs_grabber

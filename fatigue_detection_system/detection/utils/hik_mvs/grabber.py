@@ -293,7 +293,7 @@ class MvsGrabber:
                     break
                 det_frame = self._resize_for_preview(frame)
                 result = process_image(
-                    det_frame, session, True, True, update_ear_tracker=True
+                    det_frame, session, True, True
                 )
                 meta = {
                     "face_detected": result.get("face_detected"),

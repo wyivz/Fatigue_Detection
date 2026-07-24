@@ -186,37 +186,29 @@ class FatigueTemporalTracker:
         return int(max(0.0, (now - state.closed_start) * 1000.0))
 
     def _compute_perclos(self, state: _SessionFatigueState, now: float, cfg: Dict[str, Any]) -> float:
-        """PERCLOS from sample intervals within the window (face-valid samples only)."""
+        """PERCLOS = closed time in window / full window duration (face-valid samples only for numerator)."""
+        window = float(cfg["perclos_window_sec"])
+        if window <= 1e-6:
+            return 0.0
+
         samples = list(state.samples)
-        if len(samples) < 2:
-            # Single ongoing closed segment
-            if state.closed_start is not None:
-                window = float(cfg["perclos_window_sec"])
-                closed = min(now - state.closed_start, window)
-                return max(0.0, min(100.0, (closed / window) * 100.0))
-            return 0.0
-
         closed_sec = 0.0
-        total_sec = 0.0
-        for i in range(1, len(samples)):
-            t0, closed0 = samples[i - 1]
-            t1, _ = samples[i]
-            dt = max(0.0, t1 - t0)
-            total_sec += dt
-            if closed0:
-                closed_sec += dt
 
-        # Extend last sample to now with current state
-        last_t, last_closed = samples[-1]
-        if now > last_t:
-            dt = now - last_t
-            total_sec += dt
-            if last_closed or state.closed_start is not None:
-                closed_sec += dt
+        if len(samples) >= 2:
+            for i in range(1, len(samples)):
+                t0, closed0 = samples[i - 1]
+                t1, _ = samples[i]
+                dt = max(0.0, t1 - t0)
+                if closed0:
+                    closed_sec += dt
+            last_t, last_closed = samples[-1]
+            if now > last_t and (last_closed or state.closed_start is not None):
+                closed_sec += now - last_t
+        elif state.closed_start is not None:
+            closed_sec = max(0.0, now - state.closed_start)
 
-        if total_sec <= 1e-6:
-            return 0.0
-        return max(0.0, min(100.0, (closed_sec / total_sec) * 100.0))
+        closed_sec = min(closed_sec, window)
+        return max(0.0, min(100.0, (closed_sec / window) * 100.0))
 
     def _snapshot(
         self, state: _SessionFatigueState, cfg: Dict[str, Any], now: float
