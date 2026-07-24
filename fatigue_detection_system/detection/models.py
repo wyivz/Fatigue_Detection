@@ -122,6 +122,8 @@ class DetectionResult(models.Model):
     # dlib检测结果
     eye_aspect_ratio = models.FloatField(null=True, blank=True, verbose_name="眼睛纵横比")
     yawn_detected = models.BooleanField(default=False, verbose_name="检测到打哈欠")
+    perclos = models.FloatField(null=True, blank=True, verbose_name="PERCLOS百分比")
+    eye_closed_ms = models.IntegerField(null=True, blank=True, verbose_name="当前闭眼时长毫秒")
     
     # 综合判断
     fatigue_level = models.IntegerField(default=0, verbose_name="疲劳等级")  # 0-4 疲劳程度
