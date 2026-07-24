@@ -99,6 +99,12 @@ class MvsGrabber:
                 )
             except (TypeError, ValueError):
                 self._persist_interval_sec = 2.0
+            try:
+                self._warmup_sec = max(0.0, float(configs.get("startup_warmup_sec", 5.0)))
+            except (TypeError, ValueError):
+                self._warmup_sec = 5.0
+            self._warmup_until = time.time() + self._warmup_sec
+            self._warmup_ui_cleared = False
             fatigue_tracker.reset(session_id)
             behavior_tracker.reset(session_id)
             fatigue_tracker.configure(session_id, configs)
@@ -119,6 +125,16 @@ class MvsGrabber:
                     break
             self._camera = cam
             self.running = True
+            # Warmup clock starts when streams are actually up
+            self._warmup_until = time.time() + float(self._warmup_sec or 5.0)
+            # Clear any fatigue accumulation from dark AE frames after streams settle
+            try:
+                fatigue_tracker.reset(session_id)
+                behavior_tracker.reset(session_id)
+                fatigue_tracker.configure(session_id, configs)
+                behavior_tracker.configure(session_id, configs)
+            except Exception:  # noqa: BLE001
+                pass
             self._grab_thread = threading.Thread(
                 target=self._grab_loop, name="mvs-grab", daemon=True
             )
@@ -173,12 +189,41 @@ class MvsGrabber:
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
+            now = time.time()
+            warming = bool(self.running and now < float(self._warmup_until or 0.0))
+            remain = max(0.0, float(self._warmup_until or 0.0) - now) if warming else 0.0
+            if self.running and (not warming) and (not self._warmup_ui_cleared):
+                self._warmup_ui_cleared = True
+                sid = self._session_id
+                if sid is not None:
+                    try:
+                        from detection.utils.fatigue_tracker import (
+                            behavior_tracker,
+                            fatigue_tracker,
+                        )
+
+                        fatigue_tracker.reset(sid)
+                        behavior_tracker.reset(sid)
+                        self._last_fatigue_level = 0
+                        self._last_yawn = False
+                        self._pending_fatigue_event = False
+                    except Exception:  # noqa: BLE001
+                        pass
+            meta = dict(self.latest_meta)
+            if warming:
+                meta = {
+                    "timing": meta.get("timing") or {},
+                    "scheduler": meta.get("scheduler"),
+                    "warming_up": True,
+                }
             return {
                 "running": self.running,
                 "session_id": self._session_id,
                 "error": self.error,
-                "meta": dict(self.latest_meta),
+                "meta": meta,
                 "has_frame": self.latest_jpeg is not None,
+                "warming_up": warming,
+                "warmup_remaining_sec": round(remain, 1),
             }
 
     def get_jpeg(self) -> Optional[bytes]:

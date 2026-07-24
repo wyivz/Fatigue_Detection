@@ -550,6 +550,35 @@
     
     // 检测状态
     let isDetecting = false;
+    let warmupUntilMs = 0;
+    const STARTUP_WARMUP_MS = 5000;
+
+    function isWarmingUp() {
+        return Date.now() < warmupUntilMs;
+    }
+
+    function showWarmupUi(remainSec) {
+        const sec = Math.max(0, Math.ceil(remainSec));
+        detectionAlert.innerHTML =
+            '<i class="fas fa-spinner fa-spin me-2"></i>加载中……系统预热 ' + sec + 's';
+        detectionAlert.className = 'alert alert-primary';
+        fatigueLevel.style.width = '0%';
+        fatigueLevel.textContent = '加载中';
+        fatigueLevel.style.backgroundColor = '#90CAF9';
+        detectionDetails.innerHTML =
+            '<div class="text-center text-muted py-4">' +
+            '<i class="fas fa-spinner fa-spin fa-2x mb-3"></i>' +
+            '<div>加载中……</div>' +
+            '<div class="small mt-2">模型与相机预热中，暂不显示检测数据</div>' +
+            '</div>';
+        cameraStatusText.textContent = '加载中';
+    }
+
+    function beginStartupWarmup() {
+        warmupUntilMs = Date.now() + STARTUP_WARMUP_MS;
+        showWarmupUi(STARTUP_WARMUP_MS / 1000);
+    }
+
     let detectionInterval = null;
     let stream = null;
     let isRequestInFlight = false;
@@ -675,6 +704,21 @@
                 const resp = await fetch("{% url 'detection:mvs_status' %}?session_id=" + sessionId);
                 const data = await resp.json();
                 if (data.status !== 'success') return;
+
+                // Startup warmup: show loading only, hide detection payload
+                if (data.warming_up || isWarmingUp()) {
+                    const remain = (data.warmup_remaining_sec != null)
+                        ? Number(data.warmup_remaining_sec)
+                        : Math.max(0, (warmupUntilMs - Date.now()) / 1000);
+                    showWarmupUi(remain);
+                    return;
+                }
+                if (cameraStatusText.textContent === '加载中') {
+                    cameraStatusText.textContent = '检测中';
+                    detectionAlert.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>检测中...';
+                    detectionAlert.className = 'alert alert-primary';
+                }
+
                 if (data.error) {
                     detectionAlert.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>' + data.error;
                     detectionAlert.className = 'alert alert-warning';
@@ -733,9 +777,7 @@
             setSourceControlsEnabled(false);
             cameraStatus.classList.remove('inactive');
             cameraStatus.classList.add('active');
-            cameraStatusText.textContent = '已启动';
-            detectionAlert.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>检测中...';
-            detectionAlert.className = 'alert alert-primary';
+            beginStartupWarmup();
             viewResultsLink.href = `/detection/results/${sessionId}/`;
             viewResultsLink.style.display = 'inline-block';
             isDetecting = true;
@@ -846,6 +888,7 @@
         
         isDetecting = false;
         isRequestInFlight = false;
+        warmupUntilMs = 0;
         startButton.disabled = false;
         stopButton.disabled = true;
         setSourceControlsEnabled(true);
@@ -866,6 +909,15 @@
     // 检测当前帧
     function detectFrame() {
         if (!isDetecting || isRequestInFlight) return;
+        if (isWarmingUp()) {
+            showWarmupUi((warmupUntilMs - Date.now()) / 1000);
+            return;
+        }
+        if (cameraStatusText.textContent === '加载中') {
+            cameraStatusText.textContent = '检测中';
+            detectionAlert.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>检测中...';
+            detectionAlert.className = 'alert alert-primary';
+        }
         if (!videoElement.videoWidth || !videoElement.videoHeight) {
             console.warn('视频尚未就绪，跳过本帧');
             return;
@@ -970,6 +1022,10 @@
     
     // 更新检测结果
     function updateDetectionResults(result) {
+        if (isWarmingUp()) {
+            showWarmupUi((warmupUntilMs - Date.now()) / 1000);
+            return;
+        }
         console.log('检测结果:', result);
 
         if (result.timing) {
