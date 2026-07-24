@@ -91,6 +91,7 @@ class MvsGrabber:
             self._last_fatigue_level = 0
             self._last_yawn = False
             self._event_save_cooldown_until = 0.0
+            self._pending_fatigue_event = False
             fatigue_tracker.reset(session_id)
             behavior_tracker.reset(session_id)
             fatigue_tracker.configure(session_id, configs)

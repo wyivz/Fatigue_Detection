@@ -293,8 +293,8 @@
                                 <label class="col-md-4 col-form-label">检测最大宽度</label>
                                 <div class="col-md-8">
                                     <input type="number" step="80" min="640" max="2560" name="config_yolo_detect_max_width"
-                                           class="form-control" value="{{ configs.yolo_detect_max_width|default:'1280' }}">
-                                    <div class="form-text">工业相机送入 YOLO 前的缩放上限（预览仍为 960）</div>
+                                           class="form-control" value="{{ configs.yolo_detect_max_width|default:'960' }}">
+                                    <div class="form-text">工业相机送入 YOLO 前的缩放上限；过大易卡顿，建议 960</div>
                                 </div>
                             </div>
 
