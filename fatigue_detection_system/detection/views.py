@@ -475,6 +475,14 @@ def reset_fatigue(request):
 
     configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
     snap = fatigue_tracker.clear_history(session.id, configs)
+    try:
+        from .utils.hik_mvs.grabber import mvs_grabber
+        with mvs_grabber._lock:
+            if mvs_grabber._session_id == session.id:
+                mvs_grabber._last_fatigue_level = 0
+                mvs_grabber._last_yawn = False
+    except Exception:  # noqa: BLE001
+        pass
     return JsonResponse({
         'status': 'success',
         'session_id': session.id,
