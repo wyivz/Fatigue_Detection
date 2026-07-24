@@ -373,6 +373,8 @@
     ];
 
     let clientTimingAvg = {};
+    let lastFatigueAlertAt = 0;
+    const FATIGUE_ALERT_COOLDOWN_MS = 15000;
 
     function suggestIntervalMs(avgMs) {
         if (avgMs == null || isNaN(avgMs) || avgMs <= 0) return '—';

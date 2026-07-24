@@ -103,7 +103,16 @@
                                 <div class="col-md-8">
                                     <input type="number" step="1" min="5" max="80" name="config_perclos_alert_pct"
                                            class="form-control" value="{{ configs.perclos_alert_pct|default:'20' }}">
-                                    <div class="form-text">窗口内闭眼累计占比达到该值触发正式疲劳警报（常用 15–30%）</div>
+                                    <div class="form-text">窗口内「非眨眼」闭眼累计占比达到该值触发正式疲劳警报（常用 15–30%）；正常眨眼不计入 PERCLOS</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">EAR 滞回带宽</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="0.01" min="0" max="0.1" name="config_ear_hysteresis"
+                                           class="form-control" value="{{ configs.ear_hysteresis|default:'0.03' }}">
+                                    <div class="form-text">闭眼判定用阈值，睁眼需高于「阈值+带宽」才解除，抑制临界抖动误报，建议 0.02–0.04</div>
                                 </div>
                             </div>
                         </div>
