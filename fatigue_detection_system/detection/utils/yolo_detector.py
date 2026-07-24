@@ -104,14 +104,20 @@ class YOLODetector:
                 print(f"无法在设备 {self.device} 上运行模型: {e}")
 
     def detect(self, image):
-        """Run inference with explicit conf / iou / imgsz."""
-        results = self.model(
-            image,
-            conf=float(self.conf_thresh),
-            iou=float(self.iou_thresh),
-            imgsz=int(self.imgsz),
-            verbose=False,
-        )
+        """Run inference with explicit conf / iou / imgsz (CPU-friendly defaults)."""
+        predict_kwargs = {
+            "conf": float(self.conf_thresh),
+            "iou": float(self.iou_thresh),
+            "imgsz": int(self.imgsz),
+            "verbose": False,
+            "max_det": 20,
+        }
+        # Explicit device every call; half only on CUDA
+        if self.device:
+            predict_kwargs["device"] = self.device
+        if isinstance(self.device, str) and self.device.startswith("cuda"):
+            predict_kwargs["half"] = True
+        results = self.model(image, **predict_kwargs)
         return results[0]
 
     def _class_conf_floor(self, cls_id: int) -> float:

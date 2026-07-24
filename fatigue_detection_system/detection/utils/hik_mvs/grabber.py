@@ -92,6 +92,13 @@ class MvsGrabber:
             self._last_yawn = False
             self._event_save_cooldown_until = 0.0
             self._pending_fatigue_event = False
+            self._last_persist_at = 0.0
+            try:
+                self._persist_interval_sec = max(
+                    0.5, float(configs.get("yolo_persist_interval_sec", 2.0))
+                )
+            except (TypeError, ValueError):
+                self._persist_interval_sec = 2.0
             fatigue_tracker.reset(session_id)
             behavior_tracker.reset(session_id)
             fatigue_tracker.configure(session_id, configs)

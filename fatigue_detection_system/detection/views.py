@@ -690,6 +690,61 @@ def save_fatigue_event(image, session, snap, mouth_aspect_ratio=None, face_detec
     return row
 
 
+def persist_detection_snapshot(image, session, results):
+    """
+    Draw + save DetectionResult from an already-computed process_image(persist=False) result.
+    Avoids running YOLO twice when the MVS loop decides to persist.
+    """
+    from .utils.fatigue_tracker import fatigue_tracker
+
+    processed = {
+        'detections': results.get('detections') or [],
+    }
+    img = image
+    if yolo_detector is not None and processed['detections']:
+        img = yolo_detector.draw_results(image, processed)
+
+    snap = fatigue_tracker.get_snapshot(session.id)
+    if dlib_detector is not None:
+        draw_payload = {
+            'landmarks': snap.landmarks,
+            'eye_aspect_ratio': results.get('eye_aspect_ratio', snap.eye_aspect_ratio),
+            'mouth_aspect_ratio': results.get('mouth_aspect_ratio'),
+            'yawn_detected': results.get('yawn_detected', snap.yawn_detected),
+            'fatigue_level': results.get('fatigue_level', snap.fatigue_level),
+            'perclos': results.get('perclos', snap.perclos),
+            'eye_closed_ms': results.get('eye_closed_ms', snap.eye_closed_ms),
+        }
+        try:
+            img = dlib_detector.draw_fatigue_results(img, draw_payload)
+        except Exception as e:  # noqa: BLE001
+            _safe_log(f'persist draw failed: {e}')
+
+    row = DetectionResult(
+        session=session,
+        face_detected=bool(results.get('face_detected')),
+        smoking_detected=bool(results.get('smoking_detected')),
+        phone_detected=bool(results.get('phone_detected')),
+        drinking_detected=bool(results.get('drinking_detected')),
+        eye_aspect_ratio=results.get('eye_aspect_ratio'),
+        yawn_detected=bool(results.get('yawn_detected')),
+        fatigue_level=int(results.get('fatigue_level') or 0),
+        perclos=results.get('perclos'),
+        eye_closed_ms=results.get('eye_closed_ms'),
+    )
+    result_filename = f"result_{session.id}_{timezone.now().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}.jpg"
+    try:
+        ok, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if ok:
+            row.result_image.save(result_filename, ContentFile(buffer.tobytes()), save=False)
+    except Exception as e:  # noqa: BLE001
+        _safe_log(f'persist image failed: {e}')
+    row.save()
+    results['detection_id'] = row.id
+    results['result_image_url'] = row.result_image.url if row.result_image else None
+    return results
+
+
 def process_image(
     image,
     session,
