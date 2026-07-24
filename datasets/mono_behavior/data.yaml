@@ -1,0 +1,10 @@
+# Mono industrial behavior fine-tune dataset (YOLO format)
+path: .
+train: images/train
+val: images/val
+
+names:
+  0: face
+  1: smoke
+  2: phone
+  3: water
