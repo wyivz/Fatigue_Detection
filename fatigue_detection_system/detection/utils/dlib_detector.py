@@ -142,22 +142,20 @@ class DlibDetector:
         y2,
         img_w,
         img_h,
-        ratio=0.12,
-        bottom_extra=-0.02,
-        top_extra=0.18,
+        ratio=0.10,
+        bottom_extra=0.06,
+        top_extra=0.06,
     ):
         """
         Build a dlib-friendly face rect from a YOLO box.
 
-        Prefer more top pad (forehead) and little/no bottom pad. Extra bottom
-        padding pulls neck into the rect and the 68-point model then maps
-        mouth landmarks onto the chin.
+        Keep pad roughly balanced. Too much top pad → eyes land on brows;
+        too much bottom pad → mouth lands on chin.
         """
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
         pad_x = int(bw * ratio)
         pad_top = int(bh * max(0.0, ratio + float(top_extra)))
-        # bottom_extra may be negative → crop a bit of neck under YOLO chin
         bot = ratio + float(bottom_extra)
         if bot >= 0:
             pad_bot = int(bh * bot)
@@ -188,7 +186,7 @@ class DlibDetector:
     def _hog_rect_near_yolo(self, gray, face_bbox, image_shape):
         """
         If HOG finds a face overlapping YOLO, prefer that rect — it matches
-        what the 68-point model was trained on (less mouth-on-chin).
+        what the 68-point model was trained on.
         Runs on a small ROI for speed. Caller holds self._lock when needed.
         """
         try:
@@ -197,7 +195,7 @@ class DlibDetector:
             return None
         h, w = image_shape[:2]
         sx1, sy1, sx2, sy2 = self._expand_bbox(
-            x1, y1, x2, y2, w, h, ratio=0.2, bottom_extra=0.05, top_extra=0.25
+            x1, y1, x2, y2, w, h, ratio=0.18, bottom_extra=0.08, top_extra=0.10
         )
         if sx2 <= sx1 + 8 or sy2 <= sy1 + 8:
             return None
@@ -233,27 +231,18 @@ class DlibDetector:
                 return False
             nose_y = float(pts[30, 1])
             chin_y = float(pts[8, 1])
-            # Outer lip vertical center
             mouth_y = float(
-                (
-                    pts[51, 1]
-                    + pts[57, 1]
-                    + pts[48, 1]
-                    + pts[54, 1]
-                )
-                / 4.0
+                (pts[51, 1] + pts[57, 1] + pts[48, 1] + pts[54, 1]) / 4.0
             )
             face_h = chin_y - float(pts[27, 1])
             if face_h < 8.0:
                 return False
             mouth_to_chin = chin_y - mouth_y
             nose_to_mouth = mouth_y - nose_y
-            # Healthy: mouth clearly above chin and below nose
             if mouth_to_chin < 0.10 * face_h:
                 return True
             if nose_to_mouth < 0.06 * face_h:
                 return True
-            # Mouth below geometric mid of nose→chin by too little gap to chin
             span = chin_y - nose_y
             if span > 1.0 and (chin_y - mouth_y) / span < 0.22:
                 return True
@@ -261,17 +250,73 @@ class DlibDetector:
         except Exception:  # noqa: BLE001
             return False
 
-    def _rect_crop_bottom(self, rect, image_shape, crop_frac=0.16):
-        """Raise the bottom edge of a rect (drop neck) for a mouth retry."""
+    @staticmethod
+    def _eyes_collapsed_to_brows(landmarks) -> bool:
+        """True when eye contours sit on/near the eyebrows (too much forehead pad)."""
+        try:
+            pts = np.asarray(landmarks, dtype=np.float64)
+            if pts.shape[0] < 68:
+                return False
+            brow_y = float(np.mean(pts[17:27, 1]))
+            eye_y = float(
+                (
+                    np.mean(pts[36:42, 1])
+                    + np.mean(pts[42:48, 1])
+                )
+                / 2.0
+            )
+            nose_y = float(pts[30, 1])
+            chin_y = float(pts[8, 1])
+            face_h = chin_y - float(pts[27, 1])
+            if face_h < 8.0:
+                return False
+            # Healthy: brow above eye, with a clear gap; eye above nose
+            eye_to_brow = eye_y - brow_y
+            if eye_to_brow < 0.045 * face_h:
+                return True
+            if eye_y >= nose_y - 0.02 * face_h:
+                return True
+            # Eyes too high in face (near top of predicted jaw span)
+            if (eye_y - float(pts[27, 1])) < 0.02 * face_h:
+                return True
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _landmark_quality(landmarks) -> int:
+        """Higher is better. Penalize mouth-on-chin and eyes-on-brows."""
+        score = 2
+        if DlibDetector._mouth_collapsed_to_chin(landmarks):
+            score -= 2
+        if DlibDetector._eyes_collapsed_to_brows(landmarks):
+            score -= 2
+        return score
+
+    def _rect_crop_bottom(self, rect, image_shape, crop_frac=0.14):
+        """Raise the bottom edge (drop neck). Do NOT add forehead — that shifts eyes up."""
         h, w = image_shape[:2]
         x1, y1 = int(rect.left()), int(rect.top())
         x2, y2 = int(rect.right()), int(rect.bottom())
         bh = max(1, y2 - y1)
         y2 = max(y1 + 1, y2 - int(bh * float(crop_frac)))
-        # Give a bit more forehead room on retry
-        y1 = max(0, y1 - int(bh * 0.08))
         x1 = max(0, x1)
         x2 = min(w - 1, x2)
+        y2 = min(h - 1, y2)
+        if x2 <= x1 or y2 <= y1:
+            return rect
+        return dlib.rectangle(x1, y1, x2, y2)
+
+    def _rect_crop_top(self, rect, image_shape, crop_frac=0.12):
+        """Lower the top edge (drop excess forehead) so eyes leave the brows."""
+        h, w = image_shape[:2]
+        x1, y1 = int(rect.left()), int(rect.top())
+        x2, y2 = int(rect.right()), int(rect.bottom())
+        bh = max(1, y2 - y1)
+        y1 = min(y2 - 1, y1 + int(bh * float(crop_frac)))
+        x1 = max(0, x1)
+        x2 = min(w - 1, x2)
+        y1 = max(0, y1)
         y2 = min(h - 1, y2)
         if x2 <= x1 or y2 <= y1:
             return rect
@@ -388,38 +433,56 @@ class DlibDetector:
     def _predict_one(self, gray, face_bbox, image_shape, refine_rect: bool = False):
         """Run predictor for one bbox; returns metrics dict or None.
 
-        refine_rect=True: HOG snap + extra mouth retries (detect overlay).
-        refine_rect=False: top-heavy expand only + at most one mouth retry (EAR).
+        Uses a balanced YOLO expand by default, then targeted retries:
+        - mouth-on-chin → crop bottom
+        - eyes-on-brows → crop top
+        refine_rect also tries HOG and picks the best geometry score.
         """
         if self.predictor is None:
             return None
 
-        rect = None
+        candidates = []
+
+        def _try(rect):
+            if rect is None:
+                return
+            shape = self.predictor(gray, rect)
+            lm = self._shape_to_landmarks(shape)
+            candidates.append((self._landmark_quality(lm), lm))
+
+        base = self._bbox_to_rect(face_bbox, image_shape)
+        _try(base)
+
         if refine_rect:
-            rect = self._hog_rect_near_yolo(gray, face_bbox, image_shape)
-        if rect is None:
-            rect = self._bbox_to_rect(face_bbox, image_shape)
-        if rect is None:
+            hog = self._hog_rect_near_yolo(gray, face_bbox, image_shape)
+            if hog is not None:
+                _try(hog)
+
+        # Start from best so far for targeted fixes
+        if not candidates:
             return None
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        best_score, best_lm = candidates[0]
+        best_rect = base
 
-        shape = self.predictor(gray, rect)
-        landmarks = self._shape_to_landmarks(shape)
+        if best_score < 2 and base is not None:
+            # Mouth too low → drop neck
+            if self._mouth_collapsed_to_chin(best_lm):
+                r = self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.14)
+                _try(r)
+                if refine_rect:
+                    _try(self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.22))
+            # Eyes too high → drop forehead
+            if self._eyes_collapsed_to_brows(best_lm):
+                r = self._rect_crop_top(best_rect, image_shape, crop_frac=0.12)
+                _try(r)
+                if refine_rect:
+                    _try(self._rect_crop_top(best_rect, image_shape, crop_frac=0.20))
 
-        # If mouth collapsed onto chin, crop neck and retry
-        if self._mouth_collapsed_to_chin(landmarks):
-            rect2 = self._rect_crop_bottom(rect, image_shape, crop_frac=0.18)
-            shape2 = self.predictor(gray, rect2)
-            landmarks2 = self._shape_to_landmarks(shape2)
-            if not self._mouth_collapsed_to_chin(landmarks2):
-                landmarks = landmarks2
-            elif refine_rect:
-                rect3 = self._rect_crop_bottom(rect, image_shape, crop_frac=0.28)
-                shape3 = self.predictor(gray, rect3)
-                landmarks3 = self._shape_to_landmarks(shape3)
-                if not self._mouth_collapsed_to_chin(landmarks3):
-                    landmarks = landmarks3
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            best_score, best_lm = candidates[0]
 
-        metrics = self._metrics_from_landmarks(landmarks)
+        metrics = self._metrics_from_landmarks(best_lm)
         metrics["bbox"] = [int(v) for v in face_bbox]
         return metrics
 
