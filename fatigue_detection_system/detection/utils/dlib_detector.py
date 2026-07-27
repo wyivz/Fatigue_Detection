@@ -159,7 +159,7 @@ class DlibDetector:
         if x2 <= x1 or y2 <= y1:
             return None
         h, w = image_shape[:2]
-        x1, y1, x2, y2 = self._expand_bbox(x1, y1, x2, y2, w, h, ratio=0.08)
+        x1, y1, x2, y2 = self._expand_bbox(x1, y1, x2, y2, w, h, ratio=0.18)
         return dlib.rectangle(x1, y1, x2, y2)
 
     def detect_faces(self, image):

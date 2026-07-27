@@ -49,8 +49,8 @@ class MvsGrabber:
         # Primary-face hold + EMA (full-frame coords)
         self._face_ema_bbox: Optional[List[float]] = None
         self._face_hold_until: float = 0.0
-        self._face_miss_hold_sec: float = 1.5
-        self._face_ema_alpha: float = 0.35  # higher = follow detections faster
+        self._face_miss_hold_sec: float = 1.2
+        self._face_ema_alpha: float = 0.5  # follow YOLO updates more tightly
         self._frame_seq = 0
         self._detect_busy = False
         self._timing_avg: Dict[str, float] = {}
@@ -442,6 +442,40 @@ class MvsGrabber:
             return None
         return [int(round(v)) for v in box]
 
+    @staticmethod
+    def _landmarks_to_bbox(landmarks, pad_ratio: float = 0.12) -> Optional[List[int]]:
+        """Axis-aligned box from 68 landmarks (same coordinate space as points)."""
+        try:
+            pts = np.asarray(landmarks, dtype=np.float64)
+            if pts.ndim != 2 or pts.shape[0] < 5 or pts.shape[1] < 2:
+                return None
+            x1 = float(np.min(pts[:, 0]))
+            y1 = float(np.min(pts[:, 1]))
+            x2 = float(np.max(pts[:, 0]))
+            y2 = float(np.max(pts[:, 1]))
+        except Exception:  # noqa: BLE001
+            return None
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        pad_x = bw * float(pad_ratio)
+        pad_y = bh * float(pad_ratio)
+        return [
+            int(round(x1 - pad_x)),
+            int(round(y1 - pad_y)),
+            int(round(x2 + pad_x)),
+            int(round(y2 + pad_y)),
+        ]
+
+    def _clip_bbox(self, bbox: List[int], fw: int, fh: int) -> List[int]:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(fw - 1, x1))
+        y1 = max(0, min(fh - 1, y1))
+        x2 = max(0, min(fw - 1, x2))
+        y2 = max(0, min(fh - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            return [0, 0, max(1, fw - 1), max(1, fh - 1)]
+        return [x1, y1, x2, y2]
+
     def _update_tracked_faces(
         self,
         primary_full: Optional[List[int]],
@@ -459,14 +493,12 @@ class MvsGrabber:
             self._face_hold_until = now + float(self._face_miss_hold_sec)
             smoothed = self._bbox_i(self._face_ema_bbox)
             self._latest_face_bbox = smoothed
-            # Keep primary first; drop near-duplicates of primary from others
             others = []
             for b in all_full:
                 if smoothed is None:
                     others.append(b)
                     continue
                 try:
-                    # crude IoU-ish: skip boxes that heavily overlap primary
                     ix1 = max(smoothed[0], b[0])
                     iy1 = max(smoothed[1], b[1])
                     ix2 = min(smoothed[2], b[2])
@@ -480,7 +512,6 @@ class MvsGrabber:
             self._latest_face_bboxes = ([smoothed] if smoothed else []) + others[:6]
             return
 
-        # Miss: hold smoothed primary for a short window
         if self._face_ema_bbox is not None and now <= float(self._face_hold_until or 0.0):
             held = self._bbox_i(self._face_ema_bbox)
             self._latest_face_bbox = held
@@ -492,13 +523,34 @@ class MvsGrabber:
         self._latest_face_bbox = None
         self._latest_face_bboxes = []
 
-    def _annotate_preview(self, preview: np.ndarray, full_wh: Tuple[int, int]) -> np.ndarray:
-        """Draw primary face box + 68 landmarks onto preview (full-frame coords)."""
+    def _refine_primary_from_landmarks(
+        self, landmarks, fw: int, fh: int, alpha: float = 0.55
+    ) -> None:
+        """High-rate face-box update from landmarks so the box tracks between YOLO frames."""
+        box = self._landmarks_to_bbox(landmarks)
+        if box is None:
+            return
+        box = self._clip_bbox(box, fw, fh)
+        with self._lock:
+            self._face_ema_bbox = self._ema_bbox(self._face_ema_bbox, box, alpha)
+            self._face_hold_until = time.time() + float(self._face_miss_hold_sec)
+            smoothed = self._bbox_i(self._face_ema_bbox)
+            self._latest_face_bbox = smoothed
+            if smoothed is not None:
+                self._latest_face_bboxes = [smoothed]
+
+    def _annotate_full_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Draw primary face + landmarks directly on a full-resolution frame copy.
+        Avoids preview-scale mismatch (annotate-then-resize is the safe path).
+        """
         try:
             from detection.views import dlib_detector
         except Exception:  # noqa: BLE001
             dlib_detector = None
 
+        vis = frame
+        fh, fw = vis.shape[:2]
         with self._lock:
             primary = (
                 None
@@ -509,19 +561,11 @@ class MvsGrabber:
             lm_size = self._latest_landmarks_size
             lm_faces = list(self._latest_landmark_faces or [])
 
-        ph, pw = preview.shape[:2]
-        fw, fh = int(full_wh[0]), int(full_wh[1])
-        if fw <= 0 or fh <= 0:
-            return preview
-
-        def _map_xy(x: float, y: float) -> Tuple[int, int]:
-            return int(round(x * pw / float(fw))), int(round(y * ph / float(fh)))
-
-        # Primary face only — avoid side false-positives flashing
         if primary is not None:
             try:
                 x1, y1, x2, y2 = [int(v) for v in primary]
-                cv2.rectangle(preview, _map_xy(x1, y1), _map_xy(x2, y2), (0, 220, 0), 2)
+                x1, y1, x2, y2 = self._clip_bbox([x1, y1, x2, y2], fw, fh)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 220, 0), 2)
             except (TypeError, ValueError):
                 pass
 
@@ -533,27 +577,27 @@ class MvsGrabber:
                     break
             if primary_ent is None and lm_faces:
                 primary_ent = lm_faces[0]
+            pts = None
+            src_size = lm_size
             if primary_ent is not None and primary_ent.get("landmarks") is not None:
-                dlib_detector.draw_landmarks(
-                    preview,
-                    primary_ent["landmarks"],
-                    landmarks_size=(fw, fh),
-                    color=(0, 255, 0),
-                )
+                pts = primary_ent["landmarks"]
             elif lm is not None:
-                src = lm_size if lm_size is not None else (fw, fh)
+                pts = lm
+            if pts is not None:
+                # pts are stored in full-frame coords; size must match full frame
+                src = src_size if src_size is not None else (fw, fh)
                 dlib_detector.draw_landmarks(
-                    preview, lm, landmarks_size=src, color=(0, 255, 0)
+                    vis, pts, landmarks_size=src, color=(0, 255, 0)
                 )
-        return preview
+        return vis
 
     def _encode_preview_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
-        fh, fw = frame.shape[:2]
-        preview = self._resize_for_preview(frame)
+        # Annotate at full resolution, then downscale — keeps box/points locked to the face
         try:
-            preview = self._annotate_preview(preview, (fw, fh))
+            annotated = self._annotate_full_frame(frame.copy())
         except Exception:  # noqa: BLE001
-            pass
+            annotated = frame
+        preview = self._resize_for_preview(annotated)
         ok, buf = cv2.imencode(
             ".jpg",
             preview,
@@ -731,7 +775,7 @@ class MvsGrabber:
         while not self._stop.is_set():
             loop_start = time.perf_counter()
             with self._lock:
-                frame = None if self._latest_bgr is None else self._latest_bgr
+                frame = None if self._latest_bgr is None else self._latest_bgr.copy()
                 seq = self._frame_seq
                 session_id = self._session_id
                 ear_ms = self._ear_interval_ms
@@ -778,8 +822,10 @@ class MvsGrabber:
 
                 if dlib_detector is not None:
                     with compute_scheduler.ear_context():
-                        # Must match YOLO / persist frame size so landmarks overlay correctly.
-                        sample = self._resize_for_detect(frame)
+                        # EAR sample: keep closer to full-res so landmarks match the preview.
+                        # (YOLO still runs on narrower detect frames for speed.)
+                        ear_max = max(int(self._detect_max_width or 960), 1280)
+                        sample = self._resize_max_width(frame, ear_max)
                         try:
                             from detection.utils.mono_preprocess import (
                                 enhance_for_mono,
@@ -816,7 +862,6 @@ class MvsGrabber:
 
                         t_ear = time.perf_counter()
                         if not scaled_boxes:
-                            # No YOLO face: do not HOG-fallback; clear fatigue sample
                             dlib_results = {
                                 "faces_detected": 0,
                                 "eye_aspect_ratio": None,
@@ -890,6 +935,18 @@ class MvsGrabber:
                                             pass
                                     remapped.append(e)
                                 face_entries = remapped
+
+                        # High-rate tracking: refine primary box from landmarks every EAR tick
+                        if lm is not None and not in_warmup:
+                            try:
+                                self._refine_primary_from_landmarks(lm, fw, fh, alpha=0.55)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        elif not in_warmup and lm is None:
+                            with self._lock:
+                                self._latest_landmarks = None
+                                self._latest_landmarks_size = None
+                                self._latest_landmark_faces = []
 
                         # Tracker / alerts: primary face only
                         snap = fatigue_tracker.update(
