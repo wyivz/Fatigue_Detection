@@ -42,16 +42,23 @@ class MvsGrabber:
         self._latest_face_bbox: Optional[List[int]] = None
         self._latest_face_bboxes: List[List[int]] = []
         self._latest_faces_meta: List[Dict[str, Any]] = []
-        # Landmarks always stored in full-frame coordinates for correct overlay
+        # EAR-only landmark cache (never used for preview drawing)
         self._latest_landmarks = None
         self._latest_landmarks_size: Optional[Tuple[int, int]] = None
         self._latest_landmark_faces: List[Dict[str, Any]] = []
-        # Primary-face hold + EMA in DETECT-frame coordinates (same space as YOLO/dlib)
+        # Face box for EAR (detect-frame coords); EMA is for EAR stability only.
         self._face_ema_bbox: Optional[List[float]] = None
         self._face_hold_until: float = 0.0
         self._face_miss_hold_sec: float = 0.8
         self._face_ema_alpha: float = 0.65
-        self._overlay_size: Optional[Tuple[int, int]] = None  # (w,h) of detect canvas
+        # Rigid overlay from last detect (box+landmarks from SAME frame). Grab
+        # composites this onto every new frame → smooth preview, no relative drift.
+        self._overlay_bbox: Optional[List[int]] = None
+        self._overlay_landmarks = None
+        self._overlay_detections: List[Dict[str, Any]] = []
+        self._overlay_wh: Optional[Tuple[int, int]] = None
+        self._overlay_at: float = 0.0
+        self._overlay_ttl_sec: float = 1.2
         self._frame_seq = 0
         self._detect_busy = False
         self._timing_avg: Dict[str, float] = {}
@@ -106,7 +113,11 @@ class MvsGrabber:
             self._latest_landmark_faces = []
             self._face_ema_bbox = None
             self._face_hold_until = 0.0
-            self._overlay_size = None
+            self._overlay_bbox = None
+            self._overlay_landmarks = None
+            self._overlay_detections = []
+            self._overlay_wh = None
+            self._overlay_at = 0.0
             self._frame_seq = 0
             self._timing_avg = {}
             self._session_id = session_id
@@ -239,7 +250,11 @@ class MvsGrabber:
             self._latest_landmark_faces = []
             self._face_ema_bbox = None
             self._face_hold_until = 0.0
-            self._overlay_size = None
+            self._overlay_bbox = None
+            self._overlay_landmarks = None
+            self._overlay_detections = []
+            self._overlay_wh = None
+            self._overlay_at = 0.0
             session_id = self._session_id
             self._session_id = None
         if session_id is not None:
@@ -462,11 +477,11 @@ class MvsGrabber:
         det_wh: Tuple[int, int],
     ) -> None:
         """
-        EMA-smooth primary face in DETECT coordinates (YOLO space).
+        EMA-smooth primary face in DETECT coordinates for EAR sampling.
+        Preview overlay does NOT use these boxes.
         Must be called with self._lock held.
         """
         now = time.time()
-        self._overlay_size = (int(det_wh[0]), int(det_wh[1]))
         if primary_det is not None:
             self._face_ema_bbox = self._ema_bbox(
                 self._face_ema_bbox, primary_det, self._face_ema_alpha
@@ -488,11 +503,159 @@ class MvsGrabber:
         self._latest_face_bbox = None
         self._latest_face_bboxes = []
 
-    def _draw_overlay_on_detect_canvas(self, canvas: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _bbox_from_landmarks(landmarks, pad: float = 0.08) -> Optional[List[int]]:
+        """Display box locked to landmark extents so box/points cannot diverge."""
+        try:
+            pts = np.asarray(landmarks, dtype=np.float64)
+            if pts.ndim != 2 or pts.shape[0] < 5 or pts.shape[1] < 2:
+                return None
+            x1 = float(np.min(pts[:, 0]))
+            y1 = float(np.min(pts[:, 1]))
+            x2 = float(np.max(pts[:, 0]))
+            y2 = float(np.max(pts[:, 1]))
+            bw = max(1.0, x2 - x1)
+            bh = max(1.0, y2 - y1)
+            x1 -= bw * pad
+            y1 -= bh * pad
+            x2 += bw * pad
+            y2 += bh * pad
+            return [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _bbox_iou(a: Optional[List[int]], b: Optional[List[int]]) -> float:
+        if not a or not b or len(a) != 4 or len(b) != 4:
+            return 0.0
+        try:
+            ax1, ay1, ax2, ay2 = [int(v) for v in a]
+            bx1, by1, bx2, by2 = [int(v) for v in b]
+        except (TypeError, ValueError):
+            return 0.0
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = float(iw * ih)
+        if inter <= 0:
+            return 0.0
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = float(area_a + area_b - inter)
+        if union <= 1e-6:
+            return 0.0
+        return inter / union
+
+    def _refresh_face_overlay_from_ear(
+        self,
+        landmarks,
+        sample_wh: Tuple[int, int],
+        min_iou: float = 0.12,
+    ) -> bool:
         """
-        Draw face box + landmarks in DETECT space (1:1 with YOLO/dlib).
-        No coordinate remapping — this is what stops the overlay from floating.
+        Update face box + landmarks from EAR (high rate). Keeps YOLO behavior
+        detections untouched. Returns True if overlay was updated.
         """
+        if landmarks is None or sample_wh is None:
+            return False
+        try:
+            sw, sh = int(sample_wh[0]), int(sample_wh[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if sw <= 0 or sh <= 0:
+            return False
+
+        lm_box = self._bbox_from_landmarks(landmarks)
+        if lm_box is None:
+            return False
+        lm_box = self._clip_bbox(lm_box, sw, sh)
+        lm_copy = np.asarray(landmarks).copy()
+
+        with self._lock:
+            owh = self._overlay_wh
+            # Size must match existing overlay canvas (avoid cross-resolution float)
+            if owh is not None and (int(owh[0]) != sw or int(owh[1]) != sh):
+                return False
+            prev = self._overlay_bbox
+            if prev is not None and float(min_iou) > 0:
+                if self._bbox_iou(prev, lm_box) < float(min_iou):
+                    # Likely jump-face / bad predict — wait for next YOLO lock
+                    return False
+            self._overlay_bbox = lm_box
+            self._overlay_landmarks = lm_copy
+            if owh is None:
+                self._overlay_wh = (sw, sh)
+            self._overlay_at = time.time()
+            self._latest_landmarks = lm_copy
+            self._latest_landmarks_size = (sw, sh)
+            # Do NOT feed landmark hull back into YOLO/EAR face seed — that
+            # expands the dlib rect over time ("lock then grow").
+        return True
+
+    def _compute_detect_overlay(
+        self,
+        det_frame: np.ndarray,
+        face_bbox: Optional[List[int]],
+        detections: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run dlib on the YOLO frame and return a rigid overlay packet.
+        Box is derived from landmarks when available (prevents box/point split).
+        """
+        try:
+            from detection.views import dlib_detector
+        except Exception:  # noqa: BLE001
+            dlib_detector = None
+
+        dh, dw = det_frame.shape[:2]
+        primary: Optional[List[int]] = None
+        if face_bbox is not None:
+            try:
+                primary = self._clip_bbox([int(v) for v in face_bbox], dw, dh)
+            except (TypeError, ValueError):
+                primary = None
+
+        lm = None
+        if primary is not None and dlib_detector is not None:
+            try:
+                dlib_res = dlib_detector.detect_fatigue_multi(
+                    det_frame,
+                    face_bboxes=[primary],
+                    primary_bbox=primary,
+                    allow_hog=False,
+                )
+                lm = dlib_res.get("landmarks")
+            except Exception:  # noqa: BLE001
+                lm = None
+
+        draw_box = primary
+        if lm is not None:
+            lm_box = self._bbox_from_landmarks(lm)
+            if lm_box is not None:
+                draw_box = self._clip_bbox(lm_box, dw, dh)
+
+        return {
+            "bbox": draw_box,
+            "landmarks": None if lm is None else np.asarray(lm).copy(),
+            "detections": list(detections or []),
+            "wh": (dw, dh),
+            "yolo_bbox": primary,
+        }
+
+    def _store_overlay(self, packet: Dict[str, Any]) -> None:
+        with self._lock:
+            self._overlay_bbox = packet.get("bbox")
+            self._overlay_landmarks = packet.get("landmarks")
+            self._overlay_detections = list(packet.get("detections") or [])
+            self._overlay_wh = packet.get("wh")
+            self._overlay_at = time.time()
+            lm = packet.get("landmarks")
+            if lm is not None and packet.get("wh"):
+                self._latest_landmarks = lm
+                self._latest_landmarks_size = packet.get("wh")
+
+    def _draw_overlay_on_canvas(self, canvas: np.ndarray) -> np.ndarray:
+        """Draw the last rigid detect overlay onto a detect-sized canvas."""
         try:
             from detection.views import dlib_detector
         except Exception:  # noqa: BLE001
@@ -500,47 +663,66 @@ class MvsGrabber:
 
         ch, cw = canvas.shape[:2]
         with self._lock:
-            primary = (
-                None
-                if self._latest_face_bbox is None
-                else list(self._latest_face_bbox)
-            )
-            lm = self._latest_landmarks
-            lm_size = self._latest_landmarks_size
-            overlay_wh = self._overlay_size
+            age = time.time() - float(self._overlay_at or 0.0)
+            if float(self._overlay_at or 0.0) <= 0.0 or age > float(self._overlay_ttl_sec):
+                return canvas
+            owh = self._overlay_wh
+            if owh is not None and (int(owh[0]) != cw or int(owh[1]) != ch):
+                # Detect canvas size changed — do not rescale (avoids float)
+                return canvas
+            bbox = None if self._overlay_bbox is None else list(self._overlay_bbox)
+            lm = None if self._overlay_landmarks is None else self._overlay_landmarks
+            dets = list(self._overlay_detections or [])
 
-        # If canvas size changed vs last detect, skip stale overlays
-        if overlay_wh is not None and (int(overlay_wh[0]) != cw or int(overlay_wh[1]) != ch):
-            return canvas
-
-        if primary is not None:
+        if bbox is not None:
             try:
-                x1, y1, x2, y2 = self._clip_bbox([int(v) for v in primary], cw, ch)
+                x1, y1, x2, y2 = self._clip_bbox([int(v) for v in bbox], cw, ch)
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 220, 0), 2)
-            except (TypeError, ValueError):
+            except Exception:  # noqa: BLE001
                 pass
 
         if dlib_detector is not None and lm is not None:
-            # Landmarks must be in the same detect canvas space
-            src = lm_size if lm_size is not None else (cw, ch)
             try:
-                sw, sh = int(src[0]), int(src[1])
-            except (TypeError, ValueError, IndexError):
-                sw, sh = cw, ch
-            if sw == cw and sh == ch:
                 dlib_detector.draw_landmarks(
                     canvas, lm, landmarks_size=(cw, ch), color=(0, 255, 0)
                 )
-            else:
-                # Only draw if sizes match; mismatched size causes "floating" points
+            except Exception:  # noqa: BLE001
                 pass
+
+        for det in dets:
+            try:
+                db = det.get("bbox")
+                if not db:
+                    continue
+                cid = int(det.get("class_id", -1))
+                if cid == 0:
+                    continue
+                x1, y1, x2, y2 = self._clip_bbox([int(v) for v in db], cw, ch)
+                color = {
+                    1: (0, 165, 255),
+                    2: (0, 0, 255),
+                    3: (255, 128, 0),
+                }.get(cid, (200, 200, 0))
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
+                label = str(det.get("class_name") or det.get("label") or cid)
+                cv2.putText(
+                    canvas,
+                    label,
+                    (x1, max(14, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                )
+            except Exception:  # noqa: BLE001
+                continue
         return canvas
 
     def _encode_preview_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
-        # Same resize as YOLO/EAR → draw → then scale for display. Overlay stays locked.
+        """High-rate preview: detect-size canvas + rigid overlay → preview JPEG."""
         canvas = self._resize_for_detect(frame)
         try:
-            canvas = self._draw_overlay_on_detect_canvas(canvas)
+            canvas = self._draw_overlay_on_canvas(canvas)
         except Exception:  # noqa: BLE001
             pass
         preview = self._resize_for_preview(canvas)
@@ -554,6 +736,7 @@ class MvsGrabber:
         return buf.tobytes()
 
     def _publish_preview_frame(self, frame: np.ndarray, extra_meta: Optional[Dict[str, Any]] = None) -> None:
+        # Always publish at grab rate for smooth MJPEG; overlay is rigid from detect.
         jpeg = self._encode_preview_jpeg(frame)
         with self._lock:
             self._latest_bgr = frame
@@ -838,6 +1021,13 @@ class MvsGrabber:
                                 self._latest_landmarks_size = None
                                 self._latest_landmark_faces = []
 
+                        # High-rate face overlay refresh (behavior boxes stay on YOLO cadence)
+                        if lm is not None and lm_size is not None:
+                            try:
+                                self._refresh_face_overlay_from_ear(lm, lm_size)
+                            except Exception:  # noqa: BLE001
+                                pass
+
                         # Tracker / alerts: primary face only
                         snap = fatigue_tracker.update(
                             session_id,
@@ -965,57 +1155,47 @@ class MvsGrabber:
                     or result.get("drinking_detected")
                 )
                 # Do not write history during startup warmup window
+                face_bbox = result.get("face_bbox")
+                face_bboxes = result.get("face_bboxes") or []
+                try:
+                    primary_draw = (
+                        [int(v) for v in face_bbox] if face_bbox is not None else None
+                    )
+                except (TypeError, ValueError):
+                    primary_draw = None
+
+                # One dlib pass on this det_frame → rigid overlay for grab + persist
+                overlay_packet: Dict[str, Any] = {
+                    "bbox": primary_draw,
+                    "landmarks": None,
+                    "detections": result.get("detections") or [],
+                    "wh": (int(det_frame.shape[1]), int(det_frame.shape[0])),
+                }
+                try:
+                    overlay_packet = self._compute_detect_overlay(
+                        det_frame,
+                        primary_draw,
+                        detections=result.get("detections") or [],
+                    )
+                    self._store_overlay(overlay_packet)
+                except Exception:  # noqa: BLE001
+                    pass
+
                 if (not in_warmup) and (pending_event or behavior_hit or due_persist):
-                    # Persist on full frame so landmarks (full-frame coords) overlay correctly;
-                    # scale YOLO boxes from detect → full for drawing.
-                    persist_frame = frame
                     persist_result = dict(result)
-                    try:
-                        fh, fw = frame.shape[:2]
-                        dh, dw = det_frame.shape[:2]
-                        if dw > 0 and dh > 0 and (dw != fw or dh != fh):
-                            sx_p = fw / float(dw)
-                            sy_p = fh / float(dh)
-
-                            def _up(b):
-                                if not b:
-                                    return b
-                                return [
-                                    int(b[0] * sx_p),
-                                    int(b[1] * sy_p),
-                                    int(b[2] * sx_p),
-                                    int(b[3] * sy_p),
-                                ]
-
-                            dets = []
-                            for d in persist_result.get("detections") or []:
-                                dd = dict(d)
-                                if dd.get("bbox") is not None:
-                                    dd["bbox"] = _up(dd["bbox"])
-                                dets.append(dd)
-                            persist_result["detections"] = dets
-                            if persist_result.get("face_bbox") is not None:
-                                persist_result["face_bbox"] = _up(
-                                    persist_result["face_bbox"]
-                                )
-                            if persist_result.get("face_bboxes"):
-                                persist_result["face_bboxes"] = [
-                                    _up(b) for b in persist_result["face_bboxes"]
-                                ]
-                    except Exception:  # noqa: BLE001
-                        persist_frame = det_frame
-                        persist_result = result
+                    persist_result["overlay_landmarks"] = overlay_packet.get("landmarks")
+                    persist_result["overlay_landmarks_size"] = overlay_packet.get("wh")
+                    # Prefer landmark-locked box for any face draw metadata
+                    if overlay_packet.get("bbox") is not None:
+                        persist_result["face_bbox"] = overlay_packet.get("bbox")
                     result = persist_detection_snapshot(
-                        persist_frame, session, persist_result
+                        det_frame, session, persist_result
                     )
                     with self._lock:
                         self._last_persist_at = time.time()
                         self._pending_fatigue_event = False
 
                 detect_loop_ms = (time.perf_counter() - loop_start) * 1000.0
-
-                face_bbox = result.get("face_bbox")
-                face_bboxes = result.get("face_bboxes") or []
                 timing_src = dict(result.get("timing") or {})
                 timing_src["detect_loop_ms"] = detect_loop_ms
 

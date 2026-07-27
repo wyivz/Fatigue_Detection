@@ -772,29 +772,63 @@ def persist_detection_snapshot(image, session, results):
     """
     Draw + save DetectionResult from an already-computed process_image(persist=False) result.
     Avoids running YOLO twice when the MVS loop decides to persist.
+
+    Prefer same-frame overlay_landmarks from the caller. Never mix YOLO boxes with
+    stale EAR-tracker landmarks (that caused relative float on result_*.jpg).
     """
     from .utils.fatigue_tracker import fatigue_tracker
 
     processed = {
         'detections': results.get('detections') or [],
     }
+    # Align YOLO face draw with same-frame landmark box when available
+    overlay_lm = results.get('overlay_landmarks')
+    face_box = results.get('face_bbox')
+    if face_box is not None and processed['detections']:
+        aligned = []
+        for det in processed['detections']:
+            dd = dict(det)
+            if int(dd.get('class_id', -1)) == 0 and (
+                dd.get('is_primary') or face_box is not None
+            ):
+                # Replace primary face rect with landmark-locked box
+                if dd.get('is_primary') or len([d for d in processed['detections'] if int(d.get('class_id', -1)) == 0]) == 1:
+                    dd['bbox'] = [int(v) for v in face_box]
+            aligned.append(dd)
+        processed['detections'] = aligned
+
     img = image
     if yolo_detector is not None and processed['detections']:
         img = yolo_detector.draw_results(image, processed)
 
     snap = fatigue_tracker.get_snapshot(session.id)
     if dlib_detector is not None:
-        draw_payload = {
-            'landmarks': snap.landmarks,
-            'landmarks_size': getattr(snap, 'landmarks_size', None),
-            'faces': getattr(snap, 'faces', None),
-            'eye_aspect_ratio': results.get('eye_aspect_ratio', snap.eye_aspect_ratio),
-            'mouth_aspect_ratio': results.get('mouth_aspect_ratio'),
-            'yawn_detected': results.get('yawn_detected', snap.yawn_detected),
-            'fatigue_level': results.get('fatigue_level', snap.fatigue_level),
-            'perclos': results.get('perclos', snap.perclos),
-            'eye_closed_ms': results.get('eye_closed_ms', snap.eye_closed_ms),
-        }
+        overlay_lm_size = results.get('overlay_landmarks_size')
+        if overlay_lm is not None:
+            draw_payload = {
+                'landmarks': overlay_lm,
+                'landmarks_size': overlay_lm_size,
+                'faces': None,
+                'eye_aspect_ratio': results.get('eye_aspect_ratio', snap.eye_aspect_ratio),
+                'mouth_aspect_ratio': results.get('mouth_aspect_ratio'),
+                'yawn_detected': results.get('yawn_detected', snap.yawn_detected),
+                'fatigue_level': results.get('fatigue_level', snap.fatigue_level),
+                'perclos': results.get('perclos', snap.perclos),
+                'eye_closed_ms': results.get('eye_closed_ms', snap.eye_closed_ms),
+            }
+        else:
+            # Metrics HUD only — skip stale tracker landmarks
+            draw_payload = {
+                'landmarks': None,
+                'landmarks_size': None,
+                'faces': None,
+                'eye_aspect_ratio': results.get('eye_aspect_ratio', snap.eye_aspect_ratio),
+                'mouth_aspect_ratio': results.get('mouth_aspect_ratio'),
+                'yawn_detected': results.get('yawn_detected', snap.yawn_detected),
+                'fatigue_level': results.get('fatigue_level', snap.fatigue_level),
+                'perclos': results.get('perclos', snap.perclos),
+                'eye_closed_ms': results.get('eye_closed_ms', snap.eye_closed_ms),
+            }
         try:
             img = dlib_detector.draw_fatigue_results(img, draw_payload)
         except Exception as e:  # noqa: BLE001

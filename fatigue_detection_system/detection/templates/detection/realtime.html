@@ -234,7 +234,8 @@
                 <div class="card-body">
                     <p class="small text-muted mb-2" id="perf-config-hint">
                         当前设定：EAR {{ ear_sample_interval_ms|default:100 }} ms /
-                        行为 {{ detection_interval|default:500 }} ms。建议间隔 ≈ 平均耗时 × 1.5
+                        行为 {{ detection_interval|default:500 }} ms。
+                        脸部框/关键点跟随 EAR；行为框跟随检测间隔。建议间隔 ≈ 平均耗时 × 1.5
                     </p>
                     <div class="table-responsive">
                         <table class="table table-sm mb-0" id="perf-timing-table">
@@ -875,7 +876,7 @@
                         hint.textContent =
                             '调度: ' + (s.use_cuda ? ('CUDA ' + s.device) : 'CPU') +
                             ' | YOLO线程 ' + s.yolo_threads + ' / EAR线程 ' + s.ear_threads +
-                            ' | EAR {{ ear_sample_interval_ms|default:100 }} ms / 行为 {{ detection_interval|default:500 }} ms' +
+                            ' | 脸部 EAR {{ ear_sample_interval_ms|default:100 }} ms / 行为 {{ detection_interval|default:500 }} ms' +
                             (s.use_cuda && s.cuda_half ? ' | FP16' : '');
                     }
                 }

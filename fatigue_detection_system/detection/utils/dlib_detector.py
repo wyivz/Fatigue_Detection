@@ -135,16 +135,32 @@ class DlibDetector:
             print(f"加载配置失败: {e}")
 
     @staticmethod
-    def _expand_bbox(x1, y1, x2, y2, img_w, img_h, ratio=0.18):
-        """Expand bbox for more stable landmark prediction (YOLO boxes are tight)."""
+    def _expand_bbox(
+        x1,
+        y1,
+        x2,
+        y2,
+        img_w,
+        img_h,
+        ratio=0.14,
+        bottom_extra=0.20,
+        top_extra=0.04,
+    ):
+        """
+        Expand YOLO face box for dlib shape predictor.
+
+        Industrial YOLO boxes are often tight and cut the chin; without extra
+        bottom pad, mouth landmarks (48-67) systematically sit too low / wrong.
+        """
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
         pad_x = int(bw * ratio)
-        pad_y = int(bh * ratio)
+        pad_top = int(bh * (ratio + float(top_extra)))
+        pad_bot = int(bh * (ratio + float(bottom_extra)))
         nx1 = max(0, x1 - pad_x)
-        ny1 = max(0, y1 - pad_y)
+        ny1 = max(0, y1 - pad_top)
         nx2 = min(img_w - 1, x2 + pad_x)
-        ny2 = min(img_h - 1, y2 + pad_y)
+        ny2 = min(img_h - 1, y2 + pad_bot)
         if nx2 <= nx1 or ny2 <= ny1:
             return x1, y1, x2, y2
         return nx1, ny1, nx2, ny2
@@ -159,7 +175,7 @@ class DlibDetector:
         if x2 <= x1 or y2 <= y1:
             return None
         h, w = image_shape[:2]
-        x1, y1, x2, y2 = self._expand_bbox(x1, y1, x2, y2, w, h, ratio=0.18)
+        x1, y1, x2, y2 = self._expand_bbox(x1, y1, x2, y2, w, h)
         return dlib.rectangle(x1, y1, x2, y2)
 
     def detect_faces(self, image):
