@@ -142,25 +142,32 @@ class DlibDetector:
         y2,
         img_w,
         img_h,
-        ratio=0.14,
-        bottom_extra=0.20,
-        top_extra=0.04,
+        ratio=0.12,
+        bottom_extra=-0.02,
+        top_extra=0.18,
     ):
         """
-        Expand YOLO face box for dlib shape predictor.
+        Build a dlib-friendly face rect from a YOLO box.
 
-        Industrial YOLO boxes are often tight and cut the chin; without extra
-        bottom pad, mouth landmarks (48-67) systematically sit too low / wrong.
+        Prefer more top pad (forehead) and little/no bottom pad. Extra bottom
+        padding pulls neck into the rect and the 68-point model then maps
+        mouth landmarks onto the chin.
         """
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
         pad_x = int(bw * ratio)
-        pad_top = int(bh * (ratio + float(top_extra)))
-        pad_bot = int(bh * (ratio + float(bottom_extra)))
+        pad_top = int(bh * max(0.0, ratio + float(top_extra)))
+        # bottom_extra may be negative → crop a bit of neck under YOLO chin
+        bot = ratio + float(bottom_extra)
+        if bot >= 0:
+            pad_bot = int(bh * bot)
+            ny2 = min(img_h - 1, y2 + pad_bot)
+        else:
+            crop = int(bh * abs(bot))
+            ny2 = min(img_h - 1, max(y1 + 1, y2 - crop))
         nx1 = max(0, x1 - pad_x)
         ny1 = max(0, y1 - pad_top)
         nx2 = min(img_w - 1, x2 + pad_x)
-        ny2 = min(img_h - 1, y2 + pad_bot)
         if nx2 <= nx1 or ny2 <= ny1:
             return x1, y1, x2, y2
         return nx1, ny1, nx2, ny2
@@ -176,6 +183,98 @@ class DlibDetector:
             return None
         h, w = image_shape[:2]
         x1, y1, x2, y2 = self._expand_bbox(x1, y1, x2, y2, w, h)
+        return dlib.rectangle(x1, y1, x2, y2)
+
+    def _hog_rect_near_yolo(self, gray, face_bbox, image_shape):
+        """
+        If HOG finds a face overlapping YOLO, prefer that rect — it matches
+        what the 68-point model was trained on (less mouth-on-chin).
+        Runs on a small ROI for speed. Caller holds self._lock when needed.
+        """
+        try:
+            x1, y1, x2, y2 = [int(v) for v in face_bbox]
+        except (TypeError, ValueError):
+            return None
+        h, w = image_shape[:2]
+        sx1, sy1, sx2, sy2 = self._expand_bbox(
+            x1, y1, x2, y2, w, h, ratio=0.2, bottom_extra=0.05, top_extra=0.25
+        )
+        if sx2 <= sx1 + 8 or sy2 <= sy1 + 8:
+            return None
+        try:
+            roi = gray[sy1:sy2, sx1:sx2]
+            dets = list(self.detector(roi, 0))
+        except Exception:  # noqa: BLE001
+            return None
+        best = None
+        best_iou = 0.0
+        yolo = [x1, y1, x2, y2]
+        for det in dets:
+            hb = [
+                int(det.left()) + sx1,
+                int(det.top()) + sy1,
+                int(det.right()) + sx1,
+                int(det.bottom()) + sy1,
+            ]
+            iou = self._bbox_iou(hb, yolo)
+            if iou > best_iou:
+                best_iou = iou
+                best = dlib.rectangle(hb[0], hb[1], hb[2], hb[3])
+        if best is not None and best_iou >= 0.25:
+            return best
+        return None
+
+    @staticmethod
+    def _mouth_collapsed_to_chin(landmarks) -> bool:
+        """True when predicted mouth sits on/near the chin tip (classic failure)."""
+        try:
+            pts = np.asarray(landmarks, dtype=np.float64)
+            if pts.shape[0] < 68:
+                return False
+            nose_y = float(pts[30, 1])
+            chin_y = float(pts[8, 1])
+            # Outer lip vertical center
+            mouth_y = float(
+                (
+                    pts[51, 1]
+                    + pts[57, 1]
+                    + pts[48, 1]
+                    + pts[54, 1]
+                )
+                / 4.0
+            )
+            face_h = chin_y - float(pts[27, 1])
+            if face_h < 8.0:
+                return False
+            mouth_to_chin = chin_y - mouth_y
+            nose_to_mouth = mouth_y - nose_y
+            # Healthy: mouth clearly above chin and below nose
+            if mouth_to_chin < 0.10 * face_h:
+                return True
+            if nose_to_mouth < 0.06 * face_h:
+                return True
+            # Mouth below geometric mid of nose→chin by too little gap to chin
+            span = chin_y - nose_y
+            if span > 1.0 and (chin_y - mouth_y) / span < 0.22:
+                return True
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _rect_crop_bottom(self, rect, image_shape, crop_frac=0.16):
+        """Raise the bottom edge of a rect (drop neck) for a mouth retry."""
+        h, w = image_shape[:2]
+        x1, y1 = int(rect.left()), int(rect.top())
+        x2, y2 = int(rect.right()), int(rect.bottom())
+        bh = max(1, y2 - y1)
+        y2 = max(y1 + 1, y2 - int(bh * float(crop_frac)))
+        # Give a bit more forehead room on retry
+        y1 = max(0, y1 - int(bh * 0.08))
+        x1 = max(0, x1)
+        x2 = min(w - 1, x2)
+        y2 = min(h - 1, y2)
+        if x2 <= x1 or y2 <= y1:
+            return rect
         return dlib.rectangle(x1, y1, x2, y2)
 
     def detect_faces(self, image):
@@ -280,21 +379,57 @@ class DlibDetector:
             return 0.0
         return max(0, x2 - x1) * max(0, y2 - y1)
 
-    def _predict_one(self, gray, face_bbox, image_shape):
-        """Run predictor for one bbox; returns metrics dict or None."""
-        rect = self._bbox_to_rect(face_bbox, image_shape)
-        if rect is None or self.predictor is None:
-            return None
-        shape = self.predictor(gray, rect)
+    def _shape_to_landmarks(self, shape):
         landmarks = np.zeros((68, 2), dtype=int)
         for i in range(0, 68):
             landmarks[i] = (shape.part(i).x, shape.part(i).y)
+        return landmarks
+
+    def _predict_one(self, gray, face_bbox, image_shape, refine_rect: bool = False):
+        """Run predictor for one bbox; returns metrics dict or None.
+
+        refine_rect=True: HOG snap + extra mouth retries (detect overlay).
+        refine_rect=False: top-heavy expand only + at most one mouth retry (EAR).
+        """
+        if self.predictor is None:
+            return None
+
+        rect = None
+        if refine_rect:
+            rect = self._hog_rect_near_yolo(gray, face_bbox, image_shape)
+        if rect is None:
+            rect = self._bbox_to_rect(face_bbox, image_shape)
+        if rect is None:
+            return None
+
+        shape = self.predictor(gray, rect)
+        landmarks = self._shape_to_landmarks(shape)
+
+        # If mouth collapsed onto chin, crop neck and retry
+        if self._mouth_collapsed_to_chin(landmarks):
+            rect2 = self._rect_crop_bottom(rect, image_shape, crop_frac=0.18)
+            shape2 = self.predictor(gray, rect2)
+            landmarks2 = self._shape_to_landmarks(shape2)
+            if not self._mouth_collapsed_to_chin(landmarks2):
+                landmarks = landmarks2
+            elif refine_rect:
+                rect3 = self._rect_crop_bottom(rect, image_shape, crop_frac=0.28)
+                shape3 = self.predictor(gray, rect3)
+                landmarks3 = self._shape_to_landmarks(shape3)
+                if not self._mouth_collapsed_to_chin(landmarks3):
+                    landmarks = landmarks3
+
         metrics = self._metrics_from_landmarks(landmarks)
         metrics["bbox"] = [int(v) for v in face_bbox]
         return metrics
 
     def detect_fatigue_multi(
-        self, image, face_bboxes=None, primary_bbox=None, allow_hog=True
+        self,
+        image,
+        face_bboxes=None,
+        primary_bbox=None,
+        allow_hog=True,
+        refine_rect: bool = False,
     ):
         """
         Run 68-point + EAR/MAR for multiple YOLO face boxes.
@@ -304,6 +439,7 @@ class DlibDetector:
         feed the primary metrics into fatigue_tracker.
 
         allow_hog=False: never fall back to HOG when boxes are empty (MVS path).
+        refine_rect: HOG snap + extra mouth retries (detect path; keep False on EAR).
         """
         results = {
             "faces_detected": 0,
@@ -337,7 +473,9 @@ class DlibDetector:
 
                 if boxes and self.predictor is not None:
                     for bbox in boxes:
-                        one = self._predict_one(gray, bbox, image.shape)
+                        one = self._predict_one(
+                            gray, bbox, image.shape, refine_rect=bool(refine_rect)
+                        )
                         if one is not None:
                             face_entries.append(one)
                 elif allow_hog and self.predictor is not None:
@@ -508,7 +646,9 @@ class DlibDetector:
         out[:, 1] = out[:, 1] * (dh / float(sh))
         return np.round(out).astype(int)
 
-    def draw_landmarks(self, image, landmarks, landmarks_size=None, color=(0, 255, 0)):
+    def draw_landmarks(
+        self, image, landmarks, landmarks_size=None, color=(0, 255, 0), draw_points=True
+    ):
         if landmarks is None:
             return image
 
@@ -517,8 +657,9 @@ class DlibDetector:
         h, w = img.shape[:2]
         pts = self.scale_landmarks(landmarks, landmarks_size, (w, h))
         pts = np.asarray(pts, dtype=int)
-        for x, y in pts:
-            cv2.circle(img, (int(x), int(y)), 1, color, -1)
+        if draw_points:
+            for x, y in pts:
+                cv2.circle(img, (int(x), int(y)), 1, color, -1)
 
         left_eye = pts[self.LEFT_EYE_START : self.LEFT_EYE_END + 1]
         right_eye = pts[self.RIGHT_EYE_START : self.RIGHT_EYE_END + 1]

@@ -35,9 +35,10 @@ class MvsGrabber:
         self._user_id: Optional[int] = None
         self._interval_ms = 500
         self._ear_interval_ms = 100
-        self._preview_max_width = 1280
+        self._preview_max_width = 960
         self._detect_max_width = 960
-        self._preview_jpeg_quality = 70
+        self._preview_jpeg_quality = 55
+        self._preview_min_interval_sec = 0.05  # ~20 FPS cap for MJPEG encode
         self._latest_bgr: Optional[np.ndarray] = None
         self._latest_face_bbox: Optional[List[int]] = None
         self._latest_face_bboxes: List[List[int]] = []
@@ -59,6 +60,7 @@ class MvsGrabber:
         self._overlay_wh: Optional[Tuple[int, int]] = None
         self._overlay_at: float = 0.0
         self._overlay_ttl_sec: float = 1.2
+        self._last_jpeg_encode_at: float = 0.0
         self._frame_seq = 0
         self._detect_busy = False
         self._timing_avg: Dict[str, float] = {}
@@ -118,6 +120,7 @@ class MvsGrabber:
             self._overlay_detections = []
             self._overlay_wh = None
             self._overlay_at = 0.0
+            self._last_jpeg_encode_at = 0.0
             self._frame_seq = 0
             self._timing_avg = {}
             self._session_id = session_id
@@ -142,6 +145,8 @@ class MvsGrabber:
                 self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 960))))
             except (TypeError, ValueError):
                 self._detect_max_width = 960
+            # One-step preview resize: never larger than detect canvas
+            self._preview_max_width = min(int(self._preview_max_width), int(self._detect_max_width))
             self._last_fatigue_level = 0
             self._last_yawn = False
             self._event_save_cooldown_until = 0.0
@@ -623,6 +628,7 @@ class MvsGrabber:
                     face_bboxes=[primary],
                     primary_bbox=primary,
                     allow_hog=False,
+                    refine_rect=True,
                 )
                 lm = dlib_res.get("landmarks")
             except Exception:  # noqa: BLE001
@@ -655,7 +661,7 @@ class MvsGrabber:
                 self._latest_landmarks_size = packet.get("wh")
 
     def _draw_overlay_on_canvas(self, canvas: np.ndarray) -> np.ndarray:
-        """Draw the last rigid detect overlay onto a detect-sized canvas."""
+        """Draw last overlay onto preview canvas (uniform scale from detect coords)."""
         try:
             from detection.views import dlib_detector
         except Exception:  # noqa: BLE001
@@ -667,24 +673,42 @@ class MvsGrabber:
             if float(self._overlay_at or 0.0) <= 0.0 or age > float(self._overlay_ttl_sec):
                 return canvas
             owh = self._overlay_wh
-            if owh is not None and (int(owh[0]) != cw or int(owh[1]) != ch):
-                # Detect canvas size changed — do not rescale (avoids float)
-                return canvas
             bbox = None if self._overlay_bbox is None else list(self._overlay_bbox)
             lm = None if self._overlay_landmarks is None else self._overlay_landmarks
             dets = list(self._overlay_detections or [])
 
+        sx = sy = 1.0
+        lm_size = None
+        if owh is not None:
+            try:
+                ow, oh = int(owh[0]), int(owh[1])
+                if ow > 0 and oh > 0:
+                    sx = cw / float(ow)
+                    sy = ch / float(oh)
+                    lm_size = (ow, oh)
+            except (TypeError, ValueError):
+                sx = sy = 1.0
+
         if bbox is not None:
             try:
-                x1, y1, x2, y2 = self._clip_bbox([int(v) for v in bbox], cw, ch)
+                x1 = int(round(float(bbox[0]) * sx))
+                y1 = int(round(float(bbox[1]) * sy))
+                x2 = int(round(float(bbox[2]) * sx))
+                y2 = int(round(float(bbox[3]) * sy))
+                x1, y1, x2, y2 = self._clip_bbox([x1, y1, x2, y2], cw, ch)
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 220, 0), 2)
             except Exception:  # noqa: BLE001
                 pass
 
         if dlib_detector is not None and lm is not None:
             try:
+                # Contours only — skip 68 circles for preview FPS
                 dlib_detector.draw_landmarks(
-                    canvas, lm, landmarks_size=(cw, ch), color=(0, 255, 0)
+                    canvas,
+                    lm,
+                    landmarks_size=lm_size if lm_size is not None else (cw, ch),
+                    color=(0, 255, 0),
+                    draw_points=False,
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -697,35 +721,28 @@ class MvsGrabber:
                 cid = int(det.get("class_id", -1))
                 if cid == 0:
                     continue
-                x1, y1, x2, y2 = self._clip_bbox([int(v) for v in db], cw, ch)
+                x1 = int(round(float(db[0]) * sx))
+                y1 = int(round(float(db[1]) * sy))
+                x2 = int(round(float(db[2]) * sx))
+                y2 = int(round(float(db[3]) * sy))
+                x1, y1, x2, y2 = self._clip_bbox([x1, y1, x2, y2], cw, ch)
                 color = {
                     1: (0, 165, 255),
                     2: (0, 0, 255),
                     3: (255, 128, 0),
                 }.get(cid, (200, 200, 0))
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-                label = str(det.get("class_name") or det.get("label") or cid)
-                cv2.putText(
-                    canvas,
-                    label,
-                    (x1, max(14, y1 - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    1,
-                )
             except Exception:  # noqa: BLE001
                 continue
         return canvas
 
     def _encode_preview_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
-        """High-rate preview: detect-size canvas + rigid overlay → preview JPEG."""
-        canvas = self._resize_for_detect(frame)
+        """Single-resize preview encode (~20 FPS friendly)."""
+        preview = self._resize_for_preview(frame)
         try:
-            canvas = self._draw_overlay_on_canvas(canvas)
+            preview = self._draw_overlay_on_canvas(preview)
         except Exception:  # noqa: BLE001
             pass
-        preview = self._resize_for_preview(canvas)
         ok, buf = cv2.imencode(
             ".jpg",
             preview,
@@ -736,13 +753,22 @@ class MvsGrabber:
         return buf.tobytes()
 
     def _publish_preview_frame(self, frame: np.ndarray, extra_meta: Optional[Dict[str, Any]] = None) -> None:
-        # Always publish at grab rate for smooth MJPEG; overlay is rigid from detect.
-        jpeg = self._encode_preview_jpeg(frame)
+        # Always keep latest BGR for EAR/detect; throttle JPEG encode for smooth UI.
+        now = time.time()
+        encode = True
         with self._lock:
             self._latest_bgr = frame
             self._frame_seq += 1
+            min_iv = float(self._preview_min_interval_sec or 0.0)
+            if min_iv > 0 and (now - float(self._last_jpeg_encode_at or 0.0)) < min_iv:
+                if self.latest_jpeg is not None:
+                    encode = False
+
+        jpeg = self._encode_preview_jpeg(frame) if encode else None
+        with self._lock:
             if jpeg:
                 self.latest_jpeg = jpeg
+                self._last_jpeg_encode_at = now
             self.error = None
             try:
                 cam_diag = dict(getattr(self._camera, "last_diag", {}) or {})
@@ -993,6 +1019,7 @@ class MvsGrabber:
                                 face_bboxes=scaled_boxes,
                                 primary_bbox=scaled_primary,
                                 allow_hog=False,
+                                refine_rect=False,
                             )
                             ear_cost = (time.perf_counter() - t_ear) * 1000.0
 

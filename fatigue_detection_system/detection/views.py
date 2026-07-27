@@ -662,7 +662,7 @@ def mvs_preview(request):
                         b'--frame\r\n'
                         b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n'
                     )
-                time.sleep(0.03)
+                time.sleep(0.05)
 
     response = StreamingHttpResponse(
         frame_generator(),
