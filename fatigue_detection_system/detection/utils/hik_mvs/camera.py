@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from ctypes import POINTER, byref, c_ubyte, cast, memset, sizeof
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -97,6 +98,7 @@ def _load_sdk():
             MV_CC_PIXEL_CONVERT_PARAM,
             MV_FRAME_OUT_INFO_EX,
             MVCC_ENUMVALUE,
+            MVCC_FLOATVALUE,
             MVCC_INTVALUE,
         )
         from MvErrorDefine_const import MV_OK  # noqa: WPS433
@@ -135,6 +137,7 @@ def _load_sdk():
         b.MV_CC_PIXEL_CONVERT_PARAM = MV_CC_PIXEL_CONVERT_PARAM
         b.MV_FRAME_OUT_INFO_EX = MV_FRAME_OUT_INFO_EX
         b.MVCC_INTVALUE = MVCC_INTVALUE
+        b.MVCC_FLOATVALUE = MVCC_FLOATVALUE
         b.MVCC_ENUMVALUE = MVCC_ENUMVALUE
         b.PixelType_Gvsp_BGR8_Packed = PixelType_Gvsp_BGR8_Packed
         b.PixelType_Gvsp_RGB8_Packed = PixelType_Gvsp_RGB8_Packed
@@ -269,6 +272,7 @@ class HikCamera:
         self._prefer_sdk_bgr = True
         self.last_diag: Dict[str, Any] = {}
         self._dark_streak = 0
+        self._fixed_exposure_locked = False
 
     def open_by_index(self, index: int = 0) -> None:
         sdk = _load_sdk()
@@ -562,58 +566,107 @@ class HikCamera:
         return False
 
     def _apply_default_auto_exposure_gain(self, cam, sdk) -> None:
-        """Enable continuous AE/AG with a high enough upper limit for dark scenes."""
+        """Try Continuous AE/AG; if unsupported, leave manual Off for later software calibration."""
         continuous = 2
         ok_exp = self._set_enum(cam, sdk, "ExposureAuto", "Continuous", continuous)
         ok_gain = self._set_enum(cam, sdk, "GainAuto", "Continuous", continuous)
         if not ok_gain:
             ok_gain = self._set_enum(cam, sdk, "Gain", "Continuous", continuous)
 
-        for key, val in (
-            ("AutoExposureTimeUpperLimit", 200000.0),
-            ("AutoExposureTimeUpperLimit", 200000),
-            ("ExposureAutoUpperLimit", 200000.0),
-        ):
-            try:
-                if isinstance(val, float):
-                    cam.MV_CC_SetFloatValue(key, float(val))
-                else:
-                    cam.MV_CC_SetIntValue(key, int(val))
-                self.last_diag["ae_upper"] = val
-                break
-            except Exception:  # noqa: BLE001
-                continue
-
-        for key, val in (("AutoExposureTimeLowerLimit", 100.0), ("ExposureAutoLowerLimit", 100)):
-            try:
-                if isinstance(val, float):
-                    cam.MV_CC_SetFloatValue(key, float(val))
-                else:
-                    cam.MV_CC_SetIntValue(key, int(val))
-                break
-            except Exception:  # noqa: BLE001
-                continue
+        if ok_exp:
+            for key, val in (
+                ("AutoExposureTimeUpperLimit", 200000.0),
+                ("AutoExposureTimeUpperLimit", 200000),
+                ("ExposureAutoUpperLimit", 200000.0),
+            ):
+                try:
+                    if isinstance(val, float):
+                        cam.MV_CC_SetFloatValue(key, float(val))
+                    else:
+                        cam.MV_CC_SetIntValue(key, int(val))
+                    self.last_diag["ae_upper"] = val
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            for key, val in (("AutoExposureTimeLowerLimit", 100.0), ("ExposureAutoLowerLimit", 100)):
+                try:
+                    if isinstance(val, float):
+                        cam.MV_CC_SetFloatValue(key, float(val))
+                    else:
+                        cam.MV_CC_SetIntValue(key, int(val))
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+        else:
+            # Hardware AE missing (e.g. JHEM506GC): seed a mid exposure for calibration
+            self._set_enum(cam, sdk, "ExposureAuto", "Off", 0)
+            self._set_enum(cam, sdk, "GainAuto", "Off", 0)
+            self._set_exposure_gain(cam, sdk, exposure_us=12000.0, gain_db=4.0)
 
         self.last_diag["ae"] = bool(ok_exp)
         self.last_diag["ag"] = bool(ok_gain)
 
+    def _get_float_range(self, cam, sdk, key: str) -> Optional[Tuple[float, float, float]]:
+        st = sdk.MVCC_FLOATVALUE()
+        memset(byref(st), 0, sizeof(sdk.MVCC_FLOATVALUE))
+        try:
+            ret = cam.MV_CC_GetFloatValue(key, st)
+            if ret == sdk.MV_OK:
+                return float(st.fCurValue), float(st.fMin), float(st.fMax)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _get_int_range(self, cam, sdk, key: str) -> Optional[Tuple[float, float, float]]:
+        st = sdk.MVCC_INTVALUE()
+        memset(byref(st), 0, sizeof(sdk.MVCC_INTVALUE))
+        try:
+            ret = cam.MV_CC_GetIntValue(key, st)
+            if ret == sdk.MV_OK:
+                return float(st.nCurValue), float(st.nMin), float(st.nMax)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _set_exposure_gain(
+        self, cam, sdk, exposure_us: float, gain_db: float
+    ) -> Tuple[bool, bool]:
+        ok_exp = False
+        ok_gain = False
+        for setter, key, val in (
+            (cam.MV_CC_SetFloatValue, "ExposureTime", float(exposure_us)),
+            (cam.MV_CC_SetIntValue, "ExposureTime", int(round(exposure_us))),
+        ):
+            try:
+                ret = setter(key, val)
+                if ret == sdk.MV_OK:
+                    ok_exp = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        for setter, key, val in (
+            (cam.MV_CC_SetFloatValue, "Gain", float(gain_db)),
+            (cam.MV_CC_SetFloatValue, "GainRaw", float(gain_db)),
+        ):
+            try:
+                ret = setter(key, val)
+                if ret == sdk.MV_OK:
+                    ok_gain = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        return ok_exp, ok_gain
+
     def _force_manual_exposure(self, exposure_us: float = 15000.0, gain_db: float = 8.0) -> None:
-        """Rescue path when frames stay near-black despite Continuous AE."""
+        """Rescue path when frames stay near-black (skipped once fixed exposure is locked)."""
+        if self._fixed_exposure_locked:
+            return
         cam, sdk = self._cam, self._sdk
         if cam is None or sdk is None:
             return
         self._set_enum(cam, sdk, "ExposureAuto", "Off", 0)
         self._set_enum(cam, sdk, "GainAuto", "Off", 0)
-        for setter, key, val in (
-            (cam.MV_CC_SetFloatValue, "ExposureTime", float(exposure_us)),
-            (cam.MV_CC_SetIntValue, "ExposureTime", int(exposure_us)),
-            (cam.MV_CC_SetFloatValue, "Gain", float(gain_db)),
-            (cam.MV_CC_SetFloatValue, "GainRaw", float(gain_db)),
-        ):
-            try:
-                setter(key, val)
-            except Exception:  # noqa: BLE001
-                continue
+        self._set_exposure_gain(cam, sdk, exposure_us=exposure_us, gain_db=gain_db)
         self.last_diag["manual_rescue"] = {
             "exposure_us": exposure_us,
             "gain_db": gain_db,
@@ -629,29 +682,199 @@ class HikCamera:
         self._prefer_sdk_bgr = True
 
     def settle_exposure(self, frames: int = 25, timeout_ms: int = 500) -> Dict[str, Any]:
-        """Discard frames so Continuous AE can climb; rescue if still black."""
-        means = []
+        """Backward-compatible: prefer hardware AE settle, else software fallback."""
+        budget = max(1.0, float(frames) * float(timeout_ms) / 1000.0 * 0.35)
+        if self.last_diag.get("ae"):
+            return self.settle_hardware_ae(budget_sec=budget, timeout_ms=timeout_ms)
+        return self.calibrate_fixed_exposure(budget_sec=budget, timeout_ms=timeout_ms)
+
+    def settle_hardware_ae(
+        self,
+        budget_sec: float = 2.5,
+        target_mean: float = 90.0,
+        timeout_ms: int = 350,
+        on_frame=None,
+    ) -> Dict[str, Any]:
+        """
+        Let Continuous ExposureAuto/GainAuto climb; do not force Off.
+
+        Returns needs_software_fallback=True when brightness stays unusable.
+        """
+        if not self._grabbing:
+            self.last_diag["calib_error"] = "camera not grabbing"
+            return dict(self.last_diag)
+
+        deadline = time.time() + max(0.3, float(budget_sec))
+        target = float(target_mean)
+        means: List[float] = []
         last = None
-        for _i in range(max(1, int(frames))):
+        while time.time() < deadline:
             try:
                 last = self.get_bgr_frame(timeout_ms=timeout_ms)
                 m = float(np.mean(last))
                 means.append(m)
+                if on_frame is not None:
+                    try:
+                        on_frame(last)
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as exc:  # noqa: BLE001
                 self.last_diag["settle_error"] = str(exc)
                 break
-        mean_last = means[-1] if means else 0.0
-        self.last_diag["settle_mean"] = mean_last
-        self.last_diag["settle_frames"] = len(means)
-        if mean_last < 5.0 and last is not None:
-            self._force_manual_exposure(exposure_us=20000.0, gain_db=10.0)
-            for _ in range(5):
+            # Early stop once brightness is usable and stable
+            if len(means) >= 3 and float(np.mean(means[-3:])) >= target * 0.85:
+                break
+
+        mean_last = float(means[-1]) if means else 0.0
+        usable = mean_last >= max(20.0, target * 0.45)
+        still_dark = mean_last < 15.0
+        self.last_diag.update(
+            {
+                "exposure_mode": "hardware_ae",
+                "fixed_exposure": False,
+                "ae_settle_mean": round(mean_last, 2),
+                "settle_mean": round(mean_last, 2),
+                "ae_settled": bool(usable),
+                "needs_software_fallback": bool(still_dark or not usable),
+                "ae_settle_frames": len(means),
+            }
+        )
+        return dict(self.last_diag)
+
+    def calibrate_fixed_exposure(
+        self,
+        budget_sec: float = 4.0,
+        target_mean: float = 105.0,
+        timeout_ms: int = 400,
+        on_frame=None,
+    ) -> Dict[str, Any]:
+        """
+        Fallback: read frames and lock ExposureTime/Gain to a fixed suitable value.
+
+        Used only when Continuous ExposureAuto/GainAuto is unsupported or
+        hardware AE failed to reach usable brightness in time.
+        """
+        cam, sdk = self._cam, self._sdk
+        if cam is None or sdk is None or not self._grabbing:
+            self.last_diag["calib_error"] = "camera not grabbing"
+            return dict(self.last_diag)
+
+        deadline = time.time() + max(0.5, float(budget_sec))
+        target = float(target_mean)
+        lo = max(40.0, target - 25.0)
+        hi = min(200.0, target + 25.0)
+
+        self._set_enum(cam, sdk, "ExposureAuto", "Off", 0)
+        self._set_enum(cam, sdk, "GainAuto", "Off", 0)
+
+        exp_range = self._get_float_range(cam, sdk, "ExposureTime")
+        if exp_range is None:
+            exp_range = self._get_int_range(cam, sdk, "ExposureTime")
+        gain_range = self._get_float_range(cam, sdk, "Gain")
+        if gain_range is None:
+            gain_range = self._get_float_range(cam, sdk, "GainRaw")
+
+        # Sensible caps so FPS stays usable for realtime detection
+        exp_min = 100.0
+        exp_max = 80000.0
+        exp_cur = 12000.0
+        if exp_range is not None:
+            exp_cur, exp_min, exp_max = exp_range
+            exp_min = max(50.0, float(exp_min))
+            exp_max = min(100000.0, max(exp_min + 1.0, float(exp_max)))
+            exp_cur = float(np.clip(exp_cur, exp_min, exp_max))
+
+        gain_min = 0.0
+        gain_max = 16.0
+        gain_cur = 4.0
+        if gain_range is not None:
+            gain_cur, gain_min, gain_max = gain_range
+            gain_min = max(0.0, float(gain_min))
+            gain_max = min(24.0, max(gain_min, float(gain_max)))
+            gain_cur = float(np.clip(gain_cur, gain_min, gain_max))
+
+        history: List[Dict[str, float]] = []
+        mean_last = 0.0
+        steps = 0
+
+        def _measure() -> float:
+            nonlocal mean_last
+            last = None
+            means_local: List[float] = []
+            for _ in range(2):
+                if time.time() >= deadline:
+                    break
                 try:
                     last = self.get_bgr_frame(timeout_ms=timeout_ms)
-                    mean_last = float(np.mean(last))
+                    m = float(np.mean(last))
+                    means_local.append(m)
+                    if on_frame is not None and last is not None:
+                        try:
+                            on_frame(last)
+                        except Exception:  # noqa: BLE001
+                            pass
                 except Exception:  # noqa: BLE001
                     break
-            self.last_diag["settle_mean_after_rescue"] = mean_last
+            if means_local:
+                mean_last = float(np.median(means_local))
+            return mean_last
+
+        # Initial apply + measure
+        self._set_exposure_gain(cam, sdk, exp_cur, gain_cur)
+        _measure()
+        history.append({"exp_us": exp_cur, "gain_db": gain_cur, "mean": mean_last})
+
+        while time.time() < deadline and steps < 14:
+            if lo <= mean_last <= hi:
+                break
+            steps += 1
+            if mean_last < lo:
+                # Too dark: prefer longer exposure, then gain
+                if exp_cur < exp_max * 0.98:
+                    # Multiplicative step scaled by darkness
+                    ratio = max(1.25, min(2.2, (target / max(mean_last, 1.0)) ** 0.7))
+                    exp_cur = float(min(exp_max, exp_cur * ratio))
+                elif gain_cur < gain_max - 0.05:
+                    gain_cur = float(min(gain_max, gain_cur + max(1.0, (gain_max - gain_min) * 0.15)))
+                else:
+                    break
+            else:
+                # Too bright: reduce gain first, then exposure
+                if gain_cur > gain_min + 0.05:
+                    gain_cur = float(max(gain_min, gain_cur - max(1.0, (gain_max - gain_min) * 0.15)))
+                elif exp_cur > exp_min * 1.02:
+                    ratio = max(1.25, min(2.2, (mean_last / max(target, 1.0)) ** 0.7))
+                    exp_cur = float(max(exp_min, exp_cur / ratio))
+                else:
+                    break
+            self._set_exposure_gain(cam, sdk, exp_cur, gain_cur)
+            _measure()
+            history.append({"exp_us": exp_cur, "gain_db": gain_cur, "mean": mean_last})
+
+        # Final lock (re-apply once; ignore further dark-streak rescue)
+        self._set_enum(cam, sdk, "ExposureAuto", "Off", 0)
+        self._set_enum(cam, sdk, "GainAuto", "Off", 0)
+        self._set_exposure_gain(cam, sdk, exp_cur, gain_cur)
+        if time.time() < deadline:
+            _measure()
+        self._fixed_exposure_locked = True
+        self._dark_streak = 0
+
+        self.last_diag.update(
+            {
+                "exposure_mode": "software_fallback",
+                "fixed_exposure": True,
+                "needs_software_fallback": False,
+                "exposure_us": round(float(exp_cur), 1),
+                "gain_db": round(float(gain_cur), 2),
+                "calib_mean": round(float(mean_last), 2),
+                "calib_target": target,
+                "calib_steps": steps,
+                "calib_ok": bool(lo <= mean_last <= hi),
+                "calib_history": history[-8:],
+                "settle_mean": round(float(mean_last), 2),
+            }
+        )
         return dict(self.last_diag)
 
     def get_bgr_frame(self, timeout_ms: int = 1000) -> np.ndarray:
@@ -729,7 +952,9 @@ class HikCamera:
                 "is_mono": (family or self._sensor_family) == "mono",
             }
         )
-        if mean < 3.0:
+        if self._fixed_exposure_locked:
+            self._dark_streak = 0
+        elif mean < 3.0:
             self._dark_streak += 1
             if self._dark_streak == 15:
                 self._force_manual_exposure(exposure_us=30000.0, gain_db=12.0)

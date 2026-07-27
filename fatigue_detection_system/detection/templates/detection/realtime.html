@@ -584,10 +584,22 @@
         return Date.now() < warmupUntilMs;
     }
 
-    function showWarmupUi(remainSec) {
+    function showWarmupUi(remainSec, meta) {
         const sec = Math.max(0, Math.ceil(remainSec));
+        const detail = (meta && meta.warmup_detail) ? String(meta.warmup_detail) : '模型与相机预热中';
+        const phase = (meta && meta.warmup_phase) ? String(meta.warmup_phase) : '';
+        const expReady = !!(meta && meta.exposure_ready);
+        const modelReady = !!(meta && meta.models_warmed);
+        const mode = (meta && meta.camera && meta.camera.exposure_mode) ? String(meta.camera.exposure_mode) : '';
+        let modeLabel = '';
+        if (mode === 'hardware_ae') modeLabel = '硬件自动曝光';
+        else if (mode === 'software_fallback') modeLabel = '软件固定曝光（回退）';
+        else if (phase === 'ae_settle') modeLabel = '硬件自动曝光收敛';
+        else if (phase === 'software_calib') modeLabel = '软件曝光校准';
+
         detectionAlert.innerHTML =
-            '<i class="fas fa-spinner fa-spin me-2"></i>加载中……系统预热 ' + sec + 's';
+            '<i class="fas fa-spinner fa-spin me-2"></i>加载中……系统预热 ' + sec + 's' +
+            (detail ? '<span class="ms-2 small opacity-75">· ' + detail + '</span>' : '');
         detectionAlert.className = 'alert alert-primary';
         fatigueLevel.style.width = '0%';
         fatigueLevel.textContent = '加载中';
@@ -596,14 +608,19 @@
             '<div class="text-center text-muted py-4">' +
             '<i class="fas fa-spinner fa-spin fa-2x mb-3"></i>' +
             '<div>加载中……</div>' +
-            '<div class="small mt-2">模型与相机预热中，暂不显示检测数据</div>' +
+            '<div class="small mt-2">' + detail + '，暂不显示检测数据</div>' +
+            '<div class="small mt-3">' +
+            '<span class="me-3">' + (expReady ? '✓' : '…') + ' 曝光 ' +
+            (modeLabel || '准备中') + '</span>' +
+            '<span>' + (modelReady ? '✓' : '…') + ' 模型预热</span>' +
+            '</div>' +
             '</div>';
         cameraStatusText.textContent = '加载中';
     }
 
     function beginStartupWarmup() {
         warmupUntilMs = Date.now() + STARTUP_WARMUP_MS;
-        showWarmupUi(STARTUP_WARMUP_MS / 1000);
+        showWarmupUi(STARTUP_WARMUP_MS / 1000, null);
     }
 
     let detectionInterval = null;
@@ -732,13 +749,18 @@
                 const data = await resp.json();
                 if (data.status !== 'success') return;
 
-                // Startup warmup: show loading only, hide detection payload
-                if (data.warming_up || isWarmingUp()) {
+                // Startup warmup: prefer server clock (supports early exit)
+                if (data.warming_up) {
                     const remain = (data.warmup_remaining_sec != null)
                         ? Number(data.warmup_remaining_sec)
                         : Math.max(0, (warmupUntilMs - Date.now()) / 1000);
-                    showWarmupUi(remain);
+                    warmupUntilMs = Date.now() + Math.max(0, remain) * 1000;
+                    showWarmupUi(remain, data.meta || null);
                     return;
+                }
+                if (isWarmingUp()) {
+                    // Server finished early — clear local timer and continue
+                    warmupUntilMs = 0;
                 }
                 if (cameraStatusText.textContent === '加载中') {
                     cameraStatusText.textContent = '检测中';

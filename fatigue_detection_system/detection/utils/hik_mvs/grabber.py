@@ -53,7 +53,13 @@ class MvsGrabber:
         self._persist_interval_sec = 2.0
         self._warmup_until = 0.0
         self._warmup_sec = 5.0
+        self._warmup_started_at = 0.0
+        self._warmup_min_sec = 1.2
         self._warmup_ui_cleared = False
+        self._exposure_ready = False
+        self._models_warmed = False
+        self._warmup_phase = "idle"
+        self._model_warm_thread: Optional[threading.Thread] = None
         self.latest_jpeg: Optional[bytes] = None
         self.latest_meta: Dict[str, Any] = {}
         self.error: Optional[str] = None
@@ -124,8 +130,10 @@ class MvsGrabber:
                 self._warmup_sec = max(0.0, float(configs.get("startup_warmup_sec", 5.0)))
             except (TypeError, ValueError):
                 self._warmup_sec = 5.0
-            self._warmup_until = time.time() + self._warmup_sec
             self._warmup_ui_cleared = False
+            self._exposure_ready = False
+            self._models_warmed = False
+            self._warmup_phase = "opening"
             fatigue_tracker.reset(session_id)
             behavior_tracker.reset(session_id)
             fatigue_tracker.configure(session_id, configs)
@@ -137,28 +145,21 @@ class MvsGrabber:
             else:
                 cam.open_by_index(int(device_index or 0))
             cam.start_grab()
-            # Discard frames so Continuous AE can climb; rescue if still near-black.
-            settle = {}
-            try:
-                settle = cam.settle_exposure(frames=30, timeout_ms=500)
-            except Exception as exc:  # noqa: BLE001
-                settle = {"settle_error": str(exc)}
             self._camera = cam
             self.running = True
+            # Warmup clock starts when stream is up; work runs in parallel inside it.
+            now = time.time()
+            self._warmup_started_at = now
+            self._warmup_until = now + float(self._warmup_sec or 5.0)
+            ae_ok = bool((getattr(cam, "last_diag", {}) or {}).get("ae"))
+            self._warmup_phase = "ae_settle" if ae_ok else "software_calib"
             self.latest_meta = {
                 "timing": {},
-                "camera": settle,
+                "camera": dict(getattr(cam, "last_diag", {}) or {}),
+                "warming_up": True,
+                "warmup_phase": self._warmup_phase,
+                "warmup_detail": self._warmup_detail_text(),
             }
-            # Warmup clock starts when streams are actually up
-            self._warmup_until = time.time() + float(self._warmup_sec or 5.0)
-            # Clear any fatigue accumulation from dark AE frames after streams settle
-            try:
-                fatigue_tracker.reset(session_id)
-                behavior_tracker.reset(session_id)
-                fatigue_tracker.configure(session_id, configs)
-                behavior_tracker.configure(session_id, configs)
-            except Exception:  # noqa: BLE001
-                pass
             self._grab_thread = threading.Thread(
                 target=self._grab_loop, name="mvs-grab", daemon=True
             )
@@ -168,9 +169,13 @@ class MvsGrabber:
             self._detect_thread = threading.Thread(
                 target=self._detect_loop, name="mvs-detect", daemon=True
             )
+            self._model_warm_thread = threading.Thread(
+                target=self._warmup_models_worker, name="mvs-model-warm", daemon=True
+            )
             self._grab_thread.start()
             self._ear_thread.start()
             self._detect_thread.start()
+            self._model_warm_thread.start()
 
     def stop(self, complete_session: bool = True) -> None:
         self._stop.set()
@@ -182,6 +187,8 @@ class MvsGrabber:
                 threads.append(self._ear_thread)
             if self._detect_thread:
                 threads.append(self._detect_thread)
+            if self._model_warm_thread:
+                threads.append(self._model_warm_thread)
         for thread in threads:
             if thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=5)
@@ -196,7 +203,11 @@ class MvsGrabber:
             self._grab_thread = None
             self._ear_thread = None
             self._detect_thread = None
+            self._model_warm_thread = None
             self._detect_busy = False
+            self._exposure_ready = False
+            self._models_warmed = False
+            self._warmup_phase = "idle"
             self._latest_face_bbox = None
             self._latest_face_bboxes = []
             self._latest_faces_meta = []
@@ -213,6 +224,95 @@ class MvsGrabber:
         if complete_session and session_id:
             self._complete_session(session_id)
 
+    def _warmup_detail_text(self) -> str:
+        phase = self._warmup_phase or "idle"
+        cam = dict(getattr(self._camera, "last_diag", {}) or {}) if self._camera else {}
+        mode = cam.get("exposure_mode") or ""
+        if phase == "ae_settle":
+            return "硬件连续自动曝光收敛中"
+        if phase == "software_calib":
+            return "自动曝光不可用，正在软件校准固定曝光"
+        if phase == "model_warmup":
+            if mode == "software_fallback":
+                return "曝光已锁定，模型预热中"
+            if mode == "hardware_ae":
+                return "硬件自动曝光就绪，模型预热中"
+            return "模型与检测管线预热中"
+        if phase == "ready":
+            return "预热完成"
+        if phase == "opening":
+            return "正在打开相机"
+        return "系统预热中"
+
+    def _set_warmup_phase(self, phase: str) -> None:
+        with self._lock:
+            self._warmup_phase = phase
+            meta = dict(self.latest_meta or {})
+            meta["warmup_phase"] = phase
+            meta["warmup_detail"] = self._warmup_detail_text()
+            meta["warming_up"] = time.time() < float(self._warmup_until or 0.0)
+            meta["exposure_ready"] = bool(self._exposure_ready)
+            meta["models_warmed"] = bool(self._models_warmed)
+            self.latest_meta = meta
+
+    def _maybe_finish_warmup_early(self) -> None:
+        """End warmup before hard deadline once exposure + models are ready."""
+        with self._lock:
+            if not self.running:
+                return
+            now = time.time()
+            until = float(self._warmup_until or 0.0)
+            if now >= until:
+                return
+            started = float(self._warmup_started_at or 0.0)
+            min_sec = float(self._warmup_min_sec or 1.2)
+            if (now - started) < min_sec:
+                return
+            if not (self._exposure_ready and self._models_warmed):
+                return
+            self._warmup_until = now
+            self._warmup_phase = "ready"
+            meta = dict(self.latest_meta or {})
+            meta["warming_up"] = False
+            meta["warmup_phase"] = "ready"
+            meta["warmup_detail"] = "预热完成"
+            meta["warmup_early_exit"] = True
+            meta["exposure_ready"] = True
+            meta["models_warmed"] = True
+            self.latest_meta = meta
+
+    def _warmup_models_worker(self) -> None:
+        """Dummy YOLO/dlib passes in parallel with camera exposure settle/calib."""
+        try:
+            from detection.views import dlib_detector, yolo_detector
+
+            warm_ms: Dict[str, float] = {}
+            if yolo_detector is not None:
+                warm_ms["yolo"] = round(float(yolo_detector.warmup(runs=2)), 1)
+            if dlib_detector is not None:
+                warm_ms["dlib"] = round(float(dlib_detector.warmup()), 1)
+            with self._lock:
+                meta = dict(self.latest_meta or {})
+                timing = dict(meta.get("timing") or {})
+                timing["model_warmup_ms"] = warm_ms
+                meta["timing"] = timing
+                self.latest_meta = meta
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                meta = dict(self.latest_meta or {})
+                meta["model_warmup_error"] = str(exc)
+                self.latest_meta = meta
+        finally:
+            with self._lock:
+                self._models_warmed = True
+            if self._exposure_ready:
+                self._set_warmup_phase("ready")
+            elif self._warmup_phase in ("ae_settle", "software_calib", "opening"):
+                pass
+            else:
+                self._set_warmup_phase("model_warmup")
+            self._maybe_finish_warmup_early()
+
     def status(self) -> Dict[str, Any]:
         """Read-only status snapshot (no tracker side effects)."""
         with self._lock:
@@ -228,6 +328,11 @@ class MvsGrabber:
                     # Keep camera health during warmup so black-stream is visible early
                     "camera": meta.get("camera"),
                     "camera_warning": meta.get("camera_warning"),
+                    "warmup_phase": meta.get("warmup_phase") or self._warmup_phase,
+                    "warmup_detail": meta.get("warmup_detail") or self._warmup_detail_text(),
+                    "exposure_ready": bool(self._exposure_ready),
+                    "models_warmed": bool(self._models_warmed),
+                    "exposure_calibrating": bool(meta.get("exposure_calibrating")),
                 }
             return {
                 "running": self.running,
@@ -237,6 +342,7 @@ class MvsGrabber:
                 "has_frame": self.latest_jpeg is not None,
                 "warming_up": warming,
                 "warmup_remaining_sec": round(remain, 1),
+                "warmup_phase": meta.get("warmup_phase") if warming else "ready",
             }
 
     def get_jpeg(self) -> Optional[bytes]:
@@ -307,36 +413,134 @@ class MvsGrabber:
             return None
         return buf.tobytes()
 
+    def _publish_preview_frame(self, frame: np.ndarray, extra_meta: Optional[Dict[str, Any]] = None) -> None:
+        jpeg = self._encode_preview_jpeg(frame)
+        with self._lock:
+            self._latest_bgr = frame
+            self._frame_seq += 1
+            if jpeg:
+                self.latest_jpeg = jpeg
+            self.error = None
+            try:
+                cam_diag = dict(getattr(self._camera, "last_diag", {}) or {})
+                meta = dict(self.latest_meta or {})
+                meta["camera"] = cam_diag
+                if extra_meta:
+                    meta.update(extra_meta)
+                mean = float(cam_diag.get("mean") or cam_diag.get("calib_mean") or 0)
+                if mean < 3.0 and not cam_diag.get("fixed_exposure"):
+                    meta["camera_warning"] = (
+                        "画面过暗(mean=%.1f, %s)。请确认镜头盖已开、补光/曝光，"
+                        "并关闭 MVS 客户端独占预览。"
+                        % (
+                            mean,
+                            "黑白" if cam_diag.get("is_mono") else "彩色",
+                        )
+                    )
+                else:
+                    meta.pop("camera_warning", None)
+                self.latest_meta = meta
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _prepare_exposure_during_warmup(self) -> None:
+        """
+        Prefer Continuous AE/AG settle; software fixed exposure is fallback only
+        when those GenICam commands fail or hardware AE stays too dark.
+        """
+        with self._lock:
+            if self._exposure_ready:
+                return
+            cam = self._camera
+            warmup_until = float(self._warmup_until or 0.0)
+
+        if cam is None:
+            return
+
+        remain = max(0.0, warmup_until - time.time())
+        # Cap exposure work so model warmup (parallel) keeps wall-clock share.
+        budget = min(max(0.6, remain * 0.55), 2.8)
+
+        def _on_frame(frame: np.ndarray, calibrating: bool) -> None:
+            self._publish_preview_frame(
+                frame,
+                {
+                    "warming_up": True,
+                    "exposure_calibrating": calibrating,
+                    "warmup_phase": self._warmup_phase,
+                    "warmup_detail": self._warmup_detail_text(),
+                },
+            )
+
+        diag = dict(getattr(cam, "last_diag", {}) or {})
+        ae_ok = bool(diag.get("ae"))
+        try:
+            if ae_ok:
+                self._set_warmup_phase("ae_settle")
+                diag = cam.settle_hardware_ae(
+                    budget_sec=budget,
+                    target_mean=90.0,
+                    timeout_ms=300,
+                    on_frame=lambda f: _on_frame(f, False),
+                )
+                if diag.get("needs_software_fallback"):
+                    left = max(0.5, warmup_until - time.time())
+                    self._set_warmup_phase("software_calib")
+                    diag = cam.calibrate_fixed_exposure(
+                        budget_sec=min(left, 2.2),
+                        target_mean=105.0,
+                        timeout_ms=300,
+                        on_frame=lambda f: _on_frame(f, True),
+                    )
+                    diag["exposure_fallback_reason"] = "hardware_ae_too_dark"
+            else:
+                self._set_warmup_phase("software_calib")
+                diag = cam.calibrate_fixed_exposure(
+                    budget_sec=budget,
+                    target_mean=105.0,
+                    timeout_ms=300,
+                    on_frame=lambda f: _on_frame(f, True),
+                )
+                diag["exposure_fallback_reason"] = "ae_ag_unsupported"
+        except Exception as exc:  # noqa: BLE001
+            diag = dict(getattr(cam, "last_diag", {}) or {})
+            diag["calib_error"] = str(exc)
+
+        with self._lock:
+            self._exposure_ready = True
+            meta = dict(self.latest_meta or {})
+            meta["camera"] = diag
+            meta["exposure_calibrating"] = False
+            meta["exposure_ready"] = True
+            self.latest_meta = meta
+
+        if self._models_warmed:
+            self._set_warmup_phase("ready")
+        else:
+            self._set_warmup_phase("model_warmup")
+        self._maybe_finish_warmup_early()
+
     def _grab_loop(self) -> None:
+        # Camera exposure phase (hardware AE settle or software fallback)
+        try:
+            self._prepare_exposure_during_warmup()
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self.error = str(exc)
+                self._exposure_ready = True
+            self._maybe_finish_warmup_early()
+
         while not self._stop.is_set():
             try:
                 frame = self._camera.get_bgr_frame(timeout_ms=500)
-                jpeg = self._encode_preview_jpeg(frame)
-                with self._lock:
-                    self._latest_bgr = frame
-                    self._frame_seq += 1
-                    if jpeg:
-                        self.latest_jpeg = jpeg
-                    self.error = None
-                    # Surface live camera health for UI / field debug
-                    try:
-                        cam_diag = dict(getattr(self._camera, "last_diag", {}) or {})
-                        meta = dict(self.latest_meta or {})
-                        meta["camera"] = cam_diag
-                        if float(cam_diag.get("mean") or 0) < 3.0:
-                            meta["camera_warning"] = (
-                                "画面过暗(mean=%.1f, %s)。请确认镜头盖已开、补光/曝光，"
-                                "并关闭 MVS 客户端独占预览。"
-                                % (
-                                    float(cam_diag.get("mean") or 0),
-                                    "黑白" if cam_diag.get("is_mono") else "彩色",
-                                )
-                            )
-                        else:
-                            meta.pop("camera_warning", None)
-                        self.latest_meta = meta
-                    except Exception:  # noqa: BLE001
-                        pass
+                self._publish_preview_frame(frame)
+                # Real frames also count toward model readiness via detect/ear loops
+                if (not self._models_warmed) and self._exposure_ready:
+                    # Keep phase visible until dummy model warm finishes
+                    if self._warmup_phase != "model_warmup" and time.time() < float(
+                        self._warmup_until or 0.0
+                    ):
+                        self._set_warmup_phase("model_warmup")
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self.error = str(exc)
@@ -706,7 +910,26 @@ class MvsGrabber:
                         meta["scheduler"] = compute_scheduler.snapshot()
                     except Exception:  # noqa: BLE001
                         meta["scheduler"] = prev.get("scheduler")
+                    # Preserve warmup / camera health fields written by grab loop
+                    for k in (
+                        "camera",
+                        "camera_warning",
+                        "warmup_phase",
+                        "warmup_detail",
+                        "exposure_ready",
+                        "models_warmed",
+                        "exposure_calibrating",
+                        "warmup_early_exit",
+                    ):
+                        if k in prev and k not in meta:
+                            meta[k] = prev[k]
+                    still_warming = time.time() < float(self._warmup_until or 0.0)
+                    meta["warming_up"] = still_warming
+                    meta["exposure_ready"] = bool(self._exposure_ready)
+                    meta["models_warmed"] = bool(self._models_warmed)
                     self.latest_meta = meta
+                if in_warmup:
+                    self._maybe_finish_warmup_early()
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self.error = str(exc)

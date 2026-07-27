@@ -443,14 +443,16 @@ def start_detection(request):
                     yolo_detector.load_config()
                 if dlib_detector is not None:
                     dlib_detector.load_config()
-                # Cold-start warmup: first real frames otherwise spike for seconds
-                warm_ms = {}
-                if yolo_detector is not None:
-                    warm_ms['yolo'] = round(yolo_detector.warmup(runs=2), 1)
-                if dlib_detector is not None:
-                    warm_ms['dlib'] = round(dlib_detector.warmup(), 1)
-                if warm_ms:
-                    _safe_log(f"detector warmup ms: {warm_ms}")
+                # Browser cold-start warmup only. MVS path warms YOLO/dlib inside
+                # the existing 5s startup window (alongside exposure calibration).
+                if source_type != 'mvs':
+                    warm_ms = {}
+                    if yolo_detector is not None:
+                        warm_ms['yolo'] = round(yolo_detector.warmup(runs=2), 1)
+                    if dlib_detector is not None:
+                        warm_ms['dlib'] = round(dlib_detector.warmup(), 1)
+                    if warm_ms:
+                        _safe_log(f"detector warmup ms: {warm_ms}")
             except Exception:  # noqa: BLE001
                 pass
 
