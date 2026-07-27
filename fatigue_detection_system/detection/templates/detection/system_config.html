@@ -260,8 +260,8 @@
                                 <label class="col-md-4 col-form-label">YOLO全局置信度</label>
                                 <div class="col-md-8">
                                     <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_thresh" 
-                                           class="form-control" value="{{ configs.yolo_conf_thresh|default:'0.3' }}">
-                                    <div class="form-text">黑白工业相机建议 0.25–0.35；过低可能误报</div>
+                                           class="form-control" value="{{ configs.yolo_conf_thresh|default:'0.28' }}">
+                                    <div class="form-text">工业相机（彩色/黑白）建议 0.25–0.30；过低可能误报</div>
                                 </div>
                             </div>
 
@@ -271,15 +271,15 @@
                                     <div class="row g-2">
                                         <div class="col-3">
                                             <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_smoke"
-                                                   class="form-control" value="{{ configs.yolo_conf_smoke|default:'0.2' }}" title="smoke">
+                                                   class="form-control" value="{{ configs.yolo_conf_smoke|default:'0.18' }}" title="smoke">
                                         </div>
                                         <div class="col-3">
                                             <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_phone"
-                                                   class="form-control" value="{{ configs.yolo_conf_phone|default:'0.25' }}" title="phone">
+                                                   class="form-control" value="{{ configs.yolo_conf_phone|default:'0.22' }}" title="phone">
                                         </div>
                                         <div class="col-3">
                                             <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_water"
-                                                   class="form-control" value="{{ configs.yolo_conf_water|default:'0.25' }}" title="water">
+                                                   class="form-control" value="{{ configs.yolo_conf_water|default:'0.22' }}" title="water">
                                         </div>
                                         <div class="col-3">
                                             <input type="number" step="0.05" min="0.05" max="0.95" name="config_yolo_conf_face"
@@ -302,8 +302,8 @@
                                 <label class="col-md-4 col-form-label">YOLO imgsz</label>
                                 <div class="col-md-8">
                                     <input type="number" step="32" min="320" max="1280" name="config_yolo_imgsz"
-                                           class="form-control" value="{{ configs.yolo_imgsz|default:'640' }}">
-                                    <div class="form-text">推理输入边长；小目标可试 960</div>
+                                           class="form-control" value="{{ configs.yolo_imgsz|default:'960' }}">
+                                    <div class="form-text">推理输入边长；小目标（烟/手机）建议 960，仍漏可试 1280</div>
                                 </div>
                             </div>
 
@@ -311,8 +311,17 @@
                                 <label class="col-md-4 col-form-label">检测最大宽度</label>
                                 <div class="col-md-8">
                                     <input type="number" step="80" min="640" max="2560" name="config_yolo_detect_max_width"
-                                           class="form-control" value="{{ configs.yolo_detect_max_width|default:'960' }}">
-                                    <div class="form-text">工业相机送入 YOLO 前的缩放上限；过大易卡顿，建议 960</div>
+                                           class="form-control" value="{{ configs.yolo_detect_max_width|default:'1280' }}">
+                                    <div class="form-text">送入 YOLO 前的缩放上限（与预览解耦）；GigE 建议 1280</div>
+                                </div>
+                            </div>
+
+                            <div class="row mb-3">
+                                <label class="col-md-4 col-form-label">贴脸距离系数</label>
+                                <div class="col-md-8">
+                                    <input type="number" step="0.1" min="0.5" max="3.0" name="config_yolo_near_face_ratio"
+                                           class="form-control" value="{{ configs.yolo_near_face_ratio|default:'1.5' }}">
+                                    <div class="form-text">行为框中心相对人脸对角线的最大距离；越大越不易被几何过滤</div>
                                 </div>
                             </div>
 
@@ -322,7 +331,7 @@
                                     <div class="form-check form-switch mt-2">
                                         <input class="form-check-input" type="checkbox" name="config_yolo_spatial_filter"
                                                value="true" id="yoloSpatialFilter" {% if configs.yolo_spatial_filter != 'false' %}checked{% endif %}>
-                                        <label class="form-check-label" for="yoloSpatialFilter">行为框须靠近人脸（降误报）</label>
+                                        <label class="form-check-label" for="yoloSpatialFilter">行为框须靠近人脸（降误报；漏检时可暂关）</label>
                                     </div>
                                 </div>
                             </div>

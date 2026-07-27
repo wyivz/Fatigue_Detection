@@ -122,42 +122,41 @@ class YOLODetector:
         from detection.utils.compute_scheduler import compute_scheduler
         from detection.utils.config_cache import get_configs
 
-        self.conf_thresh = 0.5
+        self.conf_thresh = 0.28
         self.iou_thresh = 0.5
-        self.imgsz = 640
-        self._imgsz_from_config = False
+        self.imgsz = 960
+        self._imgsz_from_config = True
         self.device = "cpu"
         # Per-class floors (applied after global conf)
         self.conf_face = 0.35
-        self.conf_smoke = 0.2
-        self.conf_phone = 0.25
-        self.conf_water = 0.25
+        self.conf_smoke = 0.18
+        self.conf_phone = 0.22
+        self.conf_water = 0.22
         self.spatial_filter = True
-        self.near_face_ratio = 1.2  # max center distance in face-diag units
+        self.near_face_ratio = 1.5  # max center distance in face-diag units
 
         try:
             configs = get_configs(force=True)
             compute_scheduler.configure(configs)
-            self.conf_thresh = _cfg_float(configs, "yolo_conf_thresh", 0.5)
+            self.conf_thresh = _cfg_float(configs, "yolo_conf_thresh", 0.28)
             self.iou_thresh = _cfg_float(configs, "yolo_iou_thresh", 0.5)
             if "yolo_imgsz" in configs and str(configs.get("yolo_imgsz", "")).strip():
-                self.imgsz = max(320, _cfg_int(configs, "yolo_imgsz", 640))
-                self._imgsz_from_config = True
+                self.imgsz = max(320, _cfg_int(configs, "yolo_imgsz", 960))
             else:
-                self.imgsz = 640
-                self._imgsz_from_config = False
+                self.imgsz = 960
+            self._imgsz_from_config = True
             self.device = configs.get("device") or "cpu"
             self.conf_face = _cfg_float(configs, "yolo_conf_face", max(self.conf_thresh, 0.35))
-            self.conf_smoke = _cfg_float(configs, "yolo_conf_smoke", min(self.conf_thresh, 0.2))
-            self.conf_phone = _cfg_float(configs, "yolo_conf_phone", min(self.conf_thresh, 0.25))
-            self.conf_water = _cfg_float(configs, "yolo_conf_water", min(self.conf_thresh, 0.25))
+            self.conf_smoke = _cfg_float(configs, "yolo_conf_smoke", min(self.conf_thresh, 0.18))
+            self.conf_phone = _cfg_float(configs, "yolo_conf_phone", min(self.conf_thresh, 0.22))
+            self.conf_water = _cfg_float(configs, "yolo_conf_water", min(self.conf_thresh, 0.22))
             self.spatial_filter = str(configs.get("yolo_spatial_filter", "true")).lower() in (
                 "1",
                 "true",
                 "yes",
                 "on",
             )
-            self.near_face_ratio = _cfg_float(configs, "yolo_near_face_ratio", 1.2)
+            self.near_face_ratio = _cfg_float(configs, "yolo_near_face_ratio", 1.5)
             print(
                 f"已加载YOLO配置: conf={self.conf_thresh}, iou={self.iou_thresh}, "
                 f"imgsz={self.imgsz}, device={self.device}, spatial={self.spatial_filter}"
@@ -191,9 +190,12 @@ class YOLODetector:
         """Run inference under YOLO thread quota; CUDA uses FP16 when enabled."""
         from detection.utils.compute_scheduler import compute_scheduler
 
-        kwargs = {"verbose": False}
-        if getattr(self, "_imgsz_from_config", False):
-            kwargs["imgsz"] = int(self.imgsz)
+        kwargs = {
+            "verbose": False,
+            "conf": float(self.conf_thresh),
+            "iou": float(self.iou_thresh),
+            "imgsz": int(self.imgsz or 960),
+        }
 
         with compute_scheduler.yolo_context() as plan:
             if plan.use_cuda:
@@ -207,7 +209,8 @@ class YOLODetector:
         """Run dummy inferences so first real frame is not a cold-start spike."""
         import time as _time
 
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        side = int(self.imgsz or 960)
+        dummy = np.zeros((side, side, 3), dtype=np.uint8)
         t0 = _time.perf_counter()
         for _ in range(max(1, int(runs))):
             try:
@@ -340,21 +343,20 @@ class YOLODetector:
         if dist > max_dist:
             return False, f"far_face dist={dist:.0f}>{max_dist:.0f}"
 
-        # Phone: prefer lateral (cheek / ear), allow either side
+        # Phone: prefer lateral (cheek / ear), allow either side; soft vertical band
         if cls_id == 2:
-            lateral = abs(dc[0] - fc[0]) >= 0.15 * face_w
-            vertical_ok = abs(dc[1] - fc[1]) <= 0.75 * face_h
+            lateral = abs(dc[0] - fc[0]) >= 0.12 * face_w
+            vertical_ok = abs(dc[1] - fc[1]) <= 0.9 * face_h
             if not (lateral or vertical_ok):
                 return False, "phone_not_near_ear"
             return True, "ok"
 
-        # Smoke / water: prefer lower face (mouth)
+        # Smoke / water: prefer lower face (mouth); keep soft so side angles survive
         if cls_id in (1, 3):
             mouth_y = fy1 + 0.65 * face_h
-            if dc[1] < fy1 + 0.25 * face_h:
+            if dc[1] < fy1 + 0.15 * face_h:
                 return False, "above_face"
-            # Soft preference — still accept if close enough overall
-            if abs(dc[1] - mouth_y) > 0.9 * face_h and dist > 0.6 * diag:
+            if abs(dc[1] - mouth_y) > 1.1 * face_h and dist > 0.75 * diag:
                 return False, "not_near_mouth"
             return True, "ok"
 

@@ -1331,11 +1331,23 @@
         if (Array.isArray(dbg.filtered_out) && dbg.filtered_out.length) {
             filterHint = dbg.filtered_out.slice(0, 3).map(f => `${f.class_name}:${f.reason || ''}`).join('; ');
         }
+        let diagHint = '';
+        const hasRawBehavior = [top.smoke, top.phone, top.water].some(v => v != null && Number(v) > 0);
+        if (!hasRawBehavior) {
+            diagHint = '提示：YOLO 几乎无行为框 → 优先降 conf / 提高 imgsz 与检测宽度';
+        } else if (filterHint) {
+            diagHint = '提示：有框但被几何过滤 → 可放宽贴脸距离或临时关闭贴脸过滤';
+        } else if ((prog.smoking && prog.smoking.hits < prog.smoking.need) ||
+                   (prog.phone && prog.phone.hits < prog.phone.need) ||
+                   (prog.drinking && prog.drinking.hits < prog.drinking.need)) {
+            diagHint = '提示：有检出但确认未满 → 可降低行为确认帧数或缩短检测间隔';
+        }
         detailsHTML += `<div class="result-item">
             <div class="small text-muted">
                 YOLO raw conf 烟/话/水/脸: ${fmtConf(top.smoke)} / ${fmtConf(top.phone)} / ${fmtConf(top.water)} / ${fmtConf(top.face)}
                 <br>确认进度 烟/话/水: ${fmtProg('smoking')} | ${fmtProg('phone')} | ${fmtProg('drinking')}
                 ${filterHint ? `<br>已过滤: ${filterHint}` : ''}
+                ${diagHint ? `<br><span class="text-warning">${diagHint}</span>` : ''}
             </div>
         </div>`;
         

@@ -36,7 +36,7 @@ class MvsGrabber:
         self._interval_ms = 500
         self._ear_interval_ms = 100
         self._preview_max_width = 960
-        self._detect_max_width = 960
+        self._detect_max_width = 1280
         self._preview_jpeg_quality = 70
         self._latest_bgr: Optional[np.ndarray] = None
         self._latest_face_bbox: Optional[List[int]] = None
@@ -112,9 +112,9 @@ class MvsGrabber:
             except Exception:  # noqa: BLE001
                 pass
             try:
-                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 960))))
+                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 1280))))
             except (TypeError, ValueError):
-                self._detect_max_width = 960
+                self._detect_max_width = 1280
             self._last_fatigue_level = 0
             self._last_yawn = False
             self._event_save_cooldown_until = 0.0
