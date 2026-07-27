@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -35,13 +35,22 @@ class MvsGrabber:
         self._user_id: Optional[int] = None
         self._interval_ms = 500
         self._ear_interval_ms = 100
-        self._preview_max_width = 960
-        self._detect_max_width = 1280
+        self._preview_max_width = 1280
+        self._detect_max_width = 960
         self._preview_jpeg_quality = 70
         self._latest_bgr: Optional[np.ndarray] = None
         self._latest_face_bbox: Optional[List[int]] = None
         self._latest_face_bboxes: List[List[int]] = []
         self._latest_faces_meta: List[Dict[str, Any]] = []
+        # Landmarks always stored in full-frame coordinates for correct overlay
+        self._latest_landmarks = None
+        self._latest_landmarks_size: Optional[Tuple[int, int]] = None
+        self._latest_landmark_faces: List[Dict[str, Any]] = []
+        # Primary-face hold + EMA (full-frame coords)
+        self._face_ema_bbox: Optional[List[float]] = None
+        self._face_hold_until: float = 0.0
+        self._face_miss_hold_sec: float = 1.5
+        self._face_ema_alpha: float = 0.35  # higher = follow detections faster
         self._frame_seq = 0
         self._detect_busy = False
         self._timing_avg: Dict[str, float] = {}
@@ -91,6 +100,11 @@ class MvsGrabber:
             self._latest_face_bbox = None
             self._latest_face_bboxes = []
             self._latest_faces_meta = []
+            self._latest_landmarks = None
+            self._latest_landmarks_size = None
+            self._latest_landmark_faces = []
+            self._face_ema_bbox = None
+            self._face_hold_until = 0.0
             self._frame_seq = 0
             self._timing_avg = {}
             self._session_id = session_id
@@ -112,9 +126,9 @@ class MvsGrabber:
             except Exception:  # noqa: BLE001
                 pass
             try:
-                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 1280))))
+                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 960))))
             except (TypeError, ValueError):
-                self._detect_max_width = 1280
+                self._detect_max_width = 960
             self._last_fatigue_level = 0
             self._last_yawn = False
             self._event_save_cooldown_until = 0.0
@@ -138,6 +152,13 @@ class MvsGrabber:
             behavior_tracker.reset(session_id)
             fatigue_tracker.configure(session_id, configs)
             behavior_tracker.configure(session_id, configs)
+            try:
+                from detection.views import yolo_detector
+
+                if yolo_detector is not None:
+                    yolo_detector._sticky_primary_bbox = None
+            except Exception:  # noqa: BLE001
+                pass
 
             cam = HikCamera()
             if camera_ip:
@@ -211,6 +232,11 @@ class MvsGrabber:
             self._latest_face_bbox = None
             self._latest_face_bboxes = []
             self._latest_faces_meta = []
+            self._latest_landmarks = None
+            self._latest_landmarks_size = None
+            self._latest_landmark_faces = []
+            self._face_ema_bbox = None
+            self._face_hold_until = 0.0
             session_id = self._session_id
             self._session_id = None
         if session_id is not None:
@@ -402,8 +428,132 @@ class MvsGrabber:
         nh = int(h * (max_w / float(w)))
         return cv2.resize(frame, (max_w, nh), interpolation=cv2.INTER_AREA)
 
+    @staticmethod
+    def _ema_bbox(prev: Optional[List[float]], new_box: List[int], alpha: float) -> List[float]:
+        nb = [float(v) for v in new_box]
+        if prev is None or len(prev) != 4:
+            return nb
+        a = max(0.05, min(1.0, float(alpha)))
+        return [a * nb[i] + (1.0 - a) * float(prev[i]) for i in range(4)]
+
+    @staticmethod
+    def _bbox_i(box: Optional[List[float]]) -> Optional[List[int]]:
+        if box is None or len(box) != 4:
+            return None
+        return [int(round(v)) for v in box]
+
+    def _update_tracked_faces(
+        self,
+        primary_full: Optional[List[int]],
+        all_full: List[List[int]],
+    ) -> None:
+        """
+        EMA-smooth primary face and hold last box across brief YOLO misses.
+        Must be called with self._lock held.
+        """
+        now = time.time()
+        if primary_full is not None:
+            self._face_ema_bbox = self._ema_bbox(
+                self._face_ema_bbox, primary_full, self._face_ema_alpha
+            )
+            self._face_hold_until = now + float(self._face_miss_hold_sec)
+            smoothed = self._bbox_i(self._face_ema_bbox)
+            self._latest_face_bbox = smoothed
+            # Keep primary first; drop near-duplicates of primary from others
+            others = []
+            for b in all_full:
+                if smoothed is None:
+                    others.append(b)
+                    continue
+                try:
+                    # crude IoU-ish: skip boxes that heavily overlap primary
+                    ix1 = max(smoothed[0], b[0])
+                    iy1 = max(smoothed[1], b[1])
+                    ix2 = min(smoothed[2], b[2])
+                    iy2 = min(smoothed[3], b[3])
+                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                    area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+                    if inter / float(area_b) < 0.55:
+                        others.append(b)
+                except Exception:  # noqa: BLE001
+                    others.append(b)
+            self._latest_face_bboxes = ([smoothed] if smoothed else []) + others[:6]
+            return
+
+        # Miss: hold smoothed primary for a short window
+        if self._face_ema_bbox is not None and now <= float(self._face_hold_until or 0.0):
+            held = self._bbox_i(self._face_ema_bbox)
+            self._latest_face_bbox = held
+            self._latest_face_bboxes = [held] if held else []
+            return
+
+        self._face_ema_bbox = None
+        self._face_hold_until = 0.0
+        self._latest_face_bbox = None
+        self._latest_face_bboxes = []
+
+    def _annotate_preview(self, preview: np.ndarray, full_wh: Tuple[int, int]) -> np.ndarray:
+        """Draw primary face box + 68 landmarks onto preview (full-frame coords)."""
+        try:
+            from detection.views import dlib_detector
+        except Exception:  # noqa: BLE001
+            dlib_detector = None
+
+        with self._lock:
+            primary = (
+                None
+                if self._latest_face_bbox is None
+                else list(self._latest_face_bbox)
+            )
+            lm = self._latest_landmarks
+            lm_size = self._latest_landmarks_size
+            lm_faces = list(self._latest_landmark_faces or [])
+
+        ph, pw = preview.shape[:2]
+        fw, fh = int(full_wh[0]), int(full_wh[1])
+        if fw <= 0 or fh <= 0:
+            return preview
+
+        def _map_xy(x: float, y: float) -> Tuple[int, int]:
+            return int(round(x * pw / float(fw))), int(round(y * ph / float(fh)))
+
+        # Primary face only — avoid side false-positives flashing
+        if primary is not None:
+            try:
+                x1, y1, x2, y2 = [int(v) for v in primary]
+                cv2.rectangle(preview, _map_xy(x1, y1), _map_xy(x2, y2), (0, 220, 0), 2)
+            except (TypeError, ValueError):
+                pass
+
+        if dlib_detector is not None:
+            primary_ent = None
+            for ent in lm_faces:
+                if ent.get("is_primary"):
+                    primary_ent = ent
+                    break
+            if primary_ent is None and lm_faces:
+                primary_ent = lm_faces[0]
+            if primary_ent is not None and primary_ent.get("landmarks") is not None:
+                dlib_detector.draw_landmarks(
+                    preview,
+                    primary_ent["landmarks"],
+                    landmarks_size=(fw, fh),
+                    color=(0, 255, 0),
+                )
+            elif lm is not None:
+                src = lm_size if lm_size is not None else (fw, fh)
+                dlib_detector.draw_landmarks(
+                    preview, lm, landmarks_size=src, color=(0, 255, 0)
+                )
+        return preview
+
     def _encode_preview_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
+        fh, fw = frame.shape[:2]
         preview = self._resize_for_preview(frame)
+        try:
+            preview = self._annotate_preview(preview, (fw, fh))
+        except Exception:  # noqa: BLE001
+            pass
         ok, buf = cv2.imencode(
             ".jpg",
             preview,
@@ -530,9 +680,11 @@ class MvsGrabber:
                 self._exposure_ready = True
             self._maybe_finish_warmup_early()
 
+        nodata_streak = 0
         while not self._stop.is_set():
             try:
                 frame = self._camera.get_bgr_frame(timeout_ms=500)
+                nodata_streak = 0
                 self._publish_preview_frame(frame)
                 # Real frames also count toward model readiness via detect/ear loops
                 if (not self._models_warmed) and self._exposure_ready:
@@ -542,8 +694,30 @@ class MvsGrabber:
                     ):
                         self._set_warmup_phase("model_warmup")
             except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
                 with self._lock:
-                    self.error = str(exc)
+                    self.error = msg
+                # Sustained GigE NODATA → bump SCPD / shrink ROI / restart stream
+                if "0x80000007" in msg or "NODATA" in msg.upper():
+                    nodata_streak += 1
+                    if nodata_streak in (3, 8, 15) and self._camera is not None:
+                        try:
+                            self._camera.recover_stream(tighten_roi=(nodata_streak >= 8))
+                            with self._lock:
+                                meta = dict(self.latest_meta or {})
+                                meta["camera"] = dict(
+                                    getattr(self._camera, "last_diag", {}) or {}
+                                )
+                                meta["camera_warning"] = (
+                                    "工业相机取流中断，已自动恢复(SCPD/ROI)。"
+                                    "若仍黑屏请关闭 MVS 客户端独占预览。"
+                                )
+                                self.latest_meta = meta
+                        except Exception as rec_exc:  # noqa: BLE001
+                            with self._lock:
+                                self.error = "%s | recover: %s" % (msg, rec_exc)
+                else:
+                    nodata_streak = 0
                 if self._stop.wait(0.05):
                     break
 
@@ -564,7 +738,8 @@ class MvsGrabber:
                 face_bbox = (
                     None if self._latest_face_bbox is None else list(self._latest_face_bbox)
                 )
-                face_bboxes = [list(b) for b in (self._latest_face_bboxes or [])]
+                # Stick to primary only — secondary YOLO faces cause landmark "jumps"
+                face_bboxes = [list(face_bbox)] if face_bbox is not None else []
                 detect_busy = bool(self._detect_busy)
                 in_warmup = time.time() < float(self._warmup_until or 0.0)
 
@@ -652,6 +827,10 @@ class MvsGrabber:
                                 "faces": [],
                             }
                             ear_cost = (time.perf_counter() - t_ear) * 1000.0
+                            with self._lock:
+                                self._latest_landmarks = None
+                                self._latest_landmarks_size = None
+                                self._latest_landmark_faces = []
                         else:
                             dlib_results = dlib_detector.detect_fatigue_multi(
                                 sample,
@@ -676,10 +855,41 @@ class MvsGrabber:
                         if faces_n <= 0 and scaled_boxes:
                             faces_n = 1 if dlib_results.get("landmarks") is not None else 0
 
+                        # Remap landmarks/bboxes from EAR sample → full frame so
+                        # preview / persist overlays stay aligned with the camera image.
                         lm = dlib_results.get("landmarks")
+                        face_entries = list(dlib_results.get("faces") or [])
                         lm_size = None
-                        if lm is not None:
-                            lm_size = (int(sw), int(sh))
+                        if lm is not None or face_entries:
+                            lm_size = (int(fw), int(fh))
+                            if sw != fw or sh != fh:
+                                if lm is not None:
+                                    lm = dlib_detector.scale_landmarks(
+                                        lm, (sw, sh), (fw, fh)
+                                    )
+                                remapped = []
+                                for ent in face_entries:
+                                    e = dict(ent)
+                                    if e.get("landmarks") is not None:
+                                        e["landmarks"] = dlib_detector.scale_landmarks(
+                                            e["landmarks"], (sw, sh), (fw, fh)
+                                        )
+                                    bb = e.get("bbox")
+                                    if bb is not None:
+                                        try:
+                                            if abs(sx - 1.0) > 1e-6 or abs(sy - 1.0) > 1e-6:
+                                                e["bbox"] = [
+                                                    int(round(bb[0] / sx)),
+                                                    int(round(bb[1] / sy)),
+                                                    int(round(bb[2] / sx)),
+                                                    int(round(bb[3] / sy)),
+                                                ]
+                                            else:
+                                                e["bbox"] = [int(v) for v in bb]
+                                        except (TypeError, ValueError, ZeroDivisionError):
+                                            pass
+                                    remapped.append(e)
+                                face_entries = remapped
 
                         # Tracker / alerts: primary face only
                         snap = fatigue_tracker.update(
@@ -689,11 +899,11 @@ class MvsGrabber:
                             faces_detected=faces_n,
                             landmarks=lm,
                             landmarks_size=lm_size,
-                            faces=dlib_results.get("faces") or [],
+                            faces=face_entries,
                         )
 
                         faces_meta = []
-                        for ent in dlib_results.get("faces") or []:
+                        for ent in face_entries:
                             faces_meta.append(
                                 {
                                     "bbox": ent.get("bbox"),
@@ -716,6 +926,9 @@ class MvsGrabber:
                             self._last_fatigue_level = level
                             self._last_yawn = yawn
                             self._latest_faces_meta = faces_meta
+                            self._latest_landmarks = lm
+                            self._latest_landmarks_size = lm_size
+                            self._latest_landmark_faces = face_entries
 
                             meta = dict(self.latest_meta)
                             timing = dict(meta.get("timing") or {})
@@ -725,6 +938,8 @@ class MvsGrabber:
                                 {
                                     "eye_aspect_ratio": snap.eye_aspect_ratio,
                                     "mouth_aspect_ratio": dlib_results.get("mouth_aspect_ratio"),
+                                    "mouth_rel_open": dlib_results.get("mouth_rel_open"),
+                                    "yawn_raw": bool(dlib_results.get("yawn_detected")),
                                     "perclos": snap.perclos,
                                     "eye_closed_ms": snap.eye_closed_ms,
                                     "is_microsleep": snap.is_microsleep,
@@ -804,7 +1019,48 @@ class MvsGrabber:
                 )
                 # Do not write history during startup warmup window
                 if (not in_warmup) and (pending_event or behavior_hit or due_persist):
-                    result = persist_detection_snapshot(det_frame, session, result)
+                    # Persist on full frame so landmarks (full-frame coords) overlay correctly;
+                    # scale YOLO boxes from detect → full for drawing.
+                    persist_frame = frame
+                    persist_result = dict(result)
+                    try:
+                        fh, fw = frame.shape[:2]
+                        dh, dw = det_frame.shape[:2]
+                        if dw > 0 and dh > 0 and (dw != fw or dh != fh):
+                            sx_p = fw / float(dw)
+                            sy_p = fh / float(dh)
+
+                            def _up(b):
+                                if not b:
+                                    return b
+                                return [
+                                    int(b[0] * sx_p),
+                                    int(b[1] * sy_p),
+                                    int(b[2] * sx_p),
+                                    int(b[3] * sy_p),
+                                ]
+
+                            dets = []
+                            for d in persist_result.get("detections") or []:
+                                dd = dict(d)
+                                if dd.get("bbox") is not None:
+                                    dd["bbox"] = _up(dd["bbox"])
+                                dets.append(dd)
+                            persist_result["detections"] = dets
+                            if persist_result.get("face_bbox") is not None:
+                                persist_result["face_bbox"] = _up(
+                                    persist_result["face_bbox"]
+                                )
+                            if persist_result.get("face_bboxes"):
+                                persist_result["face_bboxes"] = [
+                                    _up(b) for b in persist_result["face_bboxes"]
+                                ]
+                    except Exception:  # noqa: BLE001
+                        persist_frame = det_frame
+                        persist_result = result
+                    result = persist_detection_snapshot(
+                        persist_frame, session, persist_result
+                    )
                     with self._lock:
                         self._last_persist_at = time.time()
                         self._pending_fatigue_event = False
@@ -857,22 +1113,15 @@ class MvsGrabber:
                         ]
 
                     if face_bbox is not None:
-                        self._latest_face_bbox = _to_full(face_bbox)
+                        primary_full = _to_full(face_bbox)
+                    else:
+                        primary_full = None
                     scaled_all = []
                     for b in face_bboxes:
                         fb = _to_full(b)
                         if fb is not None:
                             scaled_all.append(fb)
-                    if scaled_all:
-                        self._latest_face_bboxes = scaled_all
-                        if self._latest_face_bbox is None:
-                            self._latest_face_bbox = list(scaled_all[0])
-                    elif face_bbox is not None and self._latest_face_bbox is not None:
-                        self._latest_face_bboxes = [list(self._latest_face_bbox)]
-                    else:
-                        # No faces this frame — clear caches so EAR does not track ghosts
-                        self._latest_face_bboxes = []
-                        self._latest_face_bbox = None
+                    self._update_tracked_faces(primary_full, scaled_all)
 
                     prev = dict(self.latest_meta or {})
                     prev_timing = dict(prev.get("timing") or {})

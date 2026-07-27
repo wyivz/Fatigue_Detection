@@ -54,23 +54,37 @@ def _bbox_area(bbox: List[int]) -> float:
 def pick_primary_face(
     face_boxes: List[Dict[str, Any]],
     sticky_bbox: Optional[List[int]] = None,
-    iou_keep: float = 0.25,
-    area_switch_ratio: float = 1.35,
+    iou_keep: float = 0.12,
+    area_switch_ratio: float = 2.2,
+    frame_wh: Optional[Tuple[int, int]] = None,
+    center_bias: float = 0.35,
 ) -> Optional[Dict[str, Any]]:
     """
     Choose the primary monitored face when multiple faces appear.
 
-    Prefer the largest box, but keep the previous primary when IoU is decent
-    unless another face is clearly larger (area_switch_ratio).
+    Strong stickiness: keep the previous primary whenever IoU is still
+    reasonable. Only switch when another face is clearly larger AND the
+    sticky match is weak. With no sticky history, prefer large + centered.
     """
     if not face_boxes:
         return None
-    largest = max(
-        face_boxes,
-        key=lambda d: (_bbox_area(d["bbox"]), float(d.get("confidence") or 0.0)),
-    )
+
+    def _score(d: Dict[str, Any]) -> Tuple[float, float]:
+        area = _bbox_area(d["bbox"])
+        conf = float(d.get("confidence") or 0.0)
+        if frame_wh is None or frame_wh[0] <= 0 or frame_wh[1] <= 0:
+            return (area, conf)
+        cx, cy = _bbox_center(d["bbox"])
+        fw, fh = float(frame_wh[0]), float(frame_wh[1])
+        nx = abs(cx / fw - 0.5) * 2.0
+        ny = abs(cy / fh - 0.5) * 2.0
+        dist = min(1.0, (nx * nx + ny * ny) ** 0.5)
+        centered = 1.0 - dist
+        return (area * (1.0 + float(center_bias) * centered), conf)
+
+    best = max(face_boxes, key=_score)
     if sticky_bbox is None:
-        return largest
+        return best
 
     best_iou = -1.0
     sticky_match = None
@@ -79,12 +93,21 @@ def pick_primary_face(
         if iou > best_iou:
             best_iou = iou
             sticky_match = d
-    if sticky_match is None or best_iou < float(iou_keep):
-        return largest
 
-    # Stick unless another face is substantially larger
-    if _bbox_area(largest["bbox"]) >= _bbox_area(sticky_match["bbox"]) * float(area_switch_ratio):
-        return largest
+    # Lost sticky track entirely → fall back to best score
+    if sticky_match is None or best_iou < float(iou_keep):
+        return best
+
+    # Stick unless another face is substantially larger and overlap is weak
+    sticky_area = _bbox_area(sticky_match["bbox"])
+    best_area = _bbox_area(best["bbox"])
+    if (
+        sticky_match is not best
+        and sticky_area > 0
+        and best_area >= sticky_area * float(area_switch_ratio)
+        and best_iou < 0.45
+    ):
+        return best
     return sticky_match
 
 
@@ -122,12 +145,12 @@ class YOLODetector:
         from detection.utils.compute_scheduler import compute_scheduler
         from detection.utils.config_cache import get_configs
 
+        # Speed-first defaults (GigE CPU). Raise imgsz / detect width in config if recall needs it.
         self.conf_thresh = 0.28
         self.iou_thresh = 0.5
-        self.imgsz = 960
-        self._imgsz_from_config = True
+        self.imgsz = 640
         self.device = "cpu"
-        # Per-class floors (applied after global conf)
+        # Per-class floors (applied after model returns candidates)
         self.conf_face = 0.35
         self.conf_smoke = 0.18
         self.conf_phone = 0.22
@@ -141,15 +164,15 @@ class YOLODetector:
             self.conf_thresh = _cfg_float(configs, "yolo_conf_thresh", 0.28)
             self.iou_thresh = _cfg_float(configs, "yolo_iou_thresh", 0.5)
             if "yolo_imgsz" in configs and str(configs.get("yolo_imgsz", "")).strip():
-                self.imgsz = max(320, _cfg_int(configs, "yolo_imgsz", 960))
+                self.imgsz = max(320, _cfg_int(configs, "yolo_imgsz", 640))
             else:
-                self.imgsz = 960
-            self._imgsz_from_config = True
+                self.imgsz = 640
             self.device = configs.get("device") or "cpu"
-            self.conf_face = _cfg_float(configs, "yolo_conf_face", max(self.conf_thresh, 0.35))
-            self.conf_smoke = _cfg_float(configs, "yolo_conf_smoke", min(self.conf_thresh, 0.18))
-            self.conf_phone = _cfg_float(configs, "yolo_conf_phone", min(self.conf_thresh, 0.22))
-            self.conf_water = _cfg_float(configs, "yolo_conf_water", min(self.conf_thresh, 0.22))
+            # Per-class: use saved value as-is (0.01–0.95). Do NOT clamp to global conf.
+            self.conf_face = _cfg_float(configs, "yolo_conf_face", 0.35)
+            self.conf_smoke = _cfg_float(configs, "yolo_conf_smoke", 0.18)
+            self.conf_phone = _cfg_float(configs, "yolo_conf_phone", 0.22)
+            self.conf_water = _cfg_float(configs, "yolo_conf_water", 0.22)
             self.spatial_filter = str(configs.get("yolo_spatial_filter", "true")).lower() in (
                 "1",
                 "true",
@@ -159,13 +182,25 @@ class YOLODetector:
             self.near_face_ratio = _cfg_float(configs, "yolo_near_face_ratio", 1.5)
             print(
                 f"已加载YOLO配置: conf={self.conf_thresh}, iou={self.iou_thresh}, "
-                f"imgsz={self.imgsz}, device={self.device}, spatial={self.spatial_filter}"
+                f"imgsz={self.imgsz}, device={self.device}, spatial={self.spatial_filter}, "
+                f"floors=smoke:{self.conf_smoke}/phone:{self.conf_phone}/"
+                f"water:{self.conf_water}/face:{self.conf_face}"
             )
         except Exception as e:  # noqa: BLE001
             print(f"加载YOLO配置失败: {e}")
 
         if hasattr(self, "model") and self.model is not None:
             self._apply_runtime_params()
+
+    def _infer_conf(self) -> float:
+        """
+        YOLO/Ultralytics applies one conf before per-class floors.
+
+        Use the global threshold for inference speed. Per-class floors only
+        raise the bar in post-process (they cannot recover boxes below global).
+        Lowering infer conf to min(smoke, ...) caused heavy NMS / stutter.
+        """
+        return max(0.01, min(0.99, float(self.conf_thresh)))
 
     def _apply_runtime_params(self) -> None:
         from detection.utils.compute_scheduler import compute_scheduler
@@ -175,7 +210,7 @@ class YOLODetector:
         if plan.use_cuda:
             self.device = plan.device
         try:
-            self.model.conf = self.conf_thresh
+            self.model.conf = self._infer_conf()
             self.model.iou = self.iou_thresh
         except Exception:  # noqa: BLE001
             pass
@@ -190,11 +225,15 @@ class YOLODetector:
         """Run inference under YOLO thread quota; CUDA uses FP16 when enabled."""
         from detection.utils.compute_scheduler import compute_scheduler
 
+        # Match pre-regression path: global conf only; imgsz only when configured
+        # (or explicit default 640). Avoid ultra-low conf that balloons NMS cost.
         kwargs = {
             "verbose": False,
-            "conf": float(self.conf_thresh),
+            "conf": float(self._infer_conf()),
             "iou": float(self.iou_thresh),
-            "imgsz": int(self.imgsz or 960),
+            "imgsz": int(self.imgsz or 640),
+            # Cap candidates — low conf + GigE frames otherwise flood NMS on CPU
+            "max_det": 100,
         }
 
         with compute_scheduler.yolo_context() as plan:
@@ -209,7 +248,7 @@ class YOLODetector:
         """Run dummy inferences so first real frame is not a cold-start spike."""
         import time as _time
 
-        side = int(self.imgsz or 960)
+        side = int(self.imgsz or 640)
         dummy = np.zeros((side, side, 3), dtype=np.uint8)
         t0 = _time.perf_counter()
         for _ in range(max(1, int(runs))):
@@ -260,10 +299,11 @@ class YOLODetector:
             raw.append(det)
         processed_data["raw_detections"] = raw
 
-        # Per-class confidence floors
+        # Per-class confidence floors (raise-only vs global; cannot recover below infer conf)
         kept: List[Dict[str, Any]] = []
+        infer_floor = float(self._infer_conf())
         for det in raw:
-            floor = self._class_conf_floor(det["class_id"])
+            floor = max(infer_floor, float(self._class_conf_floor(det["class_id"])))
             if det["confidence"] < floor:
                 processed_data["filtered_out"].append(
                     {**det, "reason": f"conf<{floor:.2f}"}
@@ -272,9 +312,22 @@ class YOLODetector:
             kept.append(det)
 
         face_boxes = [d for d in kept if d["class_id"] == 0]
-        primary = pick_primary_face(face_boxes, sticky_bbox=self._sticky_primary_bbox)
+        frame_wh = None
+        try:
+            # ultralytics: orig_shape is (h, w)
+            oh, ow = results.orig_shape
+            frame_wh = (int(ow), int(oh))
+        except Exception:  # noqa: BLE001
+            frame_wh = None
+        primary = pick_primary_face(
+            face_boxes,
+            sticky_bbox=self._sticky_primary_bbox,
+            frame_wh=frame_wh,
+        )
         face_bbox = primary["bbox"] if primary is not None else None
-        self._sticky_primary_bbox = list(face_bbox) if face_bbox is not None else None
+        # Keep sticky across brief misses so the next hit re-locks the same face
+        if face_bbox is not None:
+            self._sticky_primary_bbox = list(face_bbox)
 
         final: List[Dict[str, Any]] = []
         for det in kept:
@@ -309,7 +362,12 @@ class YOLODetector:
             processed_data["detections"].append(det)
 
         processed_data["face_bbox"] = face_bbox
-        processed_data["face_bboxes"] = [d["bbox"] for d in face_boxes]
+        # Primary first so downstream EAR / preview prefer the sticky face
+        if face_bbox is not None:
+            others = [d["bbox"] for d in face_boxes if d is not primary]
+            processed_data["face_bboxes"] = [list(face_bbox)] + others
+        else:
+            processed_data["face_bboxes"] = [d["bbox"] for d in face_boxes]
         processed_data["face_count"] = len(face_boxes)
         processed_data["behavior_debug"] = {
             "raw_count": len(raw),

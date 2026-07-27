@@ -407,6 +407,135 @@ class HikCamera:
             self._bgr_buf = (c_ubyte * need)()
             self._bgr_capacity = need
 
+    @staticmethod
+    def _align_int(value: int, inc: int, lo: int, hi: int) -> int:
+        """Align value down to GenICam increment and clamp to [lo, hi]."""
+        inc = max(1, int(inc or 1))
+        lo = int(lo)
+        hi = int(hi)
+        v = int(value)
+        v = v - (v % inc)
+        if v < lo:
+            v = lo + ((inc - (lo % inc)) % inc)
+        if v > hi:
+            v = hi - (hi % inc)
+        return max(lo, min(hi, v))
+
+    def _apply_stream_roi(
+        self,
+        cam,
+        sdk,
+        max_width: int = 1920,
+        max_height: int = 1600,
+    ) -> None:
+        """
+        Cap GigE ROI for reliable realtime streaming while keeping a wide FOV.
+
+        Full 5MP (e.g. 2448x2048) can yield MV_E_NODATA on ordinary 1GbE.
+        Use a large centered ROI (default 1920x1600) so faces stay in frame;
+        detection still downscales independently.
+        """
+        wr = self._get_int_range(cam, sdk, "Width")
+        hr = self._get_int_range(cam, sdk, "Height")
+        if wr is None or hr is None:
+            return
+        _cw, wmin, wmax, winc = wr
+        _ch, hmin, hmax, hinc = hr
+        if wmax <= 0 or hmax <= 0:
+            return
+
+        target_w = min(int(max_width), int(wmax))
+        target_h = min(int(max_height), int(hmax))
+        # Prefer sensor aspect so the crop is a true window, not a stretched box
+        aspect_h = int(round(target_w * (float(hmax) / float(wmax))))
+        if aspect_h <= int(hmax):
+            target_h = min(target_h, aspect_h)
+
+        tw = self._align_int(target_w, winc, wmin, wmax)
+        th = self._align_int(target_h, hinc, hmin, hmax)
+
+        # Match target size (expand small leftover ROIs; shrink oversized full-sensor)
+        same = abs(int(_cw) - tw) <= int(winc) and abs(int(_ch) - th) <= int(hinc)
+        if same:
+            # Still re-center if offset drifted
+            oxr = self._get_int_range(cam, sdk, "OffsetX")
+            oyr = self._get_int_range(cam, sdk, "OffsetY")
+            if oxr is not None and oyr is not None:
+                ox = self._align_int(
+                    max(0, (int(wmax) - tw) // 2),
+                    int(oxr[3] or 1),
+                    int(oxr[1]),
+                    max(int(oxr[1]), int(oxr[2])),
+                )
+                oy = self._align_int(
+                    max(0, (int(hmax) - th) // 2),
+                    int(oyr[3] or 1),
+                    int(oyr[1]),
+                    max(int(oyr[1]), int(oyr[2])),
+                )
+                try:
+                    cam.MV_CC_SetIntValue("OffsetX", ox)
+                    cam.MV_CC_SetIntValue("OffsetY", oy)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.last_diag["stream_roi"] = "%sx%s (target)" % (tw, th)
+            return
+
+        # Offsets must be zero before changing Width/Height on many Hikrobot models
+        try:
+            cam.MV_CC_SetIntValue("OffsetX", 0)
+            cam.MV_CC_SetIntValue("OffsetY", 0)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cam.MV_CC_SetIntValue("Width", tw)
+            cam.MV_CC_SetIntValue("Height", th)
+        except Exception as exc:  # noqa: BLE001
+            self.last_diag["stream_roi_error"] = str(exc)
+            return
+
+        gw = self._get_int(cam, sdk, "Width") or tw
+        gh = self._get_int(cam, sdk, "Height") or th
+        oxr = self._get_int_range(cam, sdk, "OffsetX")
+        oyr = self._get_int_range(cam, sdk, "OffsetY")
+        if oxr is not None:
+            _ox, oxmin, oxmax, oxinc = oxr
+            ox = self._align_int(
+                max(0, (int(wmax) - int(gw)) // 2),
+                int(oxinc or 1),
+                int(oxmin),
+                max(int(oxmin), int(oxmax)),
+            )
+            try:
+                cam.MV_CC_SetIntValue("OffsetX", ox)
+            except Exception:  # noqa: BLE001
+                pass
+        if oyr is not None:
+            _oy, oymin, oymax, oyinc = oyr
+            oy = self._align_int(
+                max(0, (int(hmax) - int(gh)) // 2),
+                int(oyinc or 1),
+                int(oymin),
+                max(int(oymin), int(oymax)),
+            )
+            try:
+                cam.MV_CC_SetIntValue("OffsetY", oy)
+            except Exception:  # noqa: BLE001
+                pass
+
+        gw = self._get_int(cam, sdk, "Width") or gw
+        gh = self._get_int(cam, sdk, "Height") or gh
+        ox = self._get_int(cam, sdk, "OffsetX") or 0
+        oy = self._get_int(cam, sdk, "OffsetY") or 0
+        self.last_diag["stream_roi"] = "%sx%s@%s,%s (cap %sx%s)" % (
+            gw,
+            gh,
+            ox,
+            oy,
+            tw,
+            th,
+        )
+
     def _configure_stream(self, cam, sdk, is_gige: bool) -> None:
         """Continuous free-run + GigE packet size; sensor-aware pixel format."""
         try:
@@ -424,6 +553,49 @@ class HikCamera:
                     except Exception:  # noqa: BLE001
                         pass
                     self.last_diag["packet_size"] = pkt
+            except Exception:  # noqa: BLE001
+                pass
+
+            # Inter-packet delay: SCPD=0 maxes throughput but often drops frames
+            # on ordinary 1GbE NICs with large ROI payloads.
+            scpd = 2000
+            try:
+                from detection.utils.config_cache import get_configs
+
+                raw = (get_configs() or {}).get("mvs_gev_scpd")
+                if raw is not None and str(raw).strip() != "":
+                    scpd = max(0, int(float(raw)))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                ret = cam.MV_CC_SetIntValue("GevSCPD", int(scpd))
+                if ret == sdk.MV_OK:
+                    self.last_diag["gev_scpd"] = int(scpd)
+            except Exception:  # noqa: BLE001
+                pass
+
+            # Wide FOV default — faces stay in frame; still below full 5MP
+            stream_w, stream_h = 1920, 1600
+            try:
+                from detection.utils.config_cache import get_configs
+
+                cfg = get_configs() or {}
+                if cfg.get("mvs_stream_max_width"):
+                    stream_w = max(960, int(float(cfg.get("mvs_stream_max_width"))))
+                if cfg.get("mvs_stream_max_height"):
+                    stream_h = max(720, int(float(cfg.get("mvs_stream_max_height"))))
+            except Exception:  # noqa: BLE001
+                pass
+            self._apply_stream_roi(cam, sdk, max_width=stream_w, max_height=stream_h)
+
+            # Cap FPS so GigE stays within link budget after ROI/SCPD
+            try:
+                cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                cam.MV_CC_SetFloatValue("AcquisitionFrameRate", 15.0)
+                self.last_diag["acq_fps"] = 15.0
             except Exception:  # noqa: BLE001
                 pass
 
@@ -617,13 +789,21 @@ class HikCamera:
             pass
         return None
 
-    def _get_int_range(self, cam, sdk, key: str) -> Optional[Tuple[float, float, float]]:
+    def _get_int_range(
+        self, cam, sdk, key: str
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Return (cur, min, max, inc) for an integer GenICam node."""
         st = sdk.MVCC_INTVALUE()
         memset(byref(st), 0, sizeof(sdk.MVCC_INTVALUE))
         try:
             ret = cam.MV_CC_GetIntValue(key, st)
             if ret == sdk.MV_OK:
-                return float(st.nCurValue), float(st.nMin), float(st.nMax)
+                return (
+                    float(st.nCurValue),
+                    float(st.nMin),
+                    float(st.nMax),
+                    float(st.nInc or 1),
+                )
         except Exception:  # noqa: BLE001
             pass
         return None
@@ -680,6 +860,86 @@ class HikCamera:
             raise RuntimeError("StartGrabbing failed: 0x%x" % ret)
         self._grabbing = True
         self._prefer_sdk_bgr = True
+        try:
+            self._cam.MV_CC_ClearImageBuffer()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def recover_stream(self, tighten_roi: bool = True) -> Dict[str, Any]:
+        """
+        Recover from sustained MV_E_NODATA: bump GevSCPD, optionally shrink ROI,
+        restart grabbing. Safe to call from the grab loop.
+        """
+        cam, sdk = self._cam, self._sdk
+        if cam is None or sdk is None or not self._opened:
+            return dict(self.last_diag)
+
+        steps = []
+        try:
+            if self._grabbing:
+                cam.MV_CC_StopGrabbing()
+                self._grabbing = False
+                steps.append("stop")
+        except Exception as exc:  # noqa: BLE001
+            steps.append("stop_err:%s" % exc)
+
+        # Increase inter-packet delay
+        scpd_cur = 1500
+        try:
+            rng = self._get_int_range(cam, sdk, "GevSCPD")
+            if rng is not None:
+                scpd_cur = int(rng[0])
+        except Exception:  # noqa: BLE001
+            pass
+        scpd_next = min(8000, max(1500, int(scpd_cur) + 1000))
+        try:
+            if cam.MV_CC_SetIntValue("GevSCPD", scpd_next) == sdk.MV_OK:
+                self.last_diag["gev_scpd"] = scpd_next
+                steps.append("scpd=%s" % scpd_next)
+        except Exception:  # noqa: BLE001
+            pass
+
+        if tighten_roi:
+            wr = self._get_int_range(cam, sdk, "Width")
+            hr = self._get_int_range(cam, sdk, "Height")
+            cur_w = int(wr[0]) if wr else 1920
+            cur_h = int(hr[0]) if hr else 1600
+            # Never shrink below a usable FOV for face tracking
+            self._apply_stream_roi(
+                cam,
+                sdk,
+                max_width=max(1280, cur_w * 5 // 6),
+                max_height=max(960, cur_h * 5 // 6),
+            )
+            steps.append("roi=%s" % self.last_diag.get("stream_roi"))
+            # Payload may change with ROI — refresh grab buffers
+            try:
+                st_param = sdk.MVCC_INTVALUE()
+                memset(byref(st_param), 0, sizeof(sdk.MVCC_INTVALUE))
+                ret = cam.MV_CC_GetIntValue("PayloadSize", st_param)
+                if ret == sdk.MV_OK and st_param.nCurValue > 0:
+                    self._payload = int(st_param.nCurValue)
+                    self._buf = (c_ubyte * max(self._payload, self._payload + 64))()
+                self._alloc_bgr_buf_from_roi(cam, sdk)
+                steps.append("payload=%s" % self._payload)
+            except Exception as exc:  # noqa: BLE001
+                steps.append("payload_err:%s" % exc)
+
+        try:
+            ret = cam.MV_CC_StartGrabbing()
+            if ret != sdk.MV_OK:
+                raise RuntimeError("StartGrabbing failed: 0x%x" % ret)
+            self._grabbing = True
+            try:
+                cam.MV_CC_ClearImageBuffer()
+            except Exception:  # noqa: BLE001
+                pass
+            steps.append("start")
+        except Exception as exc:  # noqa: BLE001
+            steps.append("start_err:%s" % exc)
+
+        self.last_diag["stream_recover"] = steps
+        return dict(self.last_diag)
 
     def settle_exposure(self, frames: int = 25, timeout_ms: int = 500) -> Dict[str, Any]:
         """Backward-compatible: prefer hardware AE settle, else software fallback."""
@@ -779,7 +1039,7 @@ class HikCamera:
         exp_max = 80000.0
         exp_cur = 12000.0
         if exp_range is not None:
-            exp_cur, exp_min, exp_max = exp_range
+            exp_cur, exp_min, exp_max = exp_range[:3]
             exp_min = max(50.0, float(exp_min))
             exp_max = min(100000.0, max(exp_min + 1.0, float(exp_max)))
             exp_cur = float(np.clip(exp_cur, exp_min, exp_max))

@@ -442,6 +442,89 @@
     let clientTimingAvg = {};
     let lastFatigueAlertAt = 0;
     const FATIGUE_ALERT_COOLDOWN_MS = 15000;
+    let lastBehaviorAlertAt = { smoking: 0, phone: 0, drinking: 0 };
+    let prevBehaviorFlags = { smoking: false, phone: false, drinking: false };
+    const BEHAVIOR_ALERT_COOLDOWN_MS = 8000;
+
+    function showBehaviorWarning(kind) {
+        const titleEl = document.querySelector('#warning-modal .modal-title');
+        const msgEl = document.getElementById('warning-message');
+        const titles = {
+            smoking: '<i class="fas fa-smoking me-2"></i>抽烟行为警告',
+            phone: '<i class="fas fa-phone me-2"></i>打电话行为警告',
+            drinking: '<i class="fas fa-coffee me-2"></i>喝水行为提醒',
+        };
+        const msgs = {
+            smoking: '已确认检测到抽烟行为，请立即纠正！',
+            phone: '已确认检测到打电话行为，请注意驾驶安全！',
+            drinking: '已确认检测到喝水行为。',
+        };
+        if (titleEl) titleEl.innerHTML = titles[kind] || titles.smoking;
+        if (msgEl) msgEl.textContent = msgs[kind] || msgs.smoking;
+        // Behavior alerts do not require fatigue ack / reset
+        fatigueAckPending = false;
+        warningModal.show();
+    }
+
+    function maybeAlertBehavior(kind, isOn) {
+        const wasOn = !!prevBehaviorFlags[kind];
+        prevBehaviorFlags[kind] = !!isOn;
+        if (!isOn) return;
+        // Rising edge only — avoid spam every MVS poll while flag stays true
+        if (wasOn) return;
+        const nowMs = Date.now();
+        if (nowMs - (lastBehaviorAlertAt[kind] || 0) < BEHAVIOR_ALERT_COOLDOWN_MS) return;
+        lastBehaviorAlertAt[kind] = nowMs;
+        if (alertSound.checked) {
+            playAlertSound(kind === 'drinking' ? 'alert' : kind);
+        }
+        // Visual alert even when sound is off
+        if (kind !== 'drinking') {
+            showBehaviorWarning(kind);
+        }
+    }
+
+    function updateBehaviorBanner(result) {
+        if (!detectionAlert) return;
+        if (result.smoking_detected) {
+            detectionAlert.innerHTML = '<i class="fas fa-smoking me-2"></i>告警：检测到抽烟行为';
+            detectionAlert.className = 'alert alert-danger';
+            return;
+        }
+        if (result.phone_detected) {
+            detectionAlert.innerHTML = '<i class="fas fa-phone me-2"></i>告警：检测到打电话行为';
+            detectionAlert.className = 'alert alert-danger';
+            return;
+        }
+        if (result.drinking_detected) {
+            detectionAlert.innerHTML = '<i class="fas fa-coffee me-2"></i>提醒：检测到喝水行为';
+            detectionAlert.className = 'alert alert-warning';
+            return;
+        }
+        const prog = result.confirm_progress || {};
+        const dbg = result.behavior_debug || {};
+        const top = dbg.top_conf || {};
+        const smokeProg = prog.smoking;
+        const rawSmoke = top.smoke != null && Number(top.smoke) > 0;
+        if (smokeProg && smokeProg.hits > 0 && smokeProg.hits < smokeProg.need) {
+            detectionAlert.innerHTML =
+                `<i class="fas fa-smoking me-2"></i>抽烟确认中 ${smokeProg.hits}/${smokeProg.need}（请保持动作）`;
+            detectionAlert.className = 'alert alert-warning';
+            return;
+        }
+        if (rawSmoke && !result.smoking_detected) {
+            detectionAlert.innerHTML =
+                `<i class="fas fa-smoking me-2"></i>已检出抽烟框 conf=${Number(top.smoke).toFixed(2)}，等待确认…`;
+            detectionAlert.className = 'alert alert-warning';
+            return;
+        }
+        // Clear sticky behavior banner when no longer active
+        const text = (detectionAlert.textContent || '');
+        if (text.indexOf('抽烟') >= 0 || text.indexOf('打电话') >= 0 || text.indexOf('喝水') >= 0) {
+            detectionAlert.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>检测中...';
+            detectionAlert.className = 'alert alert-primary';
+        }
+    }
 
     function suggestIntervalMs(avgMs) {
         if (avgMs == null || isNaN(avgMs) || avgMs <= 0) return '—';
@@ -756,6 +839,13 @@
                         : Math.max(0, (warmupUntilMs - Date.now()) / 1000);
                     warmupUntilMs = Date.now() + Math.max(0, remain) * 1000;
                     showWarmupUi(remain, data.meta || null);
+                    if (data.error) {
+                        detectionAlert.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>' + data.error;
+                        detectionAlert.className = 'alert alert-warning';
+                    } else if (data.meta && data.meta.camera_warning) {
+                        detectionAlert.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>' + data.meta.camera_warning;
+                        detectionAlert.className = 'alert alert-warning';
+                    }
                     return;
                 }
                 if (isWarmingUp()) {
@@ -1144,6 +1234,14 @@
                 if (nowMs - lastFatigueAlertAt >= FATIGUE_ALERT_COOLDOWN_MS) {
                     lastFatigueAlertAt = nowMs;
                     playAlertSound('fatigue');
+                    const titleEl = document.querySelector('#warning-modal .modal-title');
+                    const msgEl = document.getElementById('warning-message');
+                    if (titleEl) {
+                        titleEl.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>疲劳驾驶警告';
+                    }
+                    if (msgEl) {
+                        msgEl.textContent = '您可能处于疲劳状态，请注意休息！';
+                    }
                     warningModal.show();
                     fatigueAckPending = true;
                 }
@@ -1229,12 +1327,23 @@
         let yawnText = '未检测';
         let yawnWarning = false;
         
-        if (result.yawn_detected !== undefined) {
-            yawnText = result.yawn_detected ? '是' : '否';
-            yawnWarning = result.yawn_detected;
-            if (result.mouth_aspect_ratio !== null && result.mouth_aspect_ratio !== undefined) {
-                yawnText += ' (MAR: ' + Number(result.mouth_aspect_ratio).toFixed(2) + ')';
+        if (result.yawn_detected !== undefined || result.mouth_aspect_ratio != null) {
+            const mar = result.mouth_aspect_ratio;
+            const rel = result.mouth_rel_open;
+            const raw = !!result.yawn_raw || !!result.yawn_detected;
+            if (result.yawn_detected) {
+                yawnText = '是';
+                yawnWarning = true;
+            } else if (raw) {
+                yawnText = '确认中';
+                yawnWarning = true;
+            } else {
+                yawnText = '否';
             }
+            const bits = [];
+            if (mar !== null && mar !== undefined) bits.push('MAR: ' + Number(mar).toFixed(2));
+            if (rel !== null && rel !== undefined) bits.push('Rel: ' + Number(rel).toFixed(2));
+            if (bits.length) yawnText += ' (' + bits.join(', ') + ')';
         }
         
         detailsHTML += `<div class="result-item ${yawnWarning ? 'warning' : ''}">
@@ -1261,17 +1370,27 @@
         </div>`;
         
         // 不良行为检测 - 无论是否检测到人脸都显示
-        // 抽烟检测
+        // 行为调试字段提前取，便于显示「确认中」状态
+        const dbg = result.behavior_debug || {};
+        const prog = result.confirm_progress || {};
+        const top = dbg.top_conf || {};
+
+        // 抽烟检测（告警看确认后的 smoking_detected；YOLO 框可能更早出现）
         let smokingText = '未检测';
         let smokingWarning = false;
-        
         if (result.smoking_detected !== undefined) {
-            smokingText = result.smoking_detected ? '是' : '否';
-            smokingWarning = result.smoking_detected;
-            
-            if (!soft && result.smoking_detected && alertSound.checked) {
-                playAlertSound('smoking');
+            if (result.smoking_detected) {
+                smokingText = '是（已确认）';
+                smokingWarning = true;
+            } else if (prog.smoking && prog.smoking.hits > 0) {
+                smokingText = `确认中 ${prog.smoking.hits}/${prog.smoking.need}`;
+                smokingWarning = true;
+            } else if (top.smoke != null && Number(top.smoke) > 0) {
+                smokingText = `检出 conf ${Number(top.smoke).toFixed(2)}`;
+            } else {
+                smokingText = '否';
             }
+            maybeAlertBehavior('smoking', !!result.smoking_detected);
         }
         
         detailsHTML += `<div class="result-item ${smokingWarning ? 'danger' : ''}">
@@ -1284,14 +1403,19 @@
         // 打电话检测
         let phoneText = '未检测';
         let phoneWarning = false;
-        
         if (result.phone_detected !== undefined) {
-            phoneText = result.phone_detected ? '是' : '否';
-            phoneWarning = result.phone_detected;
-            
-            if (!soft && result.phone_detected && alertSound.checked) {
-                playAlertSound('phone');
+            if (result.phone_detected) {
+                phoneText = '是（已确认）';
+                phoneWarning = true;
+            } else if (prog.phone && prog.phone.hits > 0) {
+                phoneText = `确认中 ${prog.phone.hits}/${prog.phone.need}`;
+                phoneWarning = true;
+            } else if (top.phone != null && Number(top.phone) > 0) {
+                phoneText = `检出 conf ${Number(top.phone).toFixed(2)}`;
+            } else {
+                phoneText = '否';
             }
+            maybeAlertBehavior('phone', !!result.phone_detected);
         }
         
         detailsHTML += `<div class="result-item ${phoneWarning ? 'danger' : ''}">
@@ -1304,10 +1428,19 @@
         // 喝水检测
         let drinkingText = '未检测';
         let drinkingWarning = false;
-        
         if (result.drinking_detected !== undefined) {
-            drinkingText = result.drinking_detected ? '是' : '否';
-            drinkingWarning = result.drinking_detected;
+            if (result.drinking_detected) {
+                drinkingText = '是（已确认）';
+                drinkingWarning = true;
+            } else if (prog.drinking && prog.drinking.hits > 0) {
+                drinkingText = `确认中 ${prog.drinking.hits}/${prog.drinking.need}`;
+                drinkingWarning = true;
+            } else if (top.water != null && Number(top.water) > 0) {
+                drinkingText = `检出 conf ${Number(top.water).toFixed(2)}`;
+            } else {
+                drinkingText = '否';
+            }
+            maybeAlertBehavior('drinking', !!result.drinking_detected);
         }
         
         detailsHTML += `<div class="result-item ${drinkingWarning ? 'warning' : ''}">
@@ -1317,10 +1450,9 @@
             </div>
         </div>`;
 
+        updateBehaviorBanner(result);
+
         // 行为调试：raw conf / 过滤 / 确认进度
-        const dbg = result.behavior_debug || {};
-        const prog = result.confirm_progress || {};
-        const top = dbg.top_conf || {};
         const fmtConf = (v) => (v === null || v === undefined) ? '-' : Number(v).toFixed(2);
         const fmtProg = (key) => {
             const p = prog[key];
@@ -1353,8 +1485,8 @@
         
         detectionDetails.innerHTML = detailsHTML;
         
-        // 如果有结果图像，覆盖显示在视频区域
-        if (result.image_data) {
+        // 浏览器摄像头：可用结果图覆盖视频；工业相机预览走 MJPEG，不要用 canvas 盖住
+        if (result.image_data && activeSourceType !== 'mvs') {
             const resultImage = new Image();
             resultImage.onload = () => {
                 canvasElement.width = resultImage.width;
@@ -1365,17 +1497,23 @@
                 videoElement.style.visibility = 'hidden';
             };
             resultImage.src = result.image_data;
+        } else if (activeSourceType === 'mvs') {
+            canvasElement.style.display = 'none';
+            if (mvsPreviewImg) mvsPreviewImg.style.display = 'block';
         }
     }
     
-    // 播放警告音效
+    // 播放警告音效（仅受页面「声音提醒」开关控制；与系统配置「语音播报」解耦）
     function playAlertSound(type = 'alert') {
-        if (!enableVoice || !alertSound.checked) {
+        if (!alertSound.checked) {
             return;
         }
         if (!audioInitialized) {
-            console.error('音频未初始化');
-            return;
+            initAudio();
+            if (!audioInitialized) {
+                console.error('音频未初始化');
+                return;
+            }
         }
         
         try {

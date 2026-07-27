@@ -104,9 +104,21 @@ class DlibDetector:
             rel_cfg = SystemConfig.objects.filter(config_key="mouth_rel_open_thresh").first()
             if rel_cfg:
                 try:
-                    self.MOUTH_REL_OPEN_THRESH = max(
-                        0.05, min(0.35, float(rel_cfg.config_value))
-                    )
+                    rel_th = float(rel_cfg.config_value)
+                    # Legacy/mis-set values (>=0.22) almost never fire for real yawns
+                    # (typical yawn rel-open is ~0.10–0.20). Clamp + persist once.
+                    migrated_rel = SystemConfig.objects.filter(
+                        config_key="mouth_rel_open_migrated_v1"
+                    ).first()
+                    if migrated_rel is None and rel_th >= 0.22:
+                        rel_th = 0.12
+                        rel_cfg.config_value = "0.12"
+                        rel_cfg.save(update_fields=["config_value"])
+                        SystemConfig.objects.update_or_create(
+                            config_key="mouth_rel_open_migrated_v1",
+                            defaults={"config_value": "1"},
+                        )
+                    self.MOUTH_REL_OPEN_THRESH = max(0.05, min(0.22, float(rel_th)))
                 except (TypeError, ValueError):
                     pass
 
@@ -123,8 +135,8 @@ class DlibDetector:
             print(f"加载配置失败: {e}")
 
     @staticmethod
-    def _expand_bbox(x1, y1, x2, y2, img_w, img_h, ratio=0.08):
-        """Expand bbox slightly for more stable landmark prediction."""
+    def _expand_bbox(x1, y1, x2, y2, img_w, img_h, ratio=0.18):
+        """Expand bbox for more stable landmark prediction (YOLO boxes are tight)."""
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
         pad_x = int(bw * ratio)
@@ -204,15 +216,21 @@ class DlibDetector:
 
     def is_yawn(self, landmarks, mar=None):
         """
-        Yawn if outer MAR exceeds threshold AND absolute opening is large
-        relative to face size (filters talking / landmark jitter).
+        Yawn when outer-lip MAR reaches the configured threshold.
+
+        A tiny relative-open sanity floor rejects landmark glitches (MAR high
+        but mouth not actually open). The configured mouth_rel_open_thresh is
+        used as that soft floor (clamped), not a second hard AND gate.
         """
         if mar is None:
             mar = self.mouth_aspect_ratio(landmarks)
-        if mar <= float(self.MOUTH_AR_THRESH):
+        mar_th = float(self.MOUTH_AR_THRESH)
+        if mar < mar_th:
             return False
         rel = self.mouth_relative_open(landmarks)
-        return bool(rel >= float(self.MOUTH_REL_OPEN_THRESH))
+        # Soft floor only — do not require the full configured rel as a second gate
+        soft_floor = max(0.04, min(0.10, float(self.MOUTH_REL_OPEN_THRESH) * 0.5))
+        return bool(rel >= soft_floor)
 
     def _metrics_from_landmarks(self, landmarks):
         left_eye = landmarks[self.LEFT_EYE_START : self.LEFT_EYE_END + 1]
@@ -357,6 +375,7 @@ class DlibDetector:
                 primary = face_entries[primary_idx]
                 results["eye_aspect_ratio"] = primary["eye_aspect_ratio"]
                 results["mouth_aspect_ratio"] = primary["mouth_aspect_ratio"]
+                results["mouth_rel_open"] = primary.get("mouth_rel_open")
                 results["yawn_detected"] = primary["yawn_detected"]
                 results["fatigue_level"] = primary["fatigue_level"]
                 results["landmarks"] = primary["landmarks"]

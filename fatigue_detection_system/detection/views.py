@@ -366,15 +366,33 @@ def system_config(request):
     if not request.user.is_admin and not request.user.is_superuser:
         messages.error(request, '您没有访问此页面的权限')
         return redirect('detection:dashboard')
-    
-    bool_keys = {'enable_voice', 'mono_camera_mode', 'yolo_spatial_filter', 'cuda_half'}
+
+    from .utils.perf_presets import build_preset, detect_cuda, preset_catalog
+
+    bool_keys = {
+        'enable_voice',
+        'mono_camera_mode',
+        'yolo_spatial_filter',
+        'cuda_half',
+    }
+
+    cuda_ok, cuda_name = detect_cuda()
 
     if request.method == 'POST':
-        # 先收集 POST（同名 hidden+checkbox 取最后一个）
         posted = {}
         for key in request.POST.keys():
             if key.startswith('config_'):
                 posted[key[7:]] = request.POST.get(key)
+
+        # One-click preset overwrites performance-related keys
+        apply_preset = (request.POST.get('apply_preset') or '').strip().lower()
+        if apply_preset in ('cpu_smooth', 'balanced', 'gpu_quality'):
+            if apply_preset == 'gpu_quality' and not cuda_ok:
+                messages.warning(
+                    request,
+                    '当前机器未检测到可用 NVIDIA GPU，已改为「均衡」预设（CPU）。',
+                )
+            posted.update(build_preset(apply_preset, cuda_ok))
 
         for key in bool_keys:
             if key not in posted:
@@ -393,26 +411,42 @@ def system_config(request):
             invalidate()
         except Exception:  # noqa: BLE001
             pass
-        # Reload live detectors so new thresholds apply without restart
         try:
+            from .utils.compute_scheduler import compute_scheduler
+
+            compute_scheduler.configure(
+                {c.config_key: c.config_value for c in SystemConfig.objects.all()}
+            )
             if yolo_detector is not None:
                 yolo_detector.load_config()
             if dlib_detector is not None:
                 dlib_detector.load_config()
         except Exception:  # noqa: BLE001
             pass
-        
-        messages.success(request, '系统配置已更新')
+
+        if apply_preset:
+            messages.success(request, '已应用性能预设并保存')
+        else:
+            messages.success(request, '系统配置已更新')
         return redirect('detection:system_config')
-    
-    # 获取所有配置项并转换为字典
+
     configs_dict = {}
-    configs = SystemConfig.objects.all()
-    
-    for config in configs:
+    for config in SystemConfig.objects.all():
         configs_dict[config.config_key] = config.config_value
-    
-    return render(request, 'detection/system_config.html', {'configs': configs_dict})
+
+    catalog = preset_catalog(cuda_ok)
+    return render(
+        request,
+        'detection/system_config.html',
+        {
+            'configs': configs_dict,
+            'cuda_available': cuda_ok,
+            'cuda_name': cuda_name,
+            'preset_meta': catalog['presets'],
+            'preset_values_json': json.dumps(catalog['values'], ensure_ascii=False),
+            'current_preset': configs_dict.get('performance_preset') or 'balanced',
+        },
+    )
 
 @login_required
 def start_detection(request):
