@@ -1,0 +1,166 @@
+SleepyDetect 最终交接入口（先看这个）
+====================================
+
+先看哪个文件
+------------
+只需要先看这一个文件：
+
+- `00_START_HERE.txt`  ← 就是你现在打开的这个
+
+其他文件用途：
+- `README.txt`：完整说明，遇到问题再看
+- `MVS_SETUP.txt`：只有 GigE / 海康工业相机时才看
+- `train_behavior.bat`：要训练新行为模型时双击它
+
+
+一、如果你只是要把系统跑起来
+--------------------------
+按下面做，不用猜：
+
+1. 把整个 `SleepyDetect_Install_Offline` 文件夹复制到目标电脑
+   - 推荐路径：`D:\SleepyDetect_Install_Offline`
+   - 路径尽量不要有中文
+
+2. 双击 `install.bat`
+   - 等它跑完
+   - 如果报 Python 安装问题，再看 `README.txt` 的常见问题
+
+3. 双击 `start.bat`
+
+4. 浏览器打开：
+   - `http://127.0.0.1:8000/`
+
+5. 登录后台
+   - 用户名：`admin`
+   - 密码：看同目录下的 `ADMIN_CREDENTIALS.txt`
+   - 如果没有这个文件，就用交接时给你的管理员密码
+
+到这里系统就已经能用了。
+
+
+二、如果你要接普通 USB 摄像头 / 笔记本摄像头
+-----------------------------------------
+1. 先按上面“一、把系统跑起来”
+2. 打开网页
+3. 选择浏览器摄像头 / 系统摄像头
+4. 开始检测
+
+
+三、如果你要接 GigE / 海康工业相机
+--------------------------------
+1. 先按上面“一、把系统跑起来”
+2. 再打开 `MVS_SETUP.txt`
+3. 先把海康 MVS Runtime 安装好
+4. 然后再启动系统并选择 MVS 来源
+
+如果没装 MVS Runtime，GigE 相机路径不要硬试。
+
+
+四、如果你要训练行为识别模型
+--------------------------
+你只要记住这句话：
+
+- 把训练图片和标签放进 `app\datasets\...`
+- 然后双击 `train_behavior.bat`
+
+### 1) 训练图片放哪里
+
+彩色场景（推荐）放到：
+
+- `app\datasets\color_behavior\images\train\`
+- `app\datasets\color_behavior\images\val\`
+- `app\datasets\color_behavior\labels\train\`
+- `app\datasets\color_behavior\labels\val\`
+
+黑白工业相机场景放到：
+
+- `app\datasets\mono_behavior\images\train\`
+- `app\datasets\mono_behavior\images\val\`
+- `app\datasets\mono_behavior\labels\train\`
+- `app\datasets\mono_behavior\labels\val\`
+
+注意：
+- `train` 是训练集
+- `val` 是验证集
+- 一张图片对应一个同名 `.txt` 标签文件
+
+例子：
+- 图片：`0001.jpg`
+- 标签：`0001.txt`
+
+
+### 2) 标签怎么写（YOLO 格式）
+
+每一行一个框，格式固定：
+
+`class x_center y_center width height`
+
+5 个值都用空格分开，后 4 个是 0 到 1 的归一化坐标。
+
+类别编号固定如下，不能改：
+
+- `0 = face`
+- `1 = smoke`
+- `2 = phone`
+- `3 = water`
+
+标签示例：
+
+`1 0.512 0.438 0.120 0.210`
+
+含义：
+- 这是一个 `smoke`
+- 框中心在整张图的 `x=0.512`、`y=0.438`
+- 框宽 `0.120`
+- 框高 `0.210`
+
+如果一张图里有多个目标，就在同一个 `.txt` 里写多行。
+
+
+### 3) 什么时候用 color，什么时候用 mono
+
+- 普通彩色现场：用 `color_behavior`
+- 黑白工业相机现场：用 `mono_behavior`
+
+如果你两边都放了数据，`train_behavior.bat` 会优先用彩色数据。
+
+
+### 4) 怎么开始训练
+
+数据放好后，直接双击：
+
+- `train_behavior.bat`
+
+它会自动做这些事情：
+
+1. 检查你是否已经先执行过 `install.bat`
+2. 自动判断用彩色数据还是黑白数据
+3. 自动选择 GPU 或 CPU
+4. 开始训练
+5. 备份旧模型
+6. 用新模型覆盖线上 `best.pt`
+7. 自动导出 `best.onnx`
+
+
+### 5) 训练完成后还要做什么
+
+只要两步：
+
+1. 双击 `start.bat` 重启系统
+2. 用真实现场画面试一下抽烟 / 打电话 / 喝水 / 人脸效果
+
+
+五、如果你只想知道最终要看哪些文件
+--------------------------------
+按这个顺序就行：
+
+1. `00_START_HERE.txt`
+2. `README.txt`
+3. `MVS_SETUP.txt`（只有 GigE 时）
+
+
+六、遇到问题先看哪里
+------------------
+- 安装跑不起来：`README.txt`
+- GigE / 海康相机问题：`MVS_SETUP.txt`
+- 训练数据不会放 / 标签不会写：回到本文件第四部分

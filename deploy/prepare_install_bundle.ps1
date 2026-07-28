@@ -90,6 +90,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "bundle_start.bat") -Destination
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "stop.bat") -Destination (Join-Path $OutDir "stop.bat") -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "stop.ps1") -Destination (Join-Path $OutDir "stop.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "MVS_SETUP.txt") -Destination (Join-Path $OutDir "MVS_SETUP.txt") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "START_HERE.txt") -Destination (Join-Path $OutDir "00_START_HERE.txt") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "train_behavior.ps1") -Destination (Join-Path $OutDir "train_behavior.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "train_behavior.bat") -Destination (Join-Path $OutDir "train_behavior.bat") -Force
 
@@ -236,16 +237,16 @@ if ($wantOffline) {
 Write-Host "4/6 Write tip file ..."
 if ($wantOffline) {
     $tip = @"
-SleepyDetect OFFLINE Install Package
-====================================
-Target PC needs NO internet.
+请先打开 00_START_HERE.txt
 
-1. Copy this whole folder (e.g. D:\SleepyDetect_Install_Offline)
-2. Double-click install.bat
-3. Double-click start.bat
-4. Browser http://127.0.0.1:8000/   admin / ChangeMeNow!
-5. GigE: install MVS Runtime on target (see MVS_SETUP.txt) — MVS is separate
-6. Fine-tune behavior model later with train_behavior.bat
+只看这一个文件，就能知道：
+- 先双击 install.bat
+- 再双击 start.bat
+- 浏览器打开哪个地址
+- 训练图片放哪里
+- 标签怎么写
+- 如何双击 train_behavior.bat 一键训练
+
 Torch variant in this pack: $TorchVariant $(if ($TorchVariant -eq 'Cuda') { $CudaIndex })
 "@
 } else {
