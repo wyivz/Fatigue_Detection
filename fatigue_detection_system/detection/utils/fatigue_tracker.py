@@ -97,6 +97,11 @@ class _SessionFatigueState:
     last_face_entries: Optional[List[Dict[str, Any]]] = None
     last_faces: int = 0
     config: Dict[str, Any] = field(default_factory=dict)
+    # Session EAR baseline (open-eye calibration)
+    session_start: Optional[float] = None
+    baseline_samples: Deque[float] = field(default_factory=deque)
+    baseline_ready: bool = False
+    calibrated_eye_ar_thresh: Optional[float] = None
 
 
 class FatigueTemporalTracker:
@@ -150,6 +155,7 @@ class FatigueTemporalTracker:
         landmarks_size: Optional[Tuple[int, int]] = None,
         faces: Optional[List[Dict[str, Any]]] = None,
         timestamp: Optional[float] = None,
+        landmark_reliable: Optional[bool] = None,
     ) -> FatigueSnapshot:
         """Feed one EAR sample.
 
@@ -158,10 +164,13 @@ class FatigueTemporalTracker:
         - yawn_detected=None keeps prior yawn latch (EAR loop); True/False updates yawn FSM.
         - landmarks_size=(w,h) should match the image used for landmark prediction.
         - faces: optional multi-face list for drawing; alert metrics still use primary EAR.
+        - landmark_reliable=False: skip feeding closed-eye (profile / bad landmarks).
         """
         t = time.time() if timestamp is None else float(timestamp)
         with self._lock:
             state = self._get_state(session_id)
+            if state.session_start is None:
+                state.session_start = t
             cfg = state.config or load_fatigue_config()
             state.last_faces = int(faces_detected)
             if landmarks is not None:
@@ -178,7 +187,11 @@ class FatigueTemporalTracker:
                 state.last_face_entries = list(faces)
 
             if yawn_detected is not None:
-                self._update_yawn(state, bool(yawn_detected), t, cfg)
+                # Unreliable pose: do not start new yawn candidates
+                if landmark_reliable is False:
+                    self._update_yawn(state, False, t, cfg)
+                else:
+                    self._update_yawn(state, bool(yawn_detected), t, cfg)
 
             if ear is None or faces_detected <= 0:
                 # Lost face: end closed segment without treating gap as closed
@@ -193,10 +206,28 @@ class FatigueTemporalTracker:
 
             ear_f = float(ear)
             state.last_ear = ear_f
-            thresh = float(cfg["eye_ar_thresh"])
+
+            # Session open-eye baseline (first ~4s of reliable samples)
+            self._maybe_calibrate_baseline(state, ear_f, t, cfg, landmark_reliable)
+
+            thresh = float(
+                state.calibrated_eye_ar_thresh
+                if state.calibrated_eye_ar_thresh is not None
+                else cfg["eye_ar_thresh"]
+            )
             hyst = max(0.0, float(cfg.get("ear_hysteresis", 0.03)))
             close_thresh = thresh
             open_thresh = thresh + hyst
+
+            # Bad pose / landmark quality: never push "closed" this frame
+            if landmark_reliable is False:
+                if state.eyes_closed and state.closed_start is not None:
+                    self._close_segment(state, t, cfg)
+                state.eyes_closed = False
+                state.closed_start = None
+                state.last_t = t
+                self._prune(state, t, cfg)
+                return self._snapshot(state, cfg, t)
 
             # Hysteresis: harder to enter closed, easier to stay open until clearly open
             if state.eyes_closed:
@@ -217,6 +248,55 @@ class FatigueTemporalTracker:
             state.last_t = t
             self._prune(state, t, cfg)
             return self._snapshot(state, cfg, t)
+
+    @staticmethod
+    def _percentile(sorted_vals: List[float], pct: float) -> float:
+        if not sorted_vals:
+            return 0.25
+        if len(sorted_vals) == 1:
+            return float(sorted_vals[0])
+        k = (len(sorted_vals) - 1) * (pct / 100.0)
+        f = int(k)
+        c = min(f + 1, len(sorted_vals) - 1)
+        if f == c:
+            return float(sorted_vals[f])
+        return float(sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f))
+
+    def _maybe_calibrate_baseline(
+        self,
+        state: _SessionFatigueState,
+        ear_f: float,
+        t: float,
+        cfg: Dict[str, Any],
+        landmark_reliable: Optional[bool],
+    ) -> None:
+        if state.baseline_ready:
+            return
+        start = float(state.session_start or t)
+        elapsed = t - start
+        base_thresh = float(cfg["eye_ar_thresh"])
+        # Collect likely-open samples during first 3–5 seconds
+        if elapsed <= 5.0 and landmark_reliable is not False:
+            if ear_f >= base_thresh * 0.95:
+                state.baseline_samples.append(float(ear_f))
+                while len(state.baseline_samples) > 80:
+                    state.baseline_samples.popleft()
+        if elapsed < 3.0:
+            return
+        if len(state.baseline_samples) < 8:
+            if elapsed >= 5.0:
+                state.baseline_ready = True  # give up; keep config default
+            return
+        samples = sorted(state.baseline_samples)
+        open_p30 = self._percentile(samples, 30)
+        # Threshold below typical open EAR
+        calibrated = max(0.18, min(0.32, open_p30 * 0.72))
+        state.calibrated_eye_ar_thresh = float(calibrated)
+        state.baseline_ready = True
+        # Keep config copy in sync for snapshots/debug
+        state.config = dict(cfg)
+        state.config["eye_ar_thresh"] = float(calibrated)
+        state.config["eye_ar_thresh_calibrated"] = float(calibrated)
 
     def get_snapshot(self, session_id: int) -> FatigueSnapshot:
         with self._lock:

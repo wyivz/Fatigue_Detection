@@ -293,6 +293,37 @@ class DlibDetector:
             score -= 2
         return score
 
+    @staticmethod
+    def _pose_frontal_ok(landmarks, min_eye_face_ratio: float = 0.12) -> bool:
+        """Reject strong profile / collapsed faces for fatigue feeding."""
+        try:
+            pts = np.asarray(landmarks, dtype=np.float64)
+            if pts.shape[0] < 68:
+                return False
+            face_w = float(dist.euclidean(pts[0], pts[16]))
+            if face_w < 8.0:
+                return False
+            left_w = float(dist.euclidean(pts[36], pts[39]))
+            right_w = float(dist.euclidean(pts[42], pts[45]))
+            eye_ratio = (left_w + right_w) / (2.0 * face_w)
+            if eye_ratio < float(min_eye_face_ratio):
+                return False
+            # One eye much smaller than the other → strong yaw
+            if min(left_w, right_w) < 0.35 * max(left_w, right_w):
+                return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _normalize_refine(refine_rect) -> str:
+        """Map refine_rect to off | light | full."""
+        if refine_rect is True or refine_rect == "full" or refine_rect == "true":
+            return "full"
+        if refine_rect == "light" or refine_rect == 1:
+            return "light"
+        return "off"
+
     def _rect_crop_bottom(self, rect, image_shape, crop_frac=0.14):
         """Raise the bottom edge (drop neck). Do NOT add forehead — that shifts eyes up."""
         h, w = image_shape[:2]
@@ -430,17 +461,21 @@ class DlibDetector:
             landmarks[i] = (shape.part(i).x, shape.part(i).y)
         return landmarks
 
-    def _predict_one(self, gray, face_bbox, image_shape, refine_rect: bool = False):
+    def _predict_one(self, gray, face_bbox, image_shape, refine_rect=False):
         """Run predictor for one bbox; returns metrics dict or None.
 
         Uses a balanced YOLO expand by default, then targeted retries:
         - mouth-on-chin → crop bottom
         - eyes-on-brows → crop top
-        refine_rect also tries HOG and picks the best geometry score.
+        refine_rect modes:
+          off   — base (+ one light crop if quality bad)
+          light — geometry crops only (no HOG); for EAR hot path
+          full  — HOG snap + extra mouth/eye retries (detect overlay)
         """
         if self.predictor is None:
             return None
 
+        mode = self._normalize_refine(refine_rect)
         candidates = []
 
         def _try(rect):
@@ -453,7 +488,7 @@ class DlibDetector:
         base = self._bbox_to_rect(face_bbox, image_shape)
         _try(base)
 
-        if refine_rect:
+        if mode == "full":
             hog = self._hog_rect_near_yolo(gray, face_bbox, image_shape)
             if hog is not None:
                 _try(hog)
@@ -465,25 +500,37 @@ class DlibDetector:
         best_score, best_lm = candidates[0]
         best_rect = base
 
-        if best_score < 2 and base is not None:
+        if best_score < 2 and base is not None and mode != "off":
             # Mouth too low → drop neck
             if self._mouth_collapsed_to_chin(best_lm):
                 r = self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.14)
                 _try(r)
-                if refine_rect:
+                if mode in ("light", "full"):
                     _try(self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.22))
             # Eyes too high → drop forehead
             if self._eyes_collapsed_to_brows(best_lm):
                 r = self._rect_crop_top(best_rect, image_shape, crop_frac=0.12)
                 _try(r)
-                if refine_rect:
+                if mode in ("light", "full"):
                     _try(self._rect_crop_top(best_rect, image_shape, crop_frac=0.20))
 
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            best_score, best_lm = candidates[0]
+        elif best_score < 2 and base is not None and mode == "off":
+            # Minimal single crop (legacy False path)
+            if self._mouth_collapsed_to_chin(best_lm):
+                _try(self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.14))
+            if self._eyes_collapsed_to_brows(best_lm):
+                _try(self._rect_crop_top(best_rect, image_shape, crop_frac=0.12))
             candidates.sort(key=lambda t: t[0], reverse=True)
             best_score, best_lm = candidates[0]
 
         metrics = self._metrics_from_landmarks(best_lm)
         metrics["bbox"] = [int(v) for v in face_bbox]
+        metrics["landmark_quality"] = int(best_score)
+        metrics["pose_ok"] = bool(
+            best_score >= 0 and self._pose_frontal_ok(best_lm)
+        )
         return metrics
 
     def detect_fatigue_multi(
@@ -492,7 +539,7 @@ class DlibDetector:
         face_bboxes=None,
         primary_bbox=None,
         allow_hog=True,
-        refine_rect: bool = False,
+        refine_rect=False,
     ):
         """
         Run 68-point + EAR/MAR for multiple YOLO face boxes.
@@ -502,7 +549,7 @@ class DlibDetector:
         feed the primary metrics into fatigue_tracker.
 
         allow_hog=False: never fall back to HOG when boxes are empty (MVS path).
-        refine_rect: HOG snap + extra mouth retries (detect path; keep False on EAR).
+        refine_rect: False/"off" | "light" | True/"full".
         """
         results = {
             "faces_detected": 0,
@@ -513,6 +560,8 @@ class DlibDetector:
             "landmarks": None,
             "faces": [],
             "primary_index": None,
+            "pose_ok": True,
+            "landmark_quality": None,
         }
 
         boxes = []
@@ -537,7 +586,7 @@ class DlibDetector:
                 if boxes and self.predictor is not None:
                     for bbox in boxes:
                         one = self._predict_one(
-                            gray, bbox, image.shape, refine_rect=bool(refine_rect)
+                            gray, bbox, image.shape, refine_rect=refine_rect
                         )
                         if one is not None:
                             face_entries.append(one)
@@ -555,6 +604,11 @@ class DlibDetector:
                             int(rect.right()),
                             int(rect.bottom()),
                         ]
+                        q = self._landmark_quality(landmarks)
+                        metrics["landmark_quality"] = int(q)
+                        metrics["pose_ok"] = bool(
+                            q >= 0 and self._pose_frontal_ok(landmarks)
+                        )
                         face_entries.append(metrics)
 
                 results["faces_detected"] = len(face_entries)
@@ -596,6 +650,8 @@ class DlibDetector:
                 results["yawn_detected"] = primary["yawn_detected"]
                 results["fatigue_level"] = primary["fatigue_level"]
                 results["landmarks"] = primary["landmarks"]
+                results["pose_ok"] = bool(primary.get("pose_ok", True))
+                results["landmark_quality"] = primary.get("landmark_quality")
         except Exception as e:  # noqa: BLE001
             print(f"多人疲劳检测异常: {e}")
             results["eye_aspect_ratio"] = None

@@ -37,10 +37,24 @@ PRESET_KEYS = (
     "ear_sample_interval_ms",
     "behavior_confirm_frames",
     "behavior_window_frames",
+    "behavior_sensitivity",
     "compute_yolo_threads",
     "compute_ear_threads",
     "ear_busy_stretch_pct",
     "mono_camera_mode",
+)
+
+# Plain-language behavior modes (write existing confirm/conf keys)
+BEHAVIOR_MODE_KEYS = (
+    "behavior_sensitivity",
+    "behavior_confirm_frames",
+    "behavior_window_frames",
+    "yolo_conf_thresh",
+    "yolo_conf_smoke",
+    "yolo_conf_phone",
+    "yolo_conf_water",
+    "yolo_spatial_filter",
+    "yolo_near_face_ratio",
 )
 
 
@@ -55,14 +69,15 @@ def _base_cpu_smooth() -> Dict[str, str]:
         "yolo_conf_water": "0.35",
         "yolo_conf_face": "0.40",
         "yolo_iou_thresh": "0.5",
-        "yolo_imgsz": "640",
-        "yolo_detect_max_width": "960",
+        "yolo_imgsz": "512",
+        "yolo_detect_max_width": "800",
         "yolo_spatial_filter": "true",
         "yolo_near_face_ratio": "1.5",
         "detection_interval": "600",
         "ear_sample_interval_ms": "120",
         "behavior_confirm_frames": "2",
         "behavior_window_frames": "5",
+        "behavior_sensitivity": "normal",
         "compute_yolo_threads": "0",
         "compute_ear_threads": "0",
         "ear_busy_stretch_pct": "150",
@@ -89,6 +104,7 @@ def _base_balanced(use_cuda: bool) -> Dict[str, str]:
         "ear_sample_interval_ms": "100",
         "behavior_confirm_frames": "2",
         "behavior_window_frames": "5",
+        "behavior_sensitivity": "normal",
         "compute_yolo_threads": "0",
         "compute_ear_threads": "0",
         "ear_busy_stretch_pct": "150",
@@ -116,6 +132,7 @@ def _base_gpu_quality() -> Dict[str, str]:
         "ear_sample_interval_ms": "80",
         "behavior_confirm_frames": "2",
         "behavior_window_frames": "5",
+        "behavior_sensitivity": "normal",
         "compute_yolo_threads": "0",
         "compute_ear_threads": "0",
         "ear_busy_stretch_pct": "120",
@@ -127,13 +144,13 @@ PRESET_META = {
     "cpu_smooth": {
         "title": "工控 CPU · 流畅",
         "subtitle": "推荐无独显的工业电脑",
-        "hint": "优先不卡顿，行为灵敏度适中",
+        "hint": "优先不卡顿；降低送检分辨率。彩色相机请保持黑白增强关闭",
         "icon": "fa-microchip",
     },
     "balanced": {
-        "title": "均衡",
-        "subtitle": "多数现场默认选择",
-        "hint": "速度与检出率折中；有 GPU 时自动用 GPU",
+        "title": "均衡（推荐）",
+        "subtitle": "多数彩色现场默认选择",
+        "hint": "速度与检出率折中；有 GPU 时自动用 GPU。彩色默认请选此项",
         "icon": "fa-balance-scale",
     },
     "gpu_quality": {
@@ -143,6 +160,73 @@ PRESET_META = {
         "icon": "fa-bolt",
     },
 }
+
+
+def build_behavior_mode(
+    mode_id: str,
+    base_conf: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """
+    Plain-language behavior sensitivity → confirm M/N + conf floors.
+
+    Modes (locked values from optimization plan):
+      normal  均衡：2/5
+      strict  少误报：3/6，行为类 conf +0.05
+      loose   少漏报：2/4，推理 conf 略降
+    """
+    mid = (mode_id or "normal").strip().lower()
+    if mid in ("strict", "少误报"):
+        mid = "strict"
+    elif mid in ("loose", "少漏报"):
+        mid = "loose"
+    else:
+        mid = "normal"
+
+    base = dict(base_conf or {})
+    # Fall back to balanced-like confs when caller has no current values
+    g = float(base.get("yolo_conf_thresh") or 0.30)
+    smoke = float(base.get("yolo_conf_smoke") or 0.28)
+    phone = float(base.get("yolo_conf_phone") or 0.30)
+    water = float(base.get("yolo_conf_water") or 0.30)
+
+    def _c(v: float) -> str:
+        return f"{max(0.15, min(0.95, v)):.2f}"
+
+    if mid == "strict":
+        return {
+            "behavior_sensitivity": "strict",
+            "behavior_confirm_frames": "3",
+            "behavior_window_frames": "6",
+            "yolo_conf_thresh": _c(g + 0.05),
+            "yolo_conf_smoke": _c(smoke + 0.05),
+            "yolo_conf_phone": _c(phone + 0.05),
+            "yolo_conf_water": _c(water + 0.05),
+            "yolo_spatial_filter": "true",
+            "yolo_near_face_ratio": "1.3",
+        }
+    if mid == "loose":
+        return {
+            "behavior_sensitivity": "loose",
+            "behavior_confirm_frames": "2",
+            "behavior_window_frames": "4",
+            "yolo_conf_thresh": _c(g - 0.05),
+            "yolo_conf_smoke": _c(max(0.18, smoke - 0.05)),
+            "yolo_conf_phone": _c(max(0.18, phone - 0.05)),
+            "yolo_conf_water": _c(max(0.18, water - 0.05)),
+            "yolo_spatial_filter": "true",
+            "yolo_near_face_ratio": "1.8",
+        }
+    return {
+        "behavior_sensitivity": "normal",
+        "behavior_confirm_frames": "2",
+        "behavior_window_frames": "5",
+        "yolo_conf_thresh": _c(g),
+        "yolo_conf_smoke": _c(smoke),
+        "yolo_conf_phone": _c(phone),
+        "yolo_conf_water": _c(water),
+        "yolo_spatial_filter": "true",
+        "yolo_near_face_ratio": "1.5",
+    }
 
 
 def build_preset(preset_id: str, cuda_available: Optional[bool] = None) -> Dict[str, str]:

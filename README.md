@@ -74,6 +74,16 @@ python manage.py runserver 127.0.0.1:8000
 ## 黑白工业相机微调
 
 见 `datasets/mono_behavior/README.md` 与 `tools/finetune_mono_yolo.py`。
+**彩色现场请优先**用 `tools/finetune_yolo.py` 在彩色标注数据上微调，黑白增强（CLAHE）仅作轻度适配。
+
+## ONNX 加速（可选）
+
+```bash
+pip install onnx onnxruntime   # GPU 可用时也可装 onnxruntime-gpu
+python tools/export_yolo_onnx.py
+```
+
+将生成 `fatigue_detection_system/weights/best.onnx`。应用启动时优先加载 ONNX，失败则回退 `best.pt`。
 
 ## 技术栈
 
@@ -88,8 +98,9 @@ python manage.py runserver 127.0.0.1:8000
 Fatigue_Detection/
 ├── fatigue_detection_system/   # Django 应用
 ├── deploy/                     # 便携 / 一键安装
-├── datasets/mono_behavior/     # 微调数据布局
-├── tools/                      # 微调脚本
+├── datasets/color_behavior/    # 彩色微调（推荐）
+├── datasets/mono_behavior/     # 黑白微调（轻度）
+├── tools/                      # 微调 / ONNX 导出
 ├── requirements.txt
 ├── start.bat / stop.bat
 └── README.md

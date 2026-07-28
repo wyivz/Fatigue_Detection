@@ -136,10 +136,97 @@ class YOLODetector:
             weights_path = os.path.join(settings.BASE_DIR, "weights", "best.pt")
 
         self.load_config()
-        self.model = _yolo_cls()(weights_path)
+        self.model = None
+        self.backend = "pt"
+        self._load_model(weights_path)
         self._apply_runtime_params()
         self.class_names = list(self.CLASS_NAMES)
         self._sticky_primary_bbox: Optional[List[int]] = None
+        # ROI cascade: after sticky face is stable, infer on face neighborhood
+        self._roi_stable_hits: int = 0
+        self._detect_frame_i: int = 0
+        self._roi_full_every: int = 4  # force full-frame every K detects
+        self._last_roi_offset: Optional[Tuple[int, int]] = None
+        self._last_used_roi: bool = False
+
+    def _load_model(self, weights_path: str) -> None:
+        """Prefer ONNX beside .pt; fall back to Ultralytics .pt."""
+        pt_path = weights_path
+        onnx_path = None
+        if pt_path.lower().endswith(".pt"):
+            onnx_path = pt_path[:-3] + ".onnx"
+        elif pt_path.lower().endswith(".onnx"):
+            onnx_path = pt_path
+            pt_path = pt_path[:-5] + ".pt"
+
+        loaded = False
+        if onnx_path and os.path.isfile(onnx_path):
+            try:
+                self.model = _yolo_cls()(onnx_path)
+                self.backend = "onnx"
+                loaded = True
+                print(f"YOLO loaded ONNX: {onnx_path}")
+            except Exception as e:  # noqa: BLE001
+                print(f"ONNX load failed ({e}), falling back to .pt")
+        if not loaded:
+            if not os.path.isfile(pt_path):
+                raise FileNotFoundError(f"YOLO weights not found: {pt_path}")
+            self.model = _yolo_cls()(pt_path)
+            self.backend = "pt"
+            print(f"YOLO loaded PyTorch: {pt_path}")
+
+    def _face_roi_crop(
+        self, image: np.ndarray, face_bbox: List[int]
+    ) -> Tuple[np.ndarray, int, int]:
+        """Crop around primary face using near_face_ratio; return crop + origin."""
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in face_bbox]
+        diag = _bbox_diag([x1, y1, x2, y2])
+        pad = int(diag * float(self.near_face_ratio) * 0.55)
+        cx1 = max(0, x1 - pad)
+        cy1 = max(0, y1 - pad)
+        cx2 = min(w, x2 + pad)
+        cy2 = min(h, y2 + pad)
+        if cx2 - cx1 < 32 or cy2 - cy1 < 32:
+            return image, 0, 0
+        return image[cy1:cy2, cx1:cx2].copy(), cx1, cy1
+
+    def _should_use_roi(self) -> bool:
+        self._detect_frame_i += 1
+        if self._sticky_primary_bbox is None:
+            self._roi_stable_hits = 0
+            return False
+        if self._roi_stable_hits < 2:
+            return False
+        # Every Kth frame: full image to re-lock face / catch far behaviors
+        if (self._detect_frame_i % max(1, int(self._roi_full_every))) == 0:
+            return False
+        return True
+
+    def _remap_result_boxes(self, result, ox: int, oy: int, full_shape) -> Any:
+        """Shift YOLO boxes from crop coords back to full-frame coords."""
+        try:
+            if result is None:
+                return result
+            try:
+                result.orig_shape = full_shape[:2]
+            except Exception:  # noqa: BLE001
+                pass
+            if result.boxes is None or len(result.boxes) == 0:
+                return result
+            data = result.boxes.data
+            if hasattr(data, "clone"):
+                data = data.clone()
+            else:
+                data = data.copy()
+            data[:, 0] += float(ox)
+            data[:, 1] += float(oy)
+            data[:, 2] += float(ox)
+            data[:, 3] += float(oy)
+            result.boxes.data = data
+        except Exception as e:  # noqa: BLE001
+            print(f"ROI remap failed: {e}")
+        return result
 
     def load_config(self):
         from detection.utils.compute_scheduler import compute_scheduler
@@ -194,13 +281,20 @@ class YOLODetector:
 
     def _infer_conf(self) -> float:
         """
-        YOLO/Ultralytics applies one conf before per-class floors.
+        Ultralytics applies one conf before per-class post floors.
 
-        Use the global threshold for inference speed. Per-class floors only
-        raise the bar in post-process (they cannot recover boxes below global).
-        Lowering infer conf to min(smoke, ...) caused heavy NMS / stutter.
+        Infer at min(global, per-class floors) so soft class floors (e.g. smoke)
+        can still surface candidates; post-process raises per class. Absolute
+        floor 0.15 caps NMS cost on CPU.
         """
-        return max(0.01, min(0.99, float(self.conf_thresh)))
+        floors = (
+            float(self.conf_thresh),
+            float(self.conf_face),
+            float(self.conf_smoke),
+            float(self.conf_phone),
+            float(self.conf_water),
+        )
+        return max(0.15, min(0.99, min(floors)))
 
     def _apply_runtime_params(self) -> None:
         from detection.utils.compute_scheduler import compute_scheduler
@@ -214,7 +308,8 @@ class YOLODetector:
             self.model.iou = self.iou_thresh
         except Exception:  # noqa: BLE001
             pass
-        if self.device:
+        # .to() is for PyTorch modules; ONNX Runtime selects EP via predict kwargs
+        if self.device and getattr(self, "backend", "pt") == "pt":
             try:
                 self.model.to(self.device)
             except Exception as e:  # noqa: BLE001
@@ -222,27 +317,50 @@ class YOLODetector:
                 self.device = "cpu"
 
     def detect(self, image):
-        """Run inference under YOLO thread quota; CUDA uses FP16 when enabled."""
+        """Run inference under YOLO thread quota; CUDA uses FP16 when enabled.
+
+        When sticky primary face is stable, runs on a face-neighborhood ROI
+        (full frame every N ticks to avoid track loss).
+        """
         from detection.utils.compute_scheduler import compute_scheduler
 
-        # Match pre-regression path: global conf only; imgsz only when configured
-        # (or explicit default 640). Avoid ultra-low conf that balloons NMS cost.
         kwargs = {
             "verbose": False,
             "conf": float(self._infer_conf()),
             "iou": float(self.iou_thresh),
             "imgsz": int(self.imgsz or 640),
-            # Cap candidates — low conf + GigE frames otherwise flood NMS on CPU
             "max_det": 100,
         }
+
+        use_roi = self._should_use_roi()
+        ox = oy = 0
+        infer_img = image
+        self._last_used_roi = False
+        self._last_roi_offset = None
+        if use_roi and self._sticky_primary_bbox is not None:
+            crop, ox, oy = self._face_roi_crop(image, self._sticky_primary_bbox)
+            ch, cw = crop.shape[:2]
+            ih, iw = image.shape[:2]
+            if cw < iw or ch < ih:
+                infer_img = crop
+                self._last_used_roi = True
+                self._last_roi_offset = (ox, oy)
 
         with compute_scheduler.yolo_context() as plan:
             if plan.use_cuda:
                 kwargs["device"] = plan.device
-                if plan.cuda_half:
+                # FP16 is for PyTorch CUDA; ONNX uses CUDA EP without half kw
+                if plan.cuda_half and getattr(self, "backend", "pt") == "pt":
                     kwargs["half"] = True
-            results = self.model(image, **kwargs)
-        return results[0]
+            elif self.device:
+                kwargs["device"] = self.device
+            results = self.model(infer_img, **kwargs)
+        result = results[0]
+        if self._last_used_roi and self._last_roi_offset is not None:
+            result = self._remap_result_boxes(
+                result, self._last_roi_offset[0], self._last_roi_offset[1], image.shape
+            )
+        return result
 
     def warmup(self, runs: int = 2) -> float:
         """Run dummy inferences so first real frame is not a cold-start spike."""
@@ -299,11 +417,10 @@ class YOLODetector:
             raw.append(det)
         processed_data["raw_detections"] = raw
 
-        # Per-class confidence floors (raise-only vs global; cannot recover below infer conf)
+        # Per-class floors raise the bar after a softer infer conf
         kept: List[Dict[str, Any]] = []
-        infer_floor = float(self._infer_conf())
         for det in raw:
-            floor = max(infer_floor, float(self._class_conf_floor(det["class_id"])))
+            floor = float(self._class_conf_floor(det["class_id"]))
             if det["confidence"] < floor:
                 processed_data["filtered_out"].append(
                     {**det, "reason": f"conf<{floor:.2f}"}
@@ -327,7 +444,17 @@ class YOLODetector:
         face_bbox = primary["bbox"] if primary is not None else None
         # Keep sticky across brief misses so the next hit re-locks the same face
         if face_bbox is not None:
+            if self._sticky_primary_bbox is not None:
+                iou = _bbox_iou(face_bbox, self._sticky_primary_bbox)
+                if iou >= 0.12:
+                    self._roi_stable_hits = min(20, int(self._roi_stable_hits) + 1)
+                else:
+                    self._roi_stable_hits = 0
+            else:
+                self._roi_stable_hits = 1
             self._sticky_primary_bbox = list(face_bbox)
+        else:
+            self._roi_stable_hits = max(0, int(self._roi_stable_hits) - 1)
 
         final: List[Dict[str, Any]] = []
         for det in kept:
@@ -374,6 +501,9 @@ class YOLODetector:
             "kept_count": len(final),
             "filtered_count": len(processed_data["filtered_out"]),
             "face_count": len(face_boxes),
+            "used_roi": bool(self._last_used_roi),
+            "roi_stable_hits": int(self._roi_stable_hits),
+            "backend": getattr(self, "backend", "pt"),
             "top_conf": {
                 name: max(
                     (d["confidence"] for d in raw if d["class_name"] == name),

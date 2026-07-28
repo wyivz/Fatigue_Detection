@@ -235,7 +235,8 @@
                     <p class="small text-muted mb-2" id="perf-config-hint">
                         当前设定：EAR {{ ear_sample_interval_ms|default:100 }} ms /
                         行为 {{ detection_interval|default:500 }} ms。
-                        脸部框/关键点跟随 EAR；行为框跟随检测间隔。建议间隔 ≈ 平均耗时 × 1.5
+                        脸部框/关键点跟随 EAR；行为框跟随检测间隔。
+                        电脑摄像头轮询请勿短于行为检测间隔，否则易卡顿。
                     </p>
                     <div class="table-responsive">
                         <table class="table table-sm mb-0" id="perf-timing-table">

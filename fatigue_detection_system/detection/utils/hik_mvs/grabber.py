@@ -60,6 +60,8 @@ class MvsGrabber:
         self._overlay_wh: Optional[Tuple[int, int]] = None
         self._overlay_at: float = 0.0
         self._overlay_ttl_sec: float = 1.2
+        self._overlay_refine_every: int = 5  # full HOG refine every N detects
+        self._detect_overlay_count: int = 0
         self._last_jpeg_encode_at: float = 0.0
         self._frame_seq = 0
         self._detect_busy = False
@@ -120,6 +122,7 @@ class MvsGrabber:
             self._overlay_detections = []
             self._overlay_wh = None
             self._overlay_at = 0.0
+            self._detect_overlay_count = 0
             self._last_jpeg_encode_at = 0.0
             self._frame_seq = 0
             self._timing_avg = {}
@@ -604,8 +607,8 @@ class MvsGrabber:
         detections: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        Run dlib on the YOLO frame and return a rigid overlay packet.
-        Box is derived from landmarks when available (prevents box/point split).
+        Build overlay packet. Prefer fresh EAR landmarks (reuse) to avoid a
+        second full dlib refine on every YOLO tick; run full refine every N.
         """
         try:
             from detection.views import dlib_detector
@@ -620,15 +623,35 @@ class MvsGrabber:
             except (TypeError, ValueError):
                 primary = None
 
+        self._detect_overlay_count = int(self._detect_overlay_count or 0) + 1
+        do_full = (self._detect_overlay_count % max(1, int(self._overlay_refine_every))) == 0
+
         lm = None
-        if primary is not None and dlib_detector is not None:
+        reused = False
+        # Reuse EAR landmarks when fresh and same canvas size
+        with self._lock:
+            age = time.time() - float(self._overlay_at or 0.0)
+            ear_lm = self._latest_landmarks
+            ear_wh = self._latest_landmarks_size
+            if (
+                not do_full
+                and ear_lm is not None
+                and ear_wh is not None
+                and int(ear_wh[0]) == dw
+                and int(ear_wh[1]) == dh
+                and age < float(self._overlay_ttl_sec)
+            ):
+                lm = np.asarray(ear_lm).copy()
+                reused = True
+
+        if lm is None and primary is not None and dlib_detector is not None:
             try:
                 dlib_res = dlib_detector.detect_fatigue_multi(
                     det_frame,
                     face_bboxes=[primary],
                     primary_bbox=primary,
                     allow_hog=False,
-                    refine_rect=True,
+                    refine_rect=True if do_full else "light",
                 )
                 lm = dlib_res.get("landmarks")
             except Exception:  # noqa: BLE001
@@ -646,6 +669,7 @@ class MvsGrabber:
             "detections": list(detections or []),
             "wh": (dw, dh),
             "yolo_bbox": primary,
+            "landmarks_reused": bool(reused),
         }
 
     def _store_overlay(self, packet: Dict[str, Any]) -> None:
@@ -1019,7 +1043,7 @@ class MvsGrabber:
                                 face_bboxes=scaled_boxes,
                                 primary_bbox=scaled_primary,
                                 allow_hog=False,
-                                refine_rect=False,
+                                refine_rect="light",
                             )
                             ear_cost = (time.perf_counter() - t_ear) * 1000.0
 
@@ -1056,6 +1080,15 @@ class MvsGrabber:
                                 pass
 
                         # Tracker / alerts: primary face only
+                        reliable = True
+                        if dlib_results.get("pose_ok") is False:
+                            reliable = False
+                        try:
+                            q = dlib_results.get("landmark_quality")
+                            if q is not None and int(q) < 0:
+                                reliable = False
+                        except (TypeError, ValueError):
+                            pass
                         snap = fatigue_tracker.update(
                             session_id,
                             ear=dlib_results.get("eye_aspect_ratio"),
@@ -1064,6 +1097,7 @@ class MvsGrabber:
                             landmarks=lm,
                             landmarks_size=lm_size,
                             faces=face_entries,
+                            landmark_reliable=reliable,
                         )
 
                         faces_meta = []

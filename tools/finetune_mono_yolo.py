@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Fine-tune behavior YOLO (face/smoke/phone/water) on mono industrial camera data.
+Fine-tune behavior YOLO on mono industrial camera data.
+
+Prefer the generic color finetune for most sites:
+  python tools/finetune_yolo.py --data datasets/color_behavior/data.yaml
+
+This script remains for grayscale-only datasets (same as):
+  python tools/finetune_yolo.py --data datasets/mono_behavior/data.yaml --mono
 
 Dataset layout (YOLO format):
   datasets/mono_behavior/
@@ -10,22 +16,14 @@ Dataset layout (YOLO format):
     labels/val/*.txt
     data.yaml
 
-data.yaml example:
-  path: datasets/mono_behavior
-  train: images/train
-  val: images/val
-  names:
-    0: face
-    1: smoke
-    2: phone
-    3: water
-
 Usage (from repo root, with ultralytics installed):
   python tools/finetune_mono_yolo.py
   python tools/finetune_mono_yolo.py --epochs 80 --imgsz 960 --device 0
 
 After training, copy runs/.../weights/best.pt over:
   fatigue_detection_system/weights/best.pt
+Then optionally:
+  python tools/export_yolo_onnx.py
 """
 from __future__ import annotations
 
@@ -49,37 +47,31 @@ def main() -> None:
     parser.add_argument("--name", type=str, default="finetune")
     args = parser.parse_args()
 
-    data_path = Path(args.data)
-    weights_path = Path(args.weights)
-    if not data_path.is_file():
-        raise SystemExit(
-            f"Missing {data_path}\n"
-            "Create YOLO-format mono dataset first (see docstring)."
-        )
-    if not weights_path.is_file():
-        raise SystemExit(f"Missing base weights: {weights_path}")
+    # Delegate to shared trainer with mono augment flags
+    import runpy
+    import sys
 
-    from ultralytics import YOLO
-
-    model = YOLO(str(weights_path))
-    model.train(
-        data=str(data_path),
-        epochs=int(args.epochs),
-        imgsz=int(args.imgsz),
-        batch=int(args.batch),
-        device=args.device,
-        project=str(args.project),
-        name=str(args.name),
-        exist_ok=True,
-        pretrained=True,
-        # Mono industrial: keep mosaic mild; grayscale-friendly HSV dampening
-        hsv_h=0.0,
-        hsv_s=0.1,
-        hsv_v=0.3,
-    )
-    out = Path(args.project) / args.name / "weights" / "best.pt"
-    print(f"Done. New weights: {out}")
-    print(f"Replace deploy weights with:\n  copy {out} {weights_path}")
+    sys.argv = [
+        "finetune_yolo.py",
+        "--data",
+        str(args.data),
+        "--weights",
+        str(args.weights),
+        "--epochs",
+        str(args.epochs),
+        "--imgsz",
+        str(args.imgsz),
+        "--batch",
+        str(args.batch),
+        "--device",
+        str(args.device),
+        "--project",
+        str(args.project),
+        "--name",
+        str(args.name),
+        "--mono",
+    ]
+    runpy.run_path(str(Path(__file__).resolve().parent / "finetune_yolo.py"), run_name="__main__")
 
 
 if __name__ == "__main__":

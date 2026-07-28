@@ -33,6 +33,34 @@ def _safe_log(msg):
     except OSError:
         pass
 
+# Browser-path persist throttle (session_id -> last persist unix time / fatigue level)
+_browser_last_persist_at = {}
+_browser_last_fatigue_level = {}
+_browser_last_yawn = {}
+
+
+def _resize_for_detect(image, configs=None):
+    """Shrink frame to yolo_detect_max_width (shared by browser + process_image)."""
+    if image is None:
+        return image
+    if configs is None:
+        try:
+            from .utils.config_cache import get_configs
+
+            configs = get_configs()
+        except Exception:  # noqa: BLE001
+            configs = {}
+    try:
+        max_w = int(float((configs or {}).get("yolo_detect_max_width") or 960))
+        max_w = max(640, min(2560, max_w))
+    except (TypeError, ValueError):
+        max_w = 960
+    h0, w0 = image.shape[:2]
+    if w0 <= max_w:
+        return image
+    nh = int(h0 * (max_w / float(w0)))
+    return cv2.resize(image, (max_w, nh), interpolation=cv2.INTER_AREA)
+
 # 检查权重文件是否存在
 yolo_weights_path = os.path.join(settings.BASE_DIR, 'weights', 'best.pt')
 dlib_weights_path = os.path.join(settings.BASE_DIR, 'weights', 'shape_predictor_68_face_landmarks.dat')
@@ -697,10 +725,49 @@ def get_result(request):
             image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if image is None:
                 return JsonResponse({'status': 'error', 'message': '图像解码失败'})
-            
-            # 处理图像
-            result = process_image(image, session, detect_fatigue, detect_behaviors)
-            
+
+            from .utils.config_cache import get_configs
+            import time as _time
+
+            configs = get_configs()
+            image = _resize_for_detect(image, configs)
+
+            # Infer + draw for UI; persist only on interval / behavior / fatigue edge
+            result = process_image(
+                image,
+                session,
+                detect_fatigue,
+                detect_behaviors,
+                include_image_data=True,
+                persist=False,
+            )
+
+            try:
+                persist_iv = float(configs.get('yolo_persist_interval_sec') or 2.0)
+            except (TypeError, ValueError):
+                persist_iv = 2.0
+            persist_iv = max(0.5, min(30.0, persist_iv))
+            sid = int(session.id)
+            now = _time.time()
+            last_at = float(_browser_last_persist_at.get(sid) or 0.0)
+            due = (now - last_at) >= persist_iv
+            behavior_hit = bool(
+                result.get('smoking_detected')
+                or result.get('phone_detected')
+                or result.get('drinking_detected')
+            )
+            level = int(result.get('fatigue_level') or 0)
+            yawn = bool(result.get('yawn_detected'))
+            prev_level = int(_browser_last_fatigue_level.get(sid) or 0)
+            prev_yawn = bool(_browser_last_yawn.get(sid))
+            fatigue_edge = (level > prev_level and level >= 2) or ((not prev_yawn) and yawn)
+            _browser_last_fatigue_level[sid] = level
+            _browser_last_yawn[sid] = yawn
+
+            if due or behavior_hit or fatigue_edge:
+                result = persist_detection_snapshot(image, session, result)
+                _browser_last_persist_at[sid] = now
+
             return JsonResponse(result)
         except Exception as e:
             _safe_log(f"检测过程出现错误: {e}")
@@ -890,6 +957,9 @@ def process_image(
     configs = get_configs()
     mono_cfg = load_mono_config(configs)
 
+    # Align with MVS / browser: shrink before YOLO when still oversized
+    image = _resize_for_detect(image, configs)
+
     face_bbox = None
     processed_yolo = None
     if detect_behaviors and yolo_detector:
@@ -964,12 +1034,23 @@ def process_image(
                 image,
                 face_bboxes=face_bboxes or None,
                 primary_bbox=face_bbox,
+                refine_rect="light",
             )
             timing['dlib_ms'] = round((_time.perf_counter() - t_dlib) * 1000.0, 1)
 
             faces_n = int(dlib_results.get('faces_detected') or 0)
             if faces_n <= 0 and results.get('face_detected') and face_bbox:
                 faces_n = 1
+
+            reliable = True
+            if dlib_results.get('pose_ok') is False:
+                reliable = False
+            try:
+                q = dlib_results.get('landmark_quality')
+                if q is not None and int(q) < 0:
+                    reliable = False
+            except (TypeError, ValueError):
+                pass
 
             snap = fatigue_tracker.update(
                 session.id,
@@ -983,6 +1064,7 @@ def process_image(
                     else None
                 ),
                 faces=dlib_results.get('faces') or [],
+                landmark_reliable=reliable,
             )
             draw_mar = dlib_results.get('mouth_aspect_ratio')
             draw_lm = dlib_results.get('landmarks') or snap.landmarks
@@ -1049,7 +1131,7 @@ def process_image(
             'face_count': int(results.get('face_count') or snap.faces_detected or 0),
         })
 
-    if not persist:
+    if not persist and not include_image_data:
         timing['total_ms'] = round((_time.perf_counter() - t0) * 1000.0, 1)
         results['timing'] = timing
         results['result_image_url'] = None
@@ -1083,6 +1165,22 @@ def process_image(
     else:
         image_with_results = image_with_yolo
     timing['draw_ms'] = round((_time.perf_counter() - t_draw) * 1000.0, 1)
+
+    if not persist:
+        timing['save_ms'] = 0.0
+        timing['total_ms'] = round((_time.perf_counter() - t0) * 1000.0, 1)
+        results['timing'] = timing
+        results['result_image_url'] = None
+        results['detection_id'] = None
+        if include_image_data:
+            ok, buffer = cv2.imencode('.jpg', image_with_results, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            if ok:
+                results['image_data'] = f"data:image/jpeg;base64,{base64.b64encode(buffer.tobytes()).decode('utf-8')}"
+            else:
+                results['image_data'] = None
+        else:
+            results['image_data'] = None
+        return results
 
     t_save = _time.perf_counter()
     detection_result = DetectionResult(

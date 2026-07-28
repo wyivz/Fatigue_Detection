@@ -7,3 +7,7 @@ numpy
 scipy
 matplotlib
 tqdm
+onnx
+onnxruntime
+# Optional GPU ORT (install instead of onnxruntime when CUDA available):
+# onnxruntime-gpu
