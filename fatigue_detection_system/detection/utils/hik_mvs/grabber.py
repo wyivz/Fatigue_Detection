@@ -60,8 +60,15 @@ class MvsGrabber:
         self._overlay_wh: Optional[Tuple[int, int]] = None
         self._overlay_at: float = 0.0
         self._overlay_ttl_sec: float = 1.2
-        self._overlay_refine_every: int = 5  # full HOG refine every N detects
+        self._overlay_refine_every: int = 3  # full HOG refine every N detects
         self._detect_overlay_count: int = 0
+        # EAR: periodic full realign + hold last good landmarks against skew glitches
+        self._ear_tick: int = 0
+        self._ear_full_every: int = 8
+        self._good_landmarks = None
+        self._good_landmarks_size: Optional[Tuple[int, int]] = None
+        self._good_landmarks_at: float = 0.0
+        self._good_landmarks_hold_sec: float = 0.6
         self._last_jpeg_encode_at: float = 0.0
         self._frame_seq = 0
         self._detect_busy = False
@@ -123,6 +130,10 @@ class MvsGrabber:
             self._overlay_wh = None
             self._overlay_at = 0.0
             self._detect_overlay_count = 0
+            self._ear_tick = 0
+            self._good_landmarks = None
+            self._good_landmarks_size = None
+            self._good_landmarks_at = 0.0
             self._last_jpeg_encode_at = 0.0
             self._frame_seq = 0
             self._timing_avg = {}
@@ -558,11 +569,13 @@ class MvsGrabber:
         self,
         landmarks,
         sample_wh: Tuple[int, int],
-        min_iou: float = 0.12,
+        min_iou: float = 0.35,
     ) -> bool:
         """
         Update face box + landmarks from EAR (high rate). Keeps YOLO behavior
         detections untouched. Returns True if overlay was updated.
+
+        min_iou default raised to reject occasional whole-face skew jumps.
         """
         if landmarks is None or sample_wh is None:
             return False
@@ -599,6 +612,46 @@ class MvsGrabber:
             # Do NOT feed landmark hull back into YOLO/EAR face seed — that
             # expands the dlib rect over time ("lock then grow").
         return True
+
+    def _accept_ear_landmarks(self, dlib_detector, lm, dlib_results) -> Tuple[bool, Any]:
+        """
+        Decide whether new EAR landmarks are trustworthy vs last good set.
+        Returns (accepted, landmarks_for_overlay).
+        """
+        if lm is None:
+            return False, None
+        reliable = True
+        if dlib_results.get("pose_ok") is False:
+            reliable = False
+        try:
+            q = dlib_results.get("landmark_quality")
+            if q is not None and int(q) < 0:
+                reliable = False
+        except (TypeError, ValueError):
+            pass
+
+        with self._lock:
+            prev = self._good_landmarks
+            prev_at = float(self._good_landmarks_at or 0.0)
+            hold = float(self._good_landmarks_hold_sec)
+
+        if prev is not None and dlib_detector is not None:
+            try:
+                if not dlib_detector.landmarks_stable_vs_prev(lm, prev):
+                    reliable = False
+            except Exception:  # noqa: BLE001
+                pass
+
+        if reliable:
+            with self._lock:
+                self._good_landmarks = np.asarray(lm).copy()
+                self._good_landmarks_at = time.time()
+            return True, lm
+
+        # Hold last good briefly instead of flashing a skewed face
+        if prev is not None and (time.time() - prev_at) <= hold:
+            return False, prev
+        return False, None
 
     def _compute_detect_overlay(
         self,
@@ -1037,14 +1090,53 @@ class MvsGrabber:
                                 self._latest_landmarks = None
                                 self._latest_landmarks_size = None
                                 self._latest_landmark_faces = []
+                                self._good_landmarks = None
+                                self._good_landmarks_size = None
+                                self._good_landmarks_at = 0.0
                         else:
+                            self._ear_tick = int(self._ear_tick or 0) + 1
+                            do_full = (
+                                self._ear_tick % max(1, int(self._ear_full_every or 8))
+                            ) == 0
+                            refine = "full" if do_full else "light"
                             dlib_results = dlib_detector.detect_fatigue_multi(
                                 sample,
                                 face_bboxes=scaled_boxes,
                                 primary_bbox=scaled_primary,
                                 allow_hog=False,
-                                refine_rect="light",
+                                refine_rect=refine,
                             )
+                            # Light result looks skewed → one HOG realign retry
+                            lm_try = dlib_results.get("landmarks")
+                            need_retry = False
+                            if refine == "light" and lm_try is not None:
+                                if dlib_results.get("pose_ok") is False:
+                                    need_retry = True
+                                else:
+                                    try:
+                                        q = dlib_results.get("landmark_quality")
+                                        if q is not None and int(q) < 0:
+                                            need_retry = True
+                                    except (TypeError, ValueError):
+                                        pass
+                                    with self._lock:
+                                        prev_g = self._good_landmarks
+                                    if (
+                                        not need_retry
+                                        and prev_g is not None
+                                        and not dlib_detector.landmarks_stable_vs_prev(
+                                            lm_try, prev_g
+                                        )
+                                    ):
+                                        need_retry = True
+                            if need_retry:
+                                dlib_results = dlib_detector.detect_fatigue_multi(
+                                    sample,
+                                    face_bboxes=scaled_boxes,
+                                    primary_bbox=scaled_primary,
+                                    allow_hog=False,
+                                    refine_rect="full",
+                                )
                             ear_cost = (time.perf_counter() - t_ear) * 1000.0
 
                     # Warmup: run models for cache, but do not feed trackers / UI state
@@ -1066,37 +1158,48 @@ class MvsGrabber:
                         lm = dlib_results.get("landmarks")
                         face_entries = list(dlib_results.get("faces") or [])
                         lm_size = (int(sw), int(sh)) if lm is not None else None
-                        if lm is None and not in_warmup:
-                            with self._lock:
-                                self._latest_landmarks = None
-                                self._latest_landmarks_size = None
-                                self._latest_landmark_faces = []
 
-                        # High-rate face overlay refresh (behavior boxes stay on YOLO cadence)
-                        if lm is not None and lm_size is not None:
+                        accepted, lm_draw = self._accept_ear_landmarks(
+                            dlib_detector, lm, dlib_results
+                        )
+                        reliable = bool(accepted)
+                        if lm_draw is not None:
+                            lm_size = (int(sw), int(sh))
+                        elif lm is None:
+                            # Brief miss: keep last good for overlay if still in hold
+                            with self._lock:
+                                g = self._good_landmarks
+                                gat = float(self._good_landmarks_at or 0.0)
+                                hold = float(self._good_landmarks_hold_sec)
+                            if g is not None and (time.time() - gat) <= hold:
+                                lm_draw = g
+                                lm_size = (int(sw), int(sh))
+                            else:
+                                with self._lock:
+                                    self._latest_landmarks = None
+                                    self._latest_landmarks_size = None
+                                    self._latest_landmark_faces = []
+
+                        # High-rate face overlay: only push accepted or held-good points
+                        if lm_draw is not None and lm_size is not None:
                             try:
-                                self._refresh_face_overlay_from_ear(lm, lm_size)
+                                self._refresh_face_overlay_from_ear(
+                                    lm_draw, lm_size, min_iou=0.35 if accepted else 0.0
+                                )
                             except Exception:  # noqa: BLE001
                                 pass
 
-                        # Tracker / alerts: primary face only
-                        reliable = True
-                        if dlib_results.get("pose_ok") is False:
-                            reliable = False
-                        try:
-                            q = dlib_results.get("landmark_quality")
-                            if q is not None and int(q) < 0:
-                                reliable = False
-                        except (TypeError, ValueError):
-                            pass
+                        # Tracker: raw metrics only when landmarks accepted (else no closed-eye push)
                         snap = fatigue_tracker.update(
                             session_id,
                             ear=dlib_results.get("eye_aspect_ratio"),
-                            yawn_detected=bool(dlib_results.get("yawn_detected")),
-                            faces_detected=faces_n,
-                            landmarks=lm,
+                            yawn_detected=bool(dlib_results.get("yawn_detected"))
+                            if accepted
+                            else False,
+                            faces_detected=faces_n if lm is not None or accepted else 0,
+                            landmarks=lm_draw if lm_draw is not None else lm,
                             landmarks_size=lm_size,
-                            faces=face_entries,
+                            faces=face_entries if accepted else [],
                             landmark_reliable=reliable,
                         )
 

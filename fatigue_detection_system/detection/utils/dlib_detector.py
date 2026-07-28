@@ -311,6 +311,68 @@ class DlibDetector:
             # One eye much smaller than the other → strong yaw
             if min(left_w, right_w) < 0.35 * max(left_w, right_w):
                 return False
+            # Extreme eye-line roll → whole-face skew glitch
+            if DlibDetector._eye_line_roll_deg(pts) > 28.0:
+                return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _eye_line_roll_deg(pts) -> float:
+        """Absolute roll angle of outer-eye line in degrees."""
+        try:
+            p = np.asarray(pts, dtype=np.float64)
+            dx = float(p[45, 0] - p[36, 0])
+            dy = float(p[45, 1] - p[36, 1])
+            if abs(dx) < 1e-3 and abs(dy) < 1e-3:
+                return 90.0
+            return abs(float(np.degrees(np.arctan2(dy, dx))))
+        except Exception:  # noqa: BLE001
+            return 90.0
+
+    @staticmethod
+    def landmarks_stable_vs_prev(
+        new_lm,
+        prev_lm,
+        max_center_shift_ratio: float = 0.20,
+        min_hull_iou: float = 0.40,
+        max_roll_delta_deg: float = 18.0,
+    ) -> bool:
+        """
+        True when new 68-pt set is a plausible continuation of prev.
+        Rejects occasional whole-face skew / jump glitches on industrial video.
+        """
+        try:
+            a = np.asarray(new_lm, dtype=np.float64)
+            b = np.asarray(prev_lm, dtype=np.float64)
+            if a.shape[0] < 68 or b.shape[0] < 68:
+                return False
+            ax1, ay1 = float(np.min(a[:, 0])), float(np.min(a[:, 1]))
+            ax2, ay2 = float(np.max(a[:, 0])), float(np.max(a[:, 1]))
+            bx1, by1 = float(np.min(b[:, 0])), float(np.min(b[:, 1]))
+            bx2, by2 = float(np.max(b[:, 0])), float(np.max(b[:, 1]))
+            acx, acy = 0.5 * (ax1 + ax2), 0.5 * (ay1 + ay2)
+            bcx, bcy = 0.5 * (bx1 + bx2), 0.5 * (by1 + by2)
+            diag = max(1.0, ((bx2 - bx1) ** 2 + (by2 - by1) ** 2) ** 0.5)
+            shift = ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5
+            if shift > float(max_center_shift_ratio) * diag:
+                return False
+            # Hull IoU
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+            inter = iw * ih
+            area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            union = area_a + area_b - inter
+            iou = (inter / union) if union > 1e-6 else 0.0
+            if iou < float(min_hull_iou):
+                return False
+            roll_a = DlibDetector._eye_line_roll_deg(a)
+            roll_b = DlibDetector._eye_line_roll_deg(b)
+            if abs(roll_a - roll_b) > float(max_roll_delta_deg):
+                return False
             return True
         except Exception:  # noqa: BLE001
             return False
