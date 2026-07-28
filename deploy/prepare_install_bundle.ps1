@@ -57,6 +57,18 @@ $OutApp = Join-Path $OutDir "app"
 cmd /c "robocopy `"$SrcApp`" `"$OutApp`" /E /XD __pycache__ .git media\results media\uploads /XF *.pyc .DS_Store *.sqlite3 /NFL /NDL /NJH /NJS /nc /ns /np" | Out-Null
 if ($LASTEXITCODE -ge 8) { throw "robocopy app failed: $LASTEXITCODE" }
 
+Write-Host "1b/6 Copy training helpers (tools + dataset templates) ..."
+$SrcTools = Join-Path $ProjectRoot "tools"
+$SrcDatasets = Join-Path $ProjectRoot "datasets"
+if (Test-Path -LiteralPath $SrcTools) {
+    cmd /c "robocopy `"$SrcTools`" `"$OutApp\tools`" /E /XD __pycache__ /XF *.pyc .DS_Store /NFL /NDL /NJH /NJS /nc /ns /np" | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy tools failed: $LASTEXITCODE" }
+}
+if (Test-Path -LiteralPath $SrcDatasets) {
+    cmd /c "robocopy `"$SrcDatasets`" `"$OutApp\datasets`" /E /XD __pycache__ /XF *.pyc .DS_Store /NFL /NDL /NJH /NJS /nc /ns /np" | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy datasets failed: $LASTEXITCODE" }
+}
+
 foreach ($sub in @("media\results", "media\uploads")) {
     $d = Join-Path $OutApp $sub
     New-Item -ItemType Directory -Force -Path $d | Out-Null
@@ -78,6 +90,8 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "bundle_start.bat") -Destination
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "stop.bat") -Destination (Join-Path $OutDir "stop.bat") -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "stop.ps1") -Destination (Join-Path $OutDir "stop.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "MVS_SETUP.txt") -Destination (Join-Path $OutDir "MVS_SETUP.txt") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "train_behavior.ps1") -Destination (Join-Path $OutDir "train_behavior.ps1") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "train_behavior.bat") -Destination (Join-Path $OutDir "train_behavior.bat") -Force
 
 # Embed a ready-to-use Python 3.8 tree so target PCs do NOT need the MSI/exe installer
 # (silent TargetDir installs often fail with exit 1603 on locked-down industrial Windows).
@@ -231,6 +245,7 @@ Target PC needs NO internet.
 3. Double-click start.bat
 4. Browser http://127.0.0.1:8000/   admin / ChangeMeNow!
 5. GigE: install MVS Runtime on target (see MVS_SETUP.txt) — MVS is separate
+6. Fine-tune behavior model later with train_behavior.bat
 Torch variant in this pack: $TorchVariant $(if ($TorchVariant -eq 'Cuda') { $CudaIndex })
 "@
 } else {

@@ -20,7 +20,10 @@ from pathlib import Path
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    default_weights = root / "fatigue_detection_system" / "weights" / "best.pt"
+    if (root / "manage.py").is_file():
+        default_weights = root / "weights" / "best.pt"
+    else:
+        default_weights = root / "fatigue_detection_system" / "weights" / "best.pt"
 
     parser = argparse.ArgumentParser(description="Export YOLO best.pt → best.onnx")
     parser.add_argument("--weights", type=str, default=str(default_weights))

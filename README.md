@@ -77,13 +77,16 @@ python manage.py runserver 127.0.0.1:8000
 - 便携包：`deploy/prepare_portable.ps1`
 - 一键安装包：`deploy/prepare_install_bundle.ps1` → 目标机运行 `install.bat`
 - GigE：安装海康 MVS Runtime，说明见 `deploy/MVS_SETUP.txt`
+- 离线包安装完成后，可直接双击 `train_behavior.bat` 做现场行为识别微调
 
 一键安装若自动创建管理员，默认口令为 `ChangeMeNow!`，登录后请立即修改。
 
 ## 黑白工业相机微调
 
-见 `datasets/mono_behavior/README.md` 与 `tools/finetune_mono_yolo.py`。
+见 `datasets/color_behavior/README.md`、`datasets/mono_behavior/README.md`、
+`tools/finetune_yolo.py` 与 `tools/finetune_mono_yolo.py`。
 **彩色现场请优先**用 `tools/finetune_yolo.py` 在彩色标注数据上微调，黑白增强（CLAHE）仅作轻度适配。
+离线安装包场景下，安装完成后可直接双击根目录 `train_behavior.bat`，脚本会自动选择数据集、训练、回写 `best.pt` 并导出 `best.onnx`。
 
 ## ONNX 加速（可选）
 

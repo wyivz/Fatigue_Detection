@@ -38,10 +38,18 @@ import argparse
 from pathlib import Path
 
 
-def main() -> None:
+def _resolve_layout() -> tuple[Path, Path]:
     root = Path(__file__).resolve().parents[1]
+    if (root / "manage.py").is_file():
+        return root, root
+    app_dir = root / "fatigue_detection_system"
+    return root, app_dir
+
+
+def main() -> None:
+    root, app_dir = _resolve_layout()
     default_data = root / "datasets" / "color_behavior" / "data.yaml"
-    default_weights = root / "fatigue_detection_system" / "weights" / "best.pt"
+    default_weights = app_dir / "weights" / "best.pt"
 
     parser = argparse.ArgumentParser(
         description="Fine-tune behavior YOLO (color preferred; --mono for grayscale)"

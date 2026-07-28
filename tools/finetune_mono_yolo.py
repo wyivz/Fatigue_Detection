@@ -34,7 +34,10 @@ from pathlib import Path
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     default_data = root / "datasets" / "mono_behavior" / "data.yaml"
-    default_weights = root / "fatigue_detection_system" / "weights" / "best.pt"
+    if (root / "manage.py").is_file():
+        default_weights = root / "weights" / "best.pt"
+    else:
+        default_weights = root / "fatigue_detection_system" / "weights" / "best.pt"
 
     parser = argparse.ArgumentParser(description="Fine-tune mono behavior YOLO")
     parser.add_argument("--data", type=str, default=str(default_data))

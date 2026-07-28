@@ -1,6 +1,8 @@
 # Color behavior fine-tune dataset (recommended)
 
 Use in-cabin / dashcam **color** frames for best smoke / phone / water / face recall.
+This layout is used both in the source repo (`datasets/color_behavior/`) and in
+the offline package (`app/datasets/color_behavior/`).
 
 ```
 datasets/color_behavior/
@@ -30,6 +32,11 @@ Train:
 ```
 python tools/finetune_yolo.py --data datasets/color_behavior/data.yaml --device 0
 ```
+
+Offline package:
+
+1. Copy your labeled files into `app/datasets/color_behavior/`
+2. Double-click `train_behavior.bat`
 
 Deploy:
 
