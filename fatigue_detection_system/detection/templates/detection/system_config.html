@@ -145,10 +145,10 @@
                                            value="{{ configs.behavior_sensitivity|default:'normal' }}">
                                     <select id="behaviorSensitivity" class="form-select">
                                         <option value="strict">少误报（更难触发，可能漏检）</option>
-                                        <option value="normal">均衡（推荐）</option>
-                                        <option value="loose">少漏报（更容易抓住短暂行为）</option>
+                                        <option value="normal">均衡</option>
+                                        <option value="loose">少漏报（推荐，接近原版）</option>
                                     </select>
-                                    <div class="form-text">会同步调整确认次数（M/N）与识别门槛。细节仍可在高级设置里改</div>
+                                    <div class="form-text">推荐「少漏报」：全图检测、不贴脸硬滤、确认 1/1（原版即时）。细节仍可在高级设置里改</div>
                                 </div>
                             </div>
                         </div>
@@ -195,17 +195,20 @@
                                     <div class="col-md-8">
                                         <input type="number" step="50" min="50" max="2000" name="config_detection_interval"
                                                id="config_detection_interval" class="form-control"
-                                               value="{{ configs.detection_interval|default:'500' }}">
+                                               value="{{ configs.detection_interval|default:'700' }}">
                                         <div class="form-text">多久跑一次抽烟/电话/喝水检测。数字越大越省性能、反应越慢。CPU 建议 500–800</div>
                                     </div>
                                 </div>
                                 <div class="row mb-3">
-                                    <label class="col-md-4 col-form-label">闭眼采样间隔（毫秒）</label>
+                                    <label class="col-md-4 col-form-label">闭眼采样间隔（毫秒） <span class="text-muted">(预留)</span></label>
                                     <div class="col-md-8">
                                         <input type="number" step="10" min="50" max="500" name="config_ear_sample_interval_ms"
                                                id="config_ear_sample_interval_ms" class="form-control"
                                                value="{{ configs.ear_sample_interval_ms|default:'100' }}">
-                                        <div class="form-text">工业相机下闭眼/哈欠采样频率。建议 80–150</div>
+                                        <div class="form-text">
+                                            <strong>预留项，当前架构未启用</strong>——闭眼/哈欠现与行为检测同帧完成，
+                                            实际采样频率由上方"检测间隔"决定。
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="row mb-3">
@@ -257,10 +260,10 @@
                                 <div class="row mb-3">
                                     <label class="col-md-4 col-form-label">送检画面最大宽度</label>
                                     <div class="col-md-8">
-                                        <input type="number" step="80" min="640" max="2560" name="config_yolo_detect_max_width"
+                                        <input type="number" step="80" min="0" max="2560" name="config_yolo_detect_max_width"
                                                id="config_yolo_detect_max_width" class="form-control"
                                                value="{{ configs.yolo_detect_max_width|default:'960' }}">
-                                        <div class="form-text">工业相机缩小后再识别。960 常用；1280 更准更卡</div>
+                                        <div class="form-text">等比缩放送检（不裁切视野）。0=原图。推荐 960（接近归档摄像头尺度，点位更稳）；工业 5MP 切勿长期设 0</div>
                                     </div>
                                 </div>
                                 <div class="row mb-3">
@@ -279,8 +282,8 @@
                                             <input type="hidden" name="config_yolo_spatial_filter" value="false">
                                             <input class="form-check-input" type="checkbox" name="config_yolo_spatial_filter"
                                                    value="true" id="config_yolo_spatial_filter"
-                                                   {% if configs.yolo_spatial_filter != 'false' %}checked{% endif %}>
-                                            <label class="form-check-label" for="config_yolo_spatial_filter">开启（减少远处误报）</label>
+                                                   {% if configs.yolo_spatial_filter == 'true' %}checked{% endif %}>
+                                            <label class="form-check-label" for="config_yolo_spatial_filter">开启（减少远处误报；漏检烟/手机时请关闭）</label>
                                         </div>
                                     </div>
                                 </div>
@@ -300,20 +303,20 @@
                                             <div class="col-6">
                                                 <input type="number" step="1" min="1" max="10" name="config_behavior_confirm_frames"
                                                        id="config_behavior_confirm_frames" class="form-control"
-                                                       value="{{ configs.behavior_confirm_frames|default:'2' }}">
+                                                       value="{{ configs.behavior_confirm_frames|default:'1' }}">
                                                 <div class="form-text">M：窗口内至少检出几次</div>
                                             </div>
                                             <div class="col-6">
                                                 <input type="number" step="1" min="1" max="20" name="config_behavior_window_frames"
                                                        id="config_behavior_window_frames" class="form-control"
-                                                       value="{{ configs.behavior_window_frames|default:'5' }}">
+                                                       value="{{ configs.behavior_window_frames|default:'1' }}">
                                                 <div class="form-text">N：统计最近几次结果</div>
                                             </div>
                                         </div>
                                     </div>
                                 </div>
                                 <div class="row mb-3">
-                                    <label class="col-md-4 col-form-label">CPU 线程（YOLO / 闭眼）</label>
+                                    <label class="col-md-4 col-form-label">CPU 线程（YOLO / 闭眼<span class="text-muted">·闭眼预留</span>）</label>
                                     <div class="col-md-8">
                                         <div class="row g-2">
                                             <div class="col-6">
@@ -327,16 +330,23 @@
                                                        value="{{ configs.compute_ear_threads|default:'0' }}">
                                             </div>
                                         </div>
-                                        <div class="form-text">填 0 表示自动分配。一般保持 0</div>
+                                        <div class="form-text">
+                                            填 0 表示自动分配，一般保持 0。左：YOLO 推理线程（生效）。
+                                            右：闭眼采样线程 —
+                                            <strong>预留项，当前同帧架构下未启用</strong>（YOLO/HOG 已在同一检测周期内完成，无需独立闭眼线程）。
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="row mb-3">
-                                    <label class="col-md-4 col-form-label">CPU 忙时闭眼变慢%</label>
+                                    <label class="col-md-4 col-form-label">CPU 忙时闭眼变慢% <span class="text-muted">(预留)</span></label>
                                     <div class="col-md-8">
                                         <input type="number" step="10" min="100" max="300" name="config_ear_busy_stretch_pct"
                                                id="config_ear_busy_stretch_pct" class="form-control"
                                                value="{{ configs.ear_busy_stretch_pct|default:'150' }}">
-                                        <div class="form-text">仅 CPU：行为检测忙时，闭眼采样间隔临时拉长，减轻卡顿</div>
+                                        <div class="form-text">
+                                            <strong>预留项，当前架构未启用</strong>
+                                            （原用于独立闭眼采样线程的忙时降频，同帧架构下已由检测间隔统一控制）
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -353,6 +363,16 @@
                         <div id="collapseFatigue" class="accordion-collapse collapse" aria-labelledby="headingFatigue"
                              data-bs-parent="#advancedConfig">
                             <div class="accordion-body">
+                                <div class="row mb-3">
+                                    <label class="col-md-4 col-form-label">关键点精修</label>
+                                    <div class="col-md-8">
+                                        <select name="config_dlib_refine_mode" id="config_dlib_refine_mode" class="form-select">
+                                            <option value="full" {% if configs.dlib_refine_mode != 'light' %}selected{% endif %}>完整（推荐）— HOG 对齐后再打点，接近原版精度</option>
+                                            <option value="light" {% if configs.dlib_refine_mode == 'light' %}selected{% endif %}>轻度 — 更快，点位可能偶发歪斜</option>
+                                        </select>
+                                        <div class="form-text">本机 CPU / 工作站请保持「完整」。仅在明显卡顿时再改轻度</div>
+                                    </div>
+                                </div>
                                 <div class="row mb-3">
                                     <label class="col-md-4 col-form-label">闭眼阈值 (EAR)</label>
                                     <div class="col-md-8">
@@ -536,13 +556,13 @@
     const sens = document.getElementById('behaviorSensitivity');
     const sensHidden = document.getElementById('config_behavior_sensitivity');
     if (sens) {
-        const saved = (sensHidden && sensHidden.value) ? sensHidden.value : 'normal';
+        const saved = (sensHidden && sensHidden.value) ? sensHidden.value : 'loose';
         if (['strict', 'normal', 'loose'].indexOf(saved) >= 0) sens.value = saved;
         else {
-            const m = parseInt((document.getElementById('config_behavior_confirm_frames') || {}).value || '2', 10);
-            const n = parseInt((document.getElementById('config_behavior_window_frames') || {}).value || '5', 10);
+            const m = parseInt((document.getElementById('config_behavior_confirm_frames') || {}).value || '1', 10);
+            const n = parseInt((document.getElementById('config_behavior_window_frames') || {}).value || '1', 10);
             if (m >= 3 || n >= 6) sens.value = 'strict';
-            else if (n <= 4) sens.value = 'loose';
+            else if (m <= 1 || n <= 3) sens.value = 'loose';
             else sens.value = 'normal';
         }
 
@@ -573,21 +593,21 @@
                 bump('config_yolo_conf_phone', 0.05, 0.15, 0.95);
                 bump('config_yolo_conf_water', 0.05, 0.15, 0.95);
                 setCheck('config_yolo_spatial_filter', true);
-                setNum('config_yolo_near_face_ratio', '1.3');
-            } else if (v === 'loose') {
-                setNum('config_behavior_confirm_frames', '2');
-                setNum('config_behavior_window_frames', '4');
-                bump('config_yolo_conf_thresh', -0.05, 0.15, 0.95);
-                bump('config_yolo_conf_smoke', -0.05, 0.18, 0.95);
-                bump('config_yolo_conf_phone', -0.05, 0.18, 0.95);
-                bump('config_yolo_conf_water', -0.05, 0.18, 0.95);
-                setCheck('config_yolo_spatial_filter', true);
-                setNum('config_yolo_near_face_ratio', '1.8');
-            } else {
+                setNum('config_yolo_near_face_ratio', '1.5');
+            } else if (v === 'normal') {
                 setNum('config_behavior_confirm_frames', '2');
                 setNum('config_behavior_window_frames', '5');
-                setCheck('config_yolo_spatial_filter', true);
-                setNum('config_yolo_near_face_ratio', '1.5');
+                setCheck('config_yolo_spatial_filter', false);
+                setNum('config_yolo_near_face_ratio', '2.0');
+            } else {
+                setNum('config_behavior_confirm_frames', '1');
+                setNum('config_behavior_window_frames', '1');
+                bump('config_yolo_conf_thresh', -0.03, 0.15, 0.95);
+                bump('config_yolo_conf_smoke', -0.03, 0.18, 0.95);
+                bump('config_yolo_conf_phone', -0.03, 0.18, 0.95);
+                bump('config_yolo_conf_water', -0.03, 0.18, 0.95);
+                setCheck('config_yolo_spatial_filter', false);
+                setNum('config_yolo_near_face_ratio', '2.0');
             }
         });
     }

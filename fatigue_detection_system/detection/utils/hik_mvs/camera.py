@@ -8,6 +8,7 @@ Compatible with mono and color GigE (and USB3 Vision) cameras:
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -16,6 +17,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger("detection.camera")
 
 _MVS_DIR = os.path.dirname(os.path.abspath(__file__))
 _MVIMPORT_DIR = os.path.join(_MVS_DIR, "MvImport")
@@ -273,6 +276,8 @@ class HikCamera:
         self.last_diag: Dict[str, Any] = {}
         self._dark_streak = 0
         self._fixed_exposure_locked = False
+        # Diagnostics: how many times recover_stream() has kicked in this session.
+        self._reconnect_count = 0
 
     def open_by_index(self, index: int = 0) -> None:
         sdk = _load_sdk()
@@ -574,19 +579,24 @@ class HikCamera:
             except Exception:  # noqa: BLE001
                 pass
 
-            # Wide FOV default — faces stay in frame; still below full 5MP
-            stream_w, stream_h = 1920, 1600
+            # Wide FOV: mvs_stream_max_width=0 → full sensor (no ROI crop)
+            stream_w, stream_h = 0, 0
             try:
                 from detection.utils.config_cache import get_configs
 
                 cfg = get_configs() or {}
-                if cfg.get("mvs_stream_max_width"):
-                    stream_w = max(960, int(float(cfg.get("mvs_stream_max_width"))))
-                if cfg.get("mvs_stream_max_height"):
-                    stream_h = max(720, int(float(cfg.get("mvs_stream_max_height"))))
+                if cfg.get("mvs_stream_max_width") not in (None, ""):
+                    stream_w = int(float(cfg.get("mvs_stream_max_width")))
+                if cfg.get("mvs_stream_max_height") not in (None, ""):
+                    stream_h = int(float(cfg.get("mvs_stream_max_height")))
             except Exception:  # noqa: BLE001
                 pass
-            self._apply_stream_roi(cam, sdk, max_width=stream_w, max_height=stream_h)
+            if stream_w > 0 and stream_h > 0:
+                self._apply_stream_roi(
+                    cam, sdk, max_width=max(960, stream_w), max_height=max(720, stream_h)
+                )
+            else:
+                self.last_diag["stream_roi"] = "full_sensor"
 
             # Cap FPS so GigE stays within link budget after ROI/SCPD
             try:
@@ -874,6 +884,13 @@ class HikCamera:
         if cam is None or sdk is None or not self._opened:
             return dict(self.last_diag)
 
+        self._reconnect_count += 1
+        self.last_diag["reconnect_count"] = self._reconnect_count
+        logger.warning(
+            "GigE stream recovery #%d triggered (tighten_roi=%s)",
+            self._reconnect_count, tighten_roi,
+        )
+
         steps = []
         try:
             if self._grabbing:
@@ -939,6 +956,7 @@ class HikCamera:
             steps.append("start_err:%s" % exc)
 
         self.last_diag["stream_recover"] = steps
+        logger.info("GigE stream recovery #%d steps: %s", self._reconnect_count, steps)
         return dict(self.last_diag)
 
     def settle_exposure(self, frames: int = 25, timeout_ms: int = 500) -> Dict[str, Any]:

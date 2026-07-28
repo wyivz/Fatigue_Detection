@@ -20,17 +20,15 @@ from .utils.yolo_detector import YOLODetector
 from .utils.dlib_detector import DlibDetector
 
 import logging
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("detection.detect")
 
 def _safe_log(msg):
-    """避免 Windows 上 stdout 失效时 print 抛出 OSError: [Errno 22]。"""
+    """Route through the logging config (rotating file under logs/) instead
+    of print(), which can raise OSError: [Errno 22] if Windows stdout is
+    detached (e.g. running via pythonw / a service)."""
     try:
         logger.info(msg)
     except Exception:
-        pass
-    try:
-        print(msg)
-    except OSError:
         pass
 
 # Browser-path persist throttle (session_id -> last persist unix time / fatigue level)
@@ -40,7 +38,7 @@ _browser_last_yawn = {}
 
 
 def _resize_for_detect(image, configs=None):
-    """Shrink frame to yolo_detect_max_width (shared by browser + process_image)."""
+    """Optionally shrink frame to yolo_detect_max_width (0 = no shrink, archive-like)."""
     if image is None:
         return image
     if configs is None:
@@ -51,10 +49,13 @@ def _resize_for_detect(image, configs=None):
         except Exception:  # noqa: BLE001
             configs = {}
     try:
-        max_w = int(float((configs or {}).get("yolo_detect_max_width") or 960))
-        max_w = max(640, min(2560, max_w))
+        raw = (configs or {}).get("yolo_detect_max_width", 0)
+        max_w = int(float(raw if raw is not None and str(raw).strip() != "" else 0))
     except (TypeError, ValueError):
-        max_w = 960
+        max_w = 0
+    if max_w <= 0:
+        return image
+    max_w = max(640, min(4096, max_w))
     h0, w0 = image.shape[:2]
     if w0 <= max_w:
         return image
@@ -155,7 +156,7 @@ def realtime_detection(request):
     fatigue_alert_level = int(configs.get('fatigue_alert_level', 2))
     alert_volume = int(configs.get('alert_volume', 80))
     enable_voice = configs.get('enable_voice', 'true') == 'true'
-    detection_interval = int(configs.get('detection_interval', 500))
+    detection_interval = int(configs.get('detection_interval', 700))
     ear_sample_interval_ms = int(configs.get('ear_sample_interval_ms', 100))
     perclos_alert_pct = float(configs.get('perclos_alert_pct', 20))
     default_source_type = configs.get('default_source_type', 'mvs')
@@ -544,6 +545,14 @@ def start_detection(request):
                         mvs_grabber.stop(complete_session=False)
                 except Exception:  # noqa: BLE001
                     pass
+                # A fresh session must not inherit a stale sticky primary-face
+                # bbox left behind by a previous session on this detector
+                # singleton (archive path keys it by session id).
+                try:
+                    if yolo_detector is not None:
+                        yolo_detector._sticky_primary_by_session.pop(session.id, None)
+                except Exception:  # noqa: BLE001
+                    pass
             return JsonResponse({
                 'status': 'success',
                 'session_id': session.id,
@@ -730,17 +739,28 @@ def get_result(request):
             import time as _time
 
             configs = get_configs()
-            image = _resize_for_detect(image, configs)
 
-            # Infer + draw for UI; persist only on interval / behavior / fatigue edge
-            result = process_image(
+            # Unified archive detect. The frontend draws the live overlay from the
+            # JSON landmarks/detections (drawLiveOverlay) and only falls back to a
+            # server-rendered annotated JPEG when landmarks are absent, so only
+            # render/encode that (full-res copy + draw + JPEG) in that fallback case
+            # instead of doing it synchronously on every request.
+            result = process_image_archive(
                 image,
                 session,
                 detect_fatigue,
                 detect_behaviors,
-                include_image_data=True,
-                persist=False,
+                include_image_data=False,
             )
+            if not (result.get('landmarks') and len(result['landmarks'])):
+                from .utils.archive_pipeline import encode_jpeg_bgr, render_annotated_bgr
+
+                annotated = render_annotated_bgr(image, result)
+                raw = encode_jpeg_bgr(annotated, 75)
+                if raw is not None:
+                    result['image_data'] = (
+                        f"data:image/jpeg;base64,{base64.b64encode(raw).decode('utf-8')}"
+                    )
 
             try:
                 persist_iv = float(configs.get('yolo_persist_interval_sec') or 2.0)
@@ -768,6 +788,20 @@ def get_result(request):
                 result = persist_detection_snapshot(image, session, result)
                 _browser_last_persist_at[sid] = now
 
+            try:
+                from .utils.persist_worker import stats as _persist_stats
+
+                result["persist"] = _persist_stats()
+            except Exception:  # noqa: BLE001
+                pass
+
+            # JsonResponse cannot encode numpy / private buffers
+            for k in list(result.keys()):
+                if str(k).startswith("_") or k in (
+                    "overlay_landmarks",
+                    "overlay_landmarks_size",
+                ):
+                    result.pop(k, None)
             return JsonResponse(result)
         except Exception as e:
             _safe_log(f"检测过程出现错误: {e}")
@@ -776,153 +810,73 @@ def get_result(request):
     return JsonResponse({'status': 'error', 'message': '不支持的请求方法'})
 
 
-def save_fatigue_event(image, session, snap, mouth_aspect_ratio=None, face_detected=False):
-    """
-    Persist a fatigue edge event (level rise / yawn) without re-running YOLO.
-    Used by MVS EAR loop so history matches realtime alerts.
-    """
-    from .utils.fatigue_tracker import fatigue_tracker
-
-    if dlib_detector is None:
-        return None
-
-    # Refresh snapshot in case caller passed a stale one
-    live = fatigue_tracker.get_snapshot(session.id)
-    level = int(live.fatigue_level if live else (snap.fatigue_level if snap else 0))
-    yawn = bool(live.yawn_detected if live else (snap.yawn_detected if snap else False))
-    ear = live.eye_aspect_ratio if live else (snap.eye_aspect_ratio if snap else None)
-    perclos = float(live.perclos if live else (snap.perclos if snap else 0.0))
-    closed_ms = int(live.eye_closed_ms if live else (snap.eye_closed_ms if snap else 0))
-    lm = live.landmarks if live else (snap.landmarks if snap else None)
-
-    draw_payload = {
-        'landmarks': lm,
-        'landmarks_size': getattr(live or snap, 'landmarks_size', None),
-        'faces': getattr(live or snap, 'faces', None),
-        'eye_aspect_ratio': ear,
-        'mouth_aspect_ratio': mouth_aspect_ratio,
-        'yawn_detected': yawn,
-        'fatigue_level': level,
-        'perclos': perclos,
-        'eye_closed_ms': closed_ms,
-    }
-    try:
-        annotated = dlib_detector.draw_fatigue_results(image, draw_payload)
-    except Exception as e:  # noqa: BLE001
-        _safe_log(f'fatigue event draw failed: {e}')
-        annotated = image
-
-    row = DetectionResult(
-        session=session,
-        face_detected=bool(face_detected or lm is not None),
-        smoking_detected=False,
-        phone_detected=False,
-        drinking_detected=False,
-        eye_aspect_ratio=float(ear) if ear is not None else None,
-        yawn_detected=yawn,
-        fatigue_level=level,
-        perclos=perclos,
-        eye_closed_ms=closed_ms,
-    )
-    result_filename = f"fatigue_{session.id}_{timezone.now().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}.jpg"
-    try:
-        ok, buffer = cv2.imencode('.jpg', annotated)
-        if ok:
-            row.result_image.save(result_filename, ContentFile(buffer.tobytes()), save=False)
-    except Exception as e:  # noqa: BLE001
-        _safe_log(f'fatigue event image save failed: {e}')
-    row.save()
-    return row
-
-
 def persist_detection_snapshot(image, session, results):
+    """Queue JPEG encode + DetectionResult write on a background worker so the
+    hot request/detect-loop thread never blocks on disk/DB latency (matters a
+    lot for high-resolution GigE frames). `detection_id` / `result_image_url`
+    are not known synchronously anymore; neither is rendered by the frontend,
+    so this is a pure perf win with no visible behavior change."""
+    from .utils.persist_worker import enqueue_persist
+
+    enqueue_persist(image, session, results)
+    results["detection_id"] = None
+    results["result_image_url"] = None
+    return results
+
+
+def process_image_archive(
+    image,
+    session,
+    detect_fatigue=True,
+    detect_behaviors=True,
+    include_image_data=False,
+):
     """
-    Draw + save DetectionResult from an already-computed process_image(persist=False) result.
-    Avoids running YOLO twice when the MVS loop decides to persist.
-
-    Prefer same-frame overlay_landmarks from the caller. Never mix YOLO boxes with
-    stale EAR-tracker landmarks (that caused relative float on result_*.jpg).
+    Unified archive path for browser + MVS.
+    Uniform max-side scale (FOV kept) so HOG sees archive-like face sizes;
+    geometry remapped to original for live overlay. JPEG only when requested.
     """
-    from .utils.fatigue_tracker import fatigue_tracker
-
-    processed = {
-        'detections': results.get('detections') or [],
-    }
-    # Align YOLO face draw with same-frame landmark box when available
-    overlay_lm = results.get('overlay_landmarks')
-    face_box = results.get('face_bbox')
-    if face_box is not None and processed['detections']:
-        aligned = []
-        for det in processed['detections']:
-            dd = dict(det)
-            if int(dd.get('class_id', -1)) == 0 and (
-                dd.get('is_primary') or face_box is not None
-            ):
-                # Replace primary face rect with landmark-locked box
-                if dd.get('is_primary') or len([d for d in processed['detections'] if int(d.get('class_id', -1)) == 0]) == 1:
-                    dd['bbox'] = [int(v) for v in face_box]
-            aligned.append(dd)
-        processed['detections'] = aligned
-
-    img = image
-    if yolo_detector is not None and processed['detections']:
-        img = yolo_detector.draw_results(image, processed)
-
-    snap = fatigue_tracker.get_snapshot(session.id)
-    if dlib_detector is not None:
-        overlay_lm_size = results.get('overlay_landmarks_size')
-        if overlay_lm is not None:
-            draw_payload = {
-                'landmarks': overlay_lm,
-                'landmarks_size': overlay_lm_size,
-                'faces': None,
-                'eye_aspect_ratio': results.get('eye_aspect_ratio', snap.eye_aspect_ratio),
-                'mouth_aspect_ratio': results.get('mouth_aspect_ratio'),
-                'yawn_detected': results.get('yawn_detected', snap.yawn_detected),
-                'fatigue_level': results.get('fatigue_level', snap.fatigue_level),
-                'perclos': results.get('perclos', snap.perclos),
-                'eye_closed_ms': results.get('eye_closed_ms', snap.eye_closed_ms),
-            }
-        else:
-            # Metrics HUD only — skip stale tracker landmarks
-            draw_payload = {
-                'landmarks': None,
-                'landmarks_size': None,
-                'faces': None,
-                'eye_aspect_ratio': results.get('eye_aspect_ratio', snap.eye_aspect_ratio),
-                'mouth_aspect_ratio': results.get('mouth_aspect_ratio'),
-                'yawn_detected': results.get('yawn_detected', snap.yawn_detected),
-                'fatigue_level': results.get('fatigue_level', snap.fatigue_level),
-                'perclos': results.get('perclos', snap.perclos),
-                'eye_closed_ms': results.get('eye_closed_ms', snap.eye_closed_ms),
-            }
-        try:
-            img = dlib_detector.draw_fatigue_results(img, draw_payload)
-        except Exception as e:  # noqa: BLE001
-            _safe_log(f'persist draw failed: {e}')
-
-    row = DetectionResult(
-        session=session,
-        face_detected=bool(results.get('face_detected')),
-        smoking_detected=bool(results.get('smoking_detected')),
-        phone_detected=bool(results.get('phone_detected')),
-        drinking_detected=bool(results.get('drinking_detected')),
-        eye_aspect_ratio=results.get('eye_aspect_ratio'),
-        yawn_detected=bool(results.get('yawn_detected')),
-        fatigue_level=int(results.get('fatigue_level') or 0),
-        perclos=results.get('perclos'),
-        eye_closed_ms=results.get('eye_closed_ms'),
+    from .utils.archive_pipeline import (
+        encode_jpeg_bgr,
+        render_annotated_bgr,
+        run_archive_detect,
     )
-    result_filename = f"result_{session.id}_{timezone.now().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}.jpg"
+    from .utils.config_cache import get_configs
+
+    configs = get_configs()
     try:
-        ok, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-        if ok:
-            row.result_image.save(result_filename, ContentFile(buffer.tobytes()), save=False)
-    except Exception as e:  # noqa: BLE001
-        _safe_log(f'persist image failed: {e}')
-    row.save()
-    results['detection_id'] = row.id
-    results['result_image_url'] = row.result_image.url if row.result_image else None
+        max_side = int(float(configs.get("yolo_detect_max_width", 960) or 960))
+    except (TypeError, ValueError):
+        max_side = 960
+    if max_side < 0:
+        max_side = 0
+    dlib_refine_mode = str(configs.get("dlib_refine_mode") or "off").strip().lower()
+    if dlib_refine_mode not in ("off", "light", "full"):
+        dlib_refine_mode = "off"
+    dlib_landmark_mode = str(configs.get("dlib_landmark_mode") or "yolo").strip().lower()
+
+    sid = getattr(session, "id", None)
+    results = run_archive_detect(
+        image,
+        sid,
+        detect_fatigue=detect_fatigue,
+        detect_behaviors=detect_behaviors,
+        max_side=max_side,
+        dlib_refine_mode=dlib_refine_mode,
+        dlib_landmark_mode=dlib_landmark_mode,
+    )
+    # Drop any non-JSON leftovers
+    for k in list(results.keys()):
+        if str(k).startswith("_"):
+            results.pop(k, None)
+    results["image_data"] = None
+    if include_image_data:
+        annotated = render_annotated_bgr(image, results)
+        raw = encode_jpeg_bgr(annotated, 75)
+        if raw is not None:
+            results["image_data"] = (
+                f"data:image/jpeg;base64,{base64.b64encode(raw).decode('utf-8')}"
+            )
     return results
 
 
@@ -1030,28 +984,34 @@ def process_image(
     if detect_fatigue and dlib_detector:
         try:
             t_dlib = _time.perf_counter()
-            dlib_results = dlib_detector.detect_fatigue_multi(
-                image,
-                face_bboxes=face_bboxes or None,
-                primary_bbox=face_bbox,
-                refine_rect="light",
-            )
+            # Default: YOLO-box guided landmarks (fast, tracks motion). HOG only if no face.
+            landmark_mode = str(configs.get('dlib_landmark_mode') or 'yolo').strip().lower()
+            refine = str(configs.get('dlib_refine_mode') or 'light').strip().lower()
+            if refine not in ('off', 'light', 'full'):
+                refine = 'light'
+            if landmark_mode == 'hog' or not (face_bboxes or face_bbox):
+                dlib_results = dlib_detector.detect_fatigue_multi(
+                    image,
+                    face_bboxes=None,
+                    primary_bbox=None,
+                    allow_hog=True,
+                    refine_rect='off',
+                )
+            else:
+                dlib_results = dlib_detector.detect_fatigue_multi(
+                    image,
+                    face_bboxes=face_bboxes or ([face_bbox] if face_bbox else None),
+                    primary_bbox=face_bbox,
+                    allow_hog=True,
+                    refine_rect=refine,
+                )
             timing['dlib_ms'] = round((_time.perf_counter() - t_dlib) * 1000.0, 1)
 
             faces_n = int(dlib_results.get('faces_detected') or 0)
             if faces_n <= 0 and results.get('face_detected') and face_bbox:
                 faces_n = 1
 
-            reliable = True
-            if dlib_results.get('pose_ok') is False:
-                reliable = False
-            try:
-                q = dlib_results.get('landmark_quality')
-                if q is not None and int(q) < 0:
-                    reliable = False
-            except (TypeError, ValueError):
-                pass
-
+            # Archive did not gate EAR on pose/quality
             snap = fatigue_tracker.update(
                 session.id,
                 ear=dlib_results.get('eye_aspect_ratio'),
@@ -1064,7 +1024,7 @@ def process_image(
                     else None
                 ),
                 faces=dlib_results.get('faces') or [],
-                landmark_reliable=reliable,
+                landmark_reliable=True,
             )
             draw_mar = dlib_results.get('mouth_aspect_ratio')
             draw_lm = dlib_results.get('landmarks') or snap.landmarks
@@ -1137,6 +1097,24 @@ def process_image(
         results['result_image_url'] = None
         results['detection_id'] = None
         results['image_data'] = None
+        # Geometry for live browser overlay (no JPEG slideshow)
+        results['image_size'] = [int(image.shape[1]), int(image.shape[0])]
+        if draw_lm is not None:
+            try:
+                results['landmarks'] = [
+                    [int(p[0]), int(p[1])] for p in np.asarray(draw_lm)
+                ]
+            except Exception:  # noqa: BLE001
+                results['landmarks'] = None
+        else:
+            results['landmarks'] = None
+        if draw_lm_size is not None:
+            try:
+                results['landmarks_size'] = [int(draw_lm_size[0]), int(draw_lm_size[1])]
+            except (TypeError, ValueError, IndexError):
+                results['landmarks_size'] = results['image_size']
+        else:
+            results['landmarks_size'] = results['image_size']
         return results
 
     t_draw = _time.perf_counter()

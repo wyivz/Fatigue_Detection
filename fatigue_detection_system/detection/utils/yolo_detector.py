@@ -2,12 +2,15 @@
 """YOLO wrapper for face / smoke / phone / water detection."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from django.conf import settings
+
+logger = logging.getLogger("detection.detect")
 
 # Lazy import: avoid loading ultralytics (and heavy train/FastSAM stack) at Django startup.
 YOLO = None
@@ -142,6 +145,10 @@ class YOLODetector:
         self._apply_runtime_params()
         self.class_names = list(self.CLASS_NAMES)
         self._sticky_primary_bbox: Optional[List[int]] = None
+        # Per-session sticky primary-face bbox for the archive/realtime path
+        # (browser + MVS may run distinct sessions against the same detector
+        # singleton, so keep their "last primary face" memory separate).
+        self._sticky_primary_by_session: Dict[Any, List[int]] = {}
         # ROI cascade: after sticky face is stable, infer on face neighborhood
         self._roi_stable_hits: int = 0
         self._detect_frame_i: int = 0
@@ -165,15 +172,15 @@ class YOLODetector:
                 self.model = _yolo_cls()(onnx_path)
                 self.backend = "onnx"
                 loaded = True
-                print(f"YOLO loaded ONNX: {onnx_path}")
-            except Exception as e:  # noqa: BLE001
-                print(f"ONNX load failed ({e}), falling back to .pt")
+                logger.info("YOLO loaded ONNX: %s", onnx_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("ONNX load failed, falling back to .pt: %s", onnx_path)
         if not loaded:
             if not os.path.isfile(pt_path):
                 raise FileNotFoundError(f"YOLO weights not found: {pt_path}")
             self.model = _yolo_cls()(pt_path)
             self.backend = "pt"
-            print(f"YOLO loaded PyTorch: {pt_path}")
+            logger.info("YOLO loaded PyTorch: %s", pt_path)
 
     def _face_roi_crop(
         self, image: np.ndarray, face_bbox: List[int]
@@ -224,26 +231,26 @@ class YOLODetector:
             data[:, 2] += float(ox)
             data[:, 3] += float(oy)
             result.boxes.data = data
-        except Exception as e:  # noqa: BLE001
-            print(f"ROI remap failed: {e}")
+        except Exception:  # noqa: BLE001
+            logger.exception("ROI remap failed")
         return result
 
     def load_config(self):
         from detection.utils.compute_scheduler import compute_scheduler
         from detection.utils.config_cache import get_configs
 
-        # Speed-first defaults (GigE CPU). Raise imgsz / detect width in config if recall needs it.
-        self.conf_thresh = 0.28
+        # Archive-like defaults (low floors cause false positives / 乱识别)
+        self.conf_thresh = 0.5
         self.iou_thresh = 0.5
         self.imgsz = 640
         self.device = "cpu"
         # Per-class floors (applied after model returns candidates)
-        self.conf_face = 0.35
-        self.conf_smoke = 0.18
-        self.conf_phone = 0.22
-        self.conf_water = 0.22
-        self.spatial_filter = True
-        self.near_face_ratio = 1.5  # max center distance in face-diag units
+        self.conf_face = 0.45
+        self.conf_smoke = 0.45
+        self.conf_phone = 0.45
+        self.conf_water = 0.45
+        self.spatial_filter = False
+        self.near_face_ratio = 2.0  # max center distance in face-diag units
 
         try:
             configs = get_configs(force=True)
@@ -257,24 +264,25 @@ class YOLODetector:
             self.device = configs.get("device") or "cpu"
             # Per-class: use saved value as-is (0.01–0.95). Do NOT clamp to global conf.
             self.conf_face = _cfg_float(configs, "yolo_conf_face", 0.35)
-            self.conf_smoke = _cfg_float(configs, "yolo_conf_smoke", 0.18)
+            self.conf_smoke = _cfg_float(configs, "yolo_conf_smoke", 0.22)
             self.conf_phone = _cfg_float(configs, "yolo_conf_phone", 0.22)
             self.conf_water = _cfg_float(configs, "yolo_conf_water", 0.22)
-            self.spatial_filter = str(configs.get("yolo_spatial_filter", "true")).lower() in (
+            self.spatial_filter = str(configs.get("yolo_spatial_filter", "false")).lower() in (
                 "1",
                 "true",
                 "yes",
                 "on",
             )
-            self.near_face_ratio = _cfg_float(configs, "yolo_near_face_ratio", 1.5)
-            print(
-                f"已加载YOLO配置: conf={self.conf_thresh}, iou={self.iou_thresh}, "
-                f"imgsz={self.imgsz}, device={self.device}, spatial={self.spatial_filter}, "
-                f"floors=smoke:{self.conf_smoke}/phone:{self.conf_phone}/"
-                f"water:{self.conf_water}/face:{self.conf_face}"
+            self.near_face_ratio = _cfg_float(configs, "yolo_near_face_ratio", 2.0)
+            logger.info(
+                "已加载YOLO配置: conf=%s, iou=%s, imgsz=%s, device=%s, spatial=%s, "
+                "floors=smoke:%s/phone:%s/water:%s/face:%s",
+                self.conf_thresh, self.iou_thresh, self.imgsz, self.device,
+                self.spatial_filter, self.conf_smoke, self.conf_phone,
+                self.conf_water, self.conf_face,
             )
-        except Exception as e:  # noqa: BLE001
-            print(f"加载YOLO配置失败: {e}")
+        except Exception:  # noqa: BLE001
+            logger.exception("加载YOLO配置失败")
 
         if hasattr(self, "model") and self.model is not None:
             self._apply_runtime_params()
@@ -312,15 +320,15 @@ class YOLODetector:
         if self.device and getattr(self, "backend", "pt") == "pt":
             try:
                 self.model.to(self.device)
-            except Exception as e:  # noqa: BLE001
-                print(f"无法在设备 {self.device} 上运行模型: {e}")
+            except Exception:  # noqa: BLE001
+                logger.exception("无法在设备 %s 上运行模型，回退到 cpu", self.device)
                 self.device = "cpu"
 
     def detect(self, image):
         """Run inference under YOLO thread quota; CUDA uses FP16 when enabled.
 
-        When sticky primary face is stable, runs on a face-neighborhood ROI
-        (full frame every N ticks to avoid track loss).
+        Always full-frame (archive-like). ROI cascade disabled — it hurt
+        smoke/phone/water recall when hands were away from the face crop.
         """
         from detection.utils.compute_scheduler import compute_scheduler
 
@@ -330,37 +338,24 @@ class YOLODetector:
             "iou": float(self.iou_thresh),
             "imgsz": int(self.imgsz or 640),
             "max_det": 100,
+            # Avoid Ultralytics dataloader worker processes on Windows (extra stalls)
+            "workers": 0,
         }
 
-        use_roi = self._should_use_roi()
-        ox = oy = 0
-        infer_img = image
         self._last_used_roi = False
         self._last_roi_offset = None
-        if use_roi and self._sticky_primary_bbox is not None:
-            crop, ox, oy = self._face_roi_crop(image, self._sticky_primary_bbox)
-            ch, cw = crop.shape[:2]
-            ih, iw = image.shape[:2]
-            if cw < iw or ch < ih:
-                infer_img = crop
-                self._last_used_roi = True
-                self._last_roi_offset = (ox, oy)
+        # Keep counters for debug/meta only; do not crop
+        self._detect_frame_i = int(getattr(self, "_detect_frame_i", 0) or 0) + 1
 
         with compute_scheduler.yolo_context() as plan:
             if plan.use_cuda:
                 kwargs["device"] = plan.device
-                # FP16 is for PyTorch CUDA; ONNX uses CUDA EP without half kw
                 if plan.cuda_half and getattr(self, "backend", "pt") == "pt":
                     kwargs["half"] = True
             elif self.device:
                 kwargs["device"] = self.device
-            results = self.model(infer_img, **kwargs)
-        result = results[0]
-        if self._last_used_roi and self._last_roi_offset is not None:
-            result = self._remap_result_boxes(
-                result, self._last_roi_offset[0], self._last_roi_offset[1], image.shape
-            )
-        return result
+            results = self.model(image, **kwargs)
+        return results[0]
 
     def warmup(self, runs: int = 2) -> float:
         """Run dummy inferences so first real frame is not a cold-start spike."""
@@ -372,8 +367,8 @@ class YOLODetector:
         for _ in range(max(1, int(runs))):
             try:
                 self.detect(dummy)
-            except Exception as e:  # noqa: BLE001
-                print(f"YOLO warmup failed: {e}")
+            except Exception:  # noqa: BLE001
+                logger.exception("YOLO warmup failed")
                 break
         return (_time.perf_counter() - t0) * 1000.0
 
@@ -387,6 +382,108 @@ class YOLODetector:
         if cls_id == 3:
             return float(self.conf_water)
         return float(self.conf_thresh)
+
+    def process_results_simple(self, results, session_id=None):
+        """Archive-style detections (single conf, no spatial filter) with
+        sticky + center-weighted primary-face selection (see pick_primary_face)
+        instead of naive max-area, so the tracked face doesn't jump around
+        when multiple people are visible (wide-FOV industrial cameras)."""
+        processed_data = {
+            "face_detected": False,
+            "smoking_detected": False,
+            "phone_detected": False,
+            "drinking_detected": False,
+            "detections": [],
+            "raw_detections": [],
+            "filtered_out": [],
+            "behavior_debug": {},
+            "face_bbox": None,
+            "face_bboxes": [],
+            "face_count": 0,
+        }
+        boxes = results.boxes.cpu().numpy()
+        face_boxes = []
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            if cls_id < 0 or cls_id >= len(self.class_names):
+                continue
+            confidence = float(box.conf[0])
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].astype(int)]
+            det = {
+                "class_id": cls_id,
+                "class_name": self.class_names[cls_id],
+                "confidence": confidence,
+                "bbox": [x1, y1, x2, y2],
+            }
+            processed_data["detections"].append(det)
+            processed_data["raw_detections"].append(det)
+            if cls_id == 0:
+                processed_data["face_detected"] = True
+                face_boxes.append(det)
+            elif cls_id == 1:
+                processed_data["smoking_detected"] = True
+            elif cls_id == 2:
+                processed_data["phone_detected"] = True
+            elif cls_id == 3:
+                processed_data["drinking_detected"] = True
+        if face_boxes:
+            frame_wh = None
+            try:
+                oh, ow = results.orig_shape
+                frame_wh = (int(ow), int(oh))
+            except Exception:  # noqa: BLE001
+                frame_wh = None
+
+            sticky_key = session_id if session_id is not None else "_default"
+            sticky_bbox = self._sticky_primary_by_session.get(sticky_key)
+            primary = pick_primary_face(
+                face_boxes, sticky_bbox=sticky_bbox, frame_wh=frame_wh
+            )
+            if primary is not None:
+                self._sticky_primary_by_session[sticky_key] = list(primary["bbox"])
+                # Bound memory growth if callers pass many distinct session ids.
+                if len(self._sticky_primary_by_session) > 64:
+                    self._sticky_primary_by_session.pop(
+                        next(iter(self._sticky_primary_by_session))
+                    )
+            processed_data["face_bbox"] = list(primary["bbox"]) if primary else None
+            processed_data["face_bboxes"] = [list(d["bbox"]) for d in face_boxes]
+            processed_data["face_count"] = len(face_boxes)
+            for d in processed_data["detections"]:
+                if d["class_id"] == 0:
+                    d["is_primary"] = primary is not None and d["bbox"] == primary["bbox"]
+        processed_data["behavior_debug"] = {
+            "raw_count": len(processed_data["detections"]),
+            "kept_count": len(processed_data["detections"]),
+            "filtered_count": 0,
+            "mode": "archive_simple",
+        }
+        return processed_data
+
+    def detect_archive(self, image):
+        """Archive infer: model(image) with global conf (Ultralytics default letterbox)."""
+        from detection.utils.compute_scheduler import compute_scheduler
+
+        conf = max(0.25, min(0.95, float(self.conf_thresh or 0.5)))
+        # Match archive: set model.conf then call model(image); keep workers=0 for CPU stability
+        try:
+            self.model.conf = conf
+        except Exception:  # noqa: BLE001
+            pass
+        kwargs = {
+            "verbose": False,
+            "conf": conf,
+            "workers": 0,
+        }
+        with compute_scheduler.yolo_context() as plan:
+            if plan.use_cuda:
+                kwargs["device"] = plan.device
+                if plan.cuda_half and getattr(self, "backend", "pt") == "pt":
+                    kwargs["half"] = True
+            elif self.device:
+                kwargs["device"] = self.device
+            results = self.model(image, **kwargs)
+        return results[0]
 
     def process_results(self, results):
         processed_data = {

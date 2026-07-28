@@ -32,23 +32,35 @@ def load_fatigue_config(configs: Optional[Dict[str, Any]] = None) -> Dict[str, A
         except Exception:  # noqa: BLE001
             configs = {}
 
+    # fatigue_level_mode: instant = archive (this-frame EAR/MAR); temporal = PERCLOS/microsleep
+    mode = str(configs.get("fatigue_level_mode") or "instant").strip().lower()
+    if mode not in ("instant", "temporal"):
+        mode = "instant"
+
     return {
         "eye_ar_thresh": _cfg_float(configs, "eye_ar_thresh", 0.25),
-        "mouth_ar_thresh": _cfg_float(configs, "mouth_ar_thresh", 0.55),
+        "mouth_ar_thresh": _cfg_float(configs, "mouth_ar_thresh", 0.6),
         "blink_max_ms": _cfg_int(configs, "blink_max_ms", 250),
         "microsleep_min_ms": _cfg_int(configs, "microsleep_min_ms", 500),
         "perclos_window_sec": max(5, _cfg_int(configs, "perclos_window_sec", 60)),
         "perclos_alert_pct": _cfg_float(configs, "perclos_alert_pct", 20.0),
         "ear_sample_interval_ms": max(50, _cfg_int(configs, "ear_sample_interval_ms", 100)),
-        # Hits required inside sliding window (M of N)
-        "behavior_confirm_frames": max(1, _cfg_int(configs, "behavior_confirm_frames", 2)),
-        "behavior_window_frames": max(1, _cfg_int(configs, "behavior_window_frames", 5)),
-        # Hysteresis band around EAR threshold to avoid flicker false closes
-        "ear_hysteresis": _cfg_float(configs, "ear_hysteresis", 0.03),
-        # Yawn must persist this many ms before latching (filters talking)
-        "yawn_confirm_ms": _cfg_int(configs, "yawn_confirm_ms", 500),
-        # How long a yawn latch stays after mouth closes
-        "yawn_hold_ms": _cfg_int(configs, "yawn_hold_ms", 1200),
+        # Archive-like: report on first hit (M=1,N=1)
+        "behavior_confirm_frames": max(1, _cfg_int(configs, "behavior_confirm_frames", 1)),
+        "behavior_window_frames": max(1, _cfg_int(configs, "behavior_window_frames", 1)),
+        # Instant mode: no hysteresis (archive). Temporal keeps a small band.
+        "ear_hysteresis": _cfg_float(
+            configs, "ear_hysteresis", 0.0 if mode == "instant" else 0.03
+        ),
+        # Archive yawn is immediate; brief hold so UI/alerts don't flicker off same tick
+        "yawn_confirm_ms": _cfg_int(configs, "yawn_confirm_ms", 0),
+        "yawn_hold_ms": _cfg_int(
+            configs, "yawn_hold_ms", 300 if mode == "instant" else 1200
+        ),
+        "fatigue_level_mode": mode,
+        # Skip session EAR baseline override in instant mode (archive used fixed thresh)
+        "use_ear_baseline": str(configs.get("use_ear_baseline", "false")).lower()
+        in ("1", "true", "yes", "on"),
     }
 
 
@@ -207,20 +219,19 @@ class FatigueTemporalTracker:
             ear_f = float(ear)
             state.last_ear = ear_f
 
-            # Session open-eye baseline (first ~4s of reliable samples)
-            self._maybe_calibrate_baseline(state, ear_f, t, cfg, landmark_reliable)
+            # Session open-eye baseline (optional; off by default for archive parity)
+            if cfg.get("use_ear_baseline"):
+                self._maybe_calibrate_baseline(state, ear_f, t, cfg, landmark_reliable)
 
-            thresh = float(
-                state.calibrated_eye_ar_thresh
-                if state.calibrated_eye_ar_thresh is not None
-                else cfg["eye_ar_thresh"]
-            )
-            hyst = max(0.0, float(cfg.get("ear_hysteresis", 0.03)))
+            thresh = float(cfg["eye_ar_thresh"])
+            if cfg.get("use_ear_baseline") and state.calibrated_eye_ar_thresh is not None:
+                thresh = float(state.calibrated_eye_ar_thresh)
+            hyst = max(0.0, float(cfg.get("ear_hysteresis", 0.0)))
             close_thresh = thresh
             open_thresh = thresh + hyst
 
-            # Bad pose / landmark quality: never push "closed" this frame
-            if landmark_reliable is False:
+            # Instant (archive) mode: always feed EAR; temporal may skip bad pose
+            if landmark_reliable is False and cfg.get("fatigue_level_mode") != "instant":
                 if state.eyes_closed and state.closed_start is not None:
                     self._close_segment(state, t, cfg)
                 state.eyes_closed = False
@@ -307,16 +318,17 @@ class FatigueTemporalTracker:
     def _update_yawn(
         self, state: _SessionFatigueState, raw_yawn: bool, t: float, cfg: Dict[str, Any]
     ) -> None:
-        confirm_ms = float(cfg.get("yawn_confirm_ms", 500))
-        hold_ms = float(cfg.get("yawn_hold_ms", 1200))
+        confirm_ms = float(cfg.get("yawn_confirm_ms", 0))
+        hold_ms = float(cfg.get("yawn_hold_ms", 300))
         gap_ms = 150.0
         if raw_yawn:
             state.last_raw_yawn_t = t
             if state.yawn_candidate_start is None:
                 state.yawn_candidate_start = t
-            elif (t - state.yawn_candidate_start) * 1000.0 >= confirm_ms:
+            # confirm_ms=0 latches on the same frame (archive)
+            if (t - state.yawn_candidate_start) * 1000.0 >= confirm_ms:
                 state.last_yawn = True
-                state.yawn_until = t + hold_ms / 1000.0
+                state.yawn_until = t + max(hold_ms, 50.0) / 1000.0
         else:
             # Clear candidate only after a real gap since last positive raw sample
             if state.yawn_candidate_start is not None:
@@ -419,15 +431,30 @@ class FatigueTemporalTracker:
         )
 
         yawn = bool(state.last_yawn)
-        level = 0
-        if yawn or (warn_pct <= perclos < alert_pct):
-            level = 1
-        if is_microsleep:
-            level = max(level, 2)
-        if perclos >= alert_pct:
-            level = max(level, 3)
-        if perclos >= alert_pct and (is_microsleep or perclos >= alert_pct * 1.5):
-            level = 4
+        ear = state.last_ear
+        mode = str(cfg.get("fatigue_level_mode") or "instant")
+
+        if mode == "instant":
+            # Archive dlib_detector.detect_fatigue: level from this-frame EAR + yawn
+            thresh = float(cfg["eye_ar_thresh"])
+            if ear is None:
+                level = 1 if yawn else 0
+            elif ear < thresh * 0.8:
+                level = 4
+            elif ear < thresh:
+                level = 3 if yawn else 2
+            else:
+                level = 1 if yawn else 0
+        else:
+            level = 0
+            if yawn or (warn_pct <= perclos < alert_pct):
+                level = 1
+            if is_microsleep:
+                level = max(level, 2)
+            if perclos >= alert_pct:
+                level = max(level, 3)
+            if perclos >= alert_pct and (is_microsleep or perclos >= alert_pct * 1.5):
+                level = 4
 
         return FatigueSnapshot(
             eye_aspect_ratio=state.last_ear,
@@ -449,8 +476,8 @@ class _BehaviorState:
     smoking_hits: Deque[bool] = field(default_factory=deque)
     phone_hits: Deque[bool] = field(default_factory=deque)
     drinking_hits: Deque[bool] = field(default_factory=deque)
-    confirm_frames: int = 2
-    window_frames: int = 5
+    confirm_frames: int = 1
+    window_frames: int = 3
 
 
 class BehaviorConfirmTracker:

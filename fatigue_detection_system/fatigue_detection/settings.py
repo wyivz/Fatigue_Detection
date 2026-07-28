@@ -160,3 +160,68 @@ AUTH_USER_MODEL = 'accounts.User'
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# Logging: rotating files under logs/, split by concern so camera / detection
+# / persistence issues can be diagnosed without relying on the console
+# (this replaced ad-hoc print() calls scattered across detection/utils/*).
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": "%(asctime)s %(levelname)s %(name)s %(threadName)s: %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
+            "level": "INFO",
+        },
+        "detection_file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": os.path.join(LOG_DIR, "detection.log"),
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 5,
+            "encoding": "utf-8",
+            "formatter": "standard",
+            "level": "DEBUG",
+        },
+        "camera_file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": os.path.join(LOG_DIR, "camera.log"),
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 5,
+            "encoding": "utf-8",
+            "formatter": "standard",
+            "level": "DEBUG",
+        },
+    },
+    "loggers": {
+        # Detection pipeline: YOLO/dlib/archive/persist worker
+        "detection.detect": {
+            "handlers": ["console", "detection_file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "detection.persist": {
+            "handlers": ["console", "detection_file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        # Camera / MVS grab + reconnect diagnostics get their own file since
+        # they're the first thing to check when a GigE camera misbehaves.
+        "detection.camera": {
+            "handlers": ["console", "camera_file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "WARNING",
+    },
+}

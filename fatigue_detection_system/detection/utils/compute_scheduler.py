@@ -3,8 +3,9 @@
 
 Goals:
 - Both loops keep running (no hard skip of EAR).
-- On CPU: partition OpenCV/Torch thread pools so the two workers do not oversubscribe.
-- On CUDA: YOLO runs on GPU (optional FP16); EAR keeps full-rate on CPU cores.
+- On CPU: use modest thread counts — oversubscribing (e.g. 9+7) causes
+  barrier stalls: high latency with surprisingly low CPU%.
+- On CUDA: YOLO on GPU; EAR keeps rate on a few CPU cores.
 """
 from __future__ import annotations
 
@@ -39,6 +40,19 @@ def _detect_cuda(device_pref: str) -> bool:
         return bool(torch.cuda.is_available())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _pin_env_threads(n: int) -> None:
+    """Pin BLAS/OpenMP before heavy native work (idempotent via setdefault)."""
+    s = str(max(1, int(n)))
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ.setdefault(key, s)
 
 
 @dataclass
@@ -91,23 +105,27 @@ class ComputeScheduler:
         if use_cuda:
             # GPU does YOLO math; leave most CPU to dlib/OpenCV preprocess.
             if yolo_t <= 0:
-                yolo_t = max(1, min(4, cpu_n // 4 or 1))
+                yolo_t = max(1, min(2, cpu_n // 4 or 1))
             if ear_t <= 0:
-                ear_t = max(1, cpu_n - yolo_t)
+                ear_t = max(2, min(4, cpu_n // 2))
             opencv_yolo = max(1, min(2, yolo_t))
             opencv_ear = max(1, min(ear_t, 2))
-            busy_yield = 0  # no need to yield GPU vs CPU
+            busy_yield = 0
         else:
-            # Split cores ~60/40 favoring YOLO (heavier), keep both alive.
+            # Windows/PyTorch: 4 intra-op threads usually beats 8–16 (less stall).
             if yolo_t <= 0:
-                yolo_t = max(1, (cpu_n * 3) // 5)
+                yolo_t = max(2, min(4, (cpu_n + 1) // 2))
             if ear_t <= 0:
-                ear_t = max(1, cpu_n - yolo_t)
-            # Avoid oversubscribe: cap sum at cpu_n
+                ear_t = max(1, min(2, cpu_n - yolo_t))
             if yolo_t + ear_t > cpu_n:
                 ear_t = max(1, cpu_n - yolo_t)
-            opencv_yolo = max(1, min(yolo_t, 4))
-            opencv_ear = max(1, min(ear_t, 2))
+            # Hard cap — UI showing 9+7 means oversubscribe / low CPU% / high latency
+            yolo_t = max(1, min(4, yolo_t))
+            ear_t = max(1, min(2, ear_t))
+            opencv_yolo = max(1, min(2, yolo_t))
+            opencv_ear = 1
+            busy_stretch = max(busy_stretch, 1.5)
+            busy_yield = max(busy_yield, 8)
 
         plan = SchedulerPlan(
             device=device if use_cuda else "cpu",
@@ -130,22 +148,23 @@ class ComputeScheduler:
     def _apply_global_defaults(self) -> None:
         """Set process thread pools once (avoid per-inference races)."""
         plan = self.plan
-        total = max(1, min(plan.cpu_count, plan.yolo_threads + plan.ear_threads))
+        # Prefer YOLO budget for torch; dlib/OpenCV use their own pools lightly
+        torch_n = max(1, plan.yolo_threads if not plan.use_cuda else min(2, plan.yolo_threads))
+        _pin_env_threads(torch_n)
         try:
             import torch
 
-            torch.set_num_threads(total)
+            torch.set_num_threads(torch_n)
             try:
-                torch.set_num_interop_threads(max(1, min(2, plan.cpu_count // 2 or 1)))
+                torch.set_num_interop_threads(1)
             except RuntimeError:
-                # Can only be set once per process in some builds
                 pass
         except Exception:  # noqa: BLE001
             pass
         try:
             import cv2
 
-            cv2.setNumThreads(max(1, min(4, plan.opencv_yolo_threads + plan.opencv_ear_threads)))
+            cv2.setNumThreads(max(1, min(2, plan.opencv_yolo_threads)))
         except Exception:  # noqa: BLE001
             pass
 
@@ -170,8 +189,6 @@ class ComputeScheduler:
 
     @contextmanager
     def yolo_context(self) -> Iterator[SchedulerPlan]:
-        # Thread pools are fixed at configure time to avoid process-wide races
-        # between concurrent EAR / YOLO workers.
         yield self.ensure_configured()
 
     @contextmanager

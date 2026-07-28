@@ -1,8 +1,9 @@
 # Fatigue Detection（基于 YOLO 与 dlib）
 
-实时检测驾驶员面部状态、疲劳程度与不良驾驶行为（打哈欠、抽烟、打电话、喝水等）。支持系统摄像头与海康威视 GigE 工业相机（MVS）。
+一套面向驾驶场景的实时检测系统：看人是否疲劳（眯眼、微睡、打哈欠），以及是否抽烟、打电话、喝水。
 
-仓库：https://github.com/wyivz/Fatigue_Detection
+- YOLO：找 face / smoke / phone / water
+- dlib：在人脸框上量眼睛开合（EAR）、嘴巴开合（MAR）
 
 ## 功能
 
@@ -13,6 +14,14 @@
 - 历史会话与结果统计
 - Windows 便携包 / 一键安装脚本（见 `deploy/`）
 
+- 画面
+  → 按 yolo_detect_max_width 缩小（与工业相机一致）
+  → [可选] 黑白 CLAHE 增强（彩色默认关）
+  → YOLO 检测 + 分项门槛 + 贴脸过滤 + 主脸粘滞
+  → BehaviorConfirmTracker（M 次命中 / 最近 N 次）
+  → dlib light 精修 → EAR/MAR
+  → FatigueTemporalTracker（含会话 EAR 校准、侧脸门控）
+  → 按需画框 / 写库
 ## 环境
 
 - Python 3.8（推荐 3.8.10）
@@ -109,3 +118,5 @@ Fatigue_Detection/
 ## 许可与声明
 
 仅供学习与研究。实车/产线部署前请完成充分测试，并自行配置密钥与访问控制。
+
+

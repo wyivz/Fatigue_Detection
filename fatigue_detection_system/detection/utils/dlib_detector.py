@@ -2,6 +2,7 @@
 """dlib face landmarks + EAR/MAR fatigue helpers (thread-safe)."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 
@@ -10,6 +11,8 @@ import dlib
 import numpy as np
 from django.conf import settings
 from scipy.spatial import distance as dist
+
+logger = logging.getLogger("detection.detect")
 
 
 class DlibDetector:
@@ -30,7 +33,7 @@ class DlibDetector:
             self.predictor = dlib.shape_predictor(predictor_path)
         except RuntimeError:
             self.predictor = None
-            print(f"无法加载面部特征点预测器，路径: {predictor_path}")
+            logger.error("无法加载面部特征点预测器，路径: %s", predictor_path)
 
         self.LEFT_EYE_START = 36
         self.LEFT_EYE_END = 41
@@ -52,16 +55,16 @@ class DlibDetector:
             dummy = np.zeros((480, 640, 3), dtype=np.uint8)
             # Synthetic mid-frame box so predictor path is exercised
             self.detect_fatigue(dummy, face_bbox=[160, 80, 480, 400])
-        except Exception as e:  # noqa: BLE001
-            print(f"dlib warmup failed: {e}")
+        except Exception:  # noqa: BLE001
+            logger.exception("dlib warmup failed")
         return (_time.perf_counter() - t0) * 1000.0
 
     def load_config(self):
         from detection.models import SystemConfig
 
         self.EYE_AR_THRESH = 0.25
-        # Outer-lip MAR: closed ~0.25–0.45, yawn typically >= 0.55–0.70
-        self.MOUTH_AR_THRESH = 0.55
+        # Archive MAR threshold (2-span mouth formula)
+        self.MOUTH_AR_THRESH = 0.6
         self.MOUTH_REL_OPEN_THRESH = 0.12  # mouth vertical / nose-chin
         self.MAX_FACES = 4
 
@@ -73,31 +76,33 @@ class DlibDetector:
             mouth_thresh_config = SystemConfig.objects.filter(
                 config_key="mouth_ar_thresh"
             ).first()
-            migrated = SystemConfig.objects.filter(
-                config_key="mouth_ar_migrated_v2"
+            # Restore archive MAR thresh once (prior v2 migrated 0.6 → 0.55 for 3-span MAR)
+            archive_mar = SystemConfig.objects.filter(
+                config_key="mouth_ar_migrated_archive_v1"
             ).first()
             if mouth_thresh_config:
                 mar_th = float(mouth_thresh_config.config_value)
-                # One-shot migration from old inner-lip / legacy defaults
-                if migrated is None and (
-                    abs(mar_th - 0.5) < 1e-6 or abs(mar_th - 0.6) < 1e-6
-                ):
-                    mar_th = 0.55
-                    mouth_thresh_config.config_value = "0.55"
+                if archive_mar is None and abs(mar_th - 0.55) < 1e-6:
+                    mar_th = 0.6
+                    mouth_thresh_config.config_value = "0.6"
                     mouth_thresh_config.save(update_fields=["config_value"])
                     SystemConfig.objects.update_or_create(
-                        config_key="mouth_ar_migrated_v2",
+                        config_key="mouth_ar_migrated_archive_v1",
                         defaults={"config_value": "1"},
                     )
-                elif migrated is None:
+                elif archive_mar is None:
                     SystemConfig.objects.update_or_create(
-                        config_key="mouth_ar_migrated_v2",
+                        config_key="mouth_ar_migrated_archive_v1",
                         defaults={"config_value": "1"},
                     )
                 self.MOUTH_AR_THRESH = mar_th
-            elif migrated is None:
+            elif archive_mar is None:
                 SystemConfig.objects.update_or_create(
-                    config_key="mouth_ar_migrated_v2",
+                    config_key="mouth_ar_thresh",
+                    defaults={"config_value": "0.6"},
+                )
+                SystemConfig.objects.update_or_create(
+                    config_key="mouth_ar_migrated_archive_v1",
                     defaults={"config_value": "1"},
                 )
 
@@ -126,13 +131,13 @@ class DlibDetector:
             if max_faces_cfg:
                 self.MAX_FACES = max(1, min(8, int(float(max_faces_cfg.config_value))))
 
-            print(
-                f"已加载配置: EYE_AR_THRESH={self.EYE_AR_THRESH}, "
-                f"MOUTH_AR_THRESH={self.MOUTH_AR_THRESH}, "
-                f"MOUTH_REL={self.MOUTH_REL_OPEN_THRESH}, MAX_FACES={self.MAX_FACES}"
+            logger.info(
+                "已加载配置: EYE_AR_THRESH=%s, MOUTH_AR_THRESH=%s, MOUTH_REL=%s, MAX_FACES=%s",
+                self.EYE_AR_THRESH, self.MOUTH_AR_THRESH,
+                self.MOUTH_REL_OPEN_THRESH, self.MAX_FACES,
             )
-        except Exception as e:  # noqa: BLE001
-            print(f"加载配置失败: {e}")
+        except Exception:  # noqa: BLE001
+            logger.exception("加载配置失败")
 
     @staticmethod
     def _expand_bbox(
@@ -438,58 +443,43 @@ class DlibDetector:
         c = dist.euclidean(eye[0], eye[3])
         return (a + b) / (2.0 * c)
 
-    def mouth_aspect_ratio(self, landmarks):
+    def mouth_aspect_ratio(self, mouth):
         """
-        Outer-lip MAR (stable on mono / noisy industrial video).
-
-        Uses three vertical outer-lip spans over mouth width:
-          (||p50-p58|| + ||p51-p57|| + ||p52-p56||) / (3 * ||p48-p54||)
-
-        Typical ranges: closed/talking ~0.25–0.50; yawn usually >= 0.55–0.70.
-        Inner-lip MAR was too noisy and caused false yawns.
+        Archive MAR on mouth slice landmarks[48:68]:
+          (||p50-p58|| + ||p52-p56||) / (2 · ||p48-p54||)
         """
-        v1 = dist.euclidean(landmarks[50], landmarks[58])
-        v2 = dist.euclidean(landmarks[51], landmarks[57])
-        v3 = dist.euclidean(landmarks[52], landmarks[56])
-        horiz = dist.euclidean(landmarks[48], landmarks[54])
-        if horiz < 1e-6:
+        A = dist.euclidean(mouth[2], mouth[10])  # 50, 58
+        B = dist.euclidean(mouth[4], mouth[8])  # 52, 56
+        C = dist.euclidean(mouth[0], mouth[6])  # 48, 54
+        if C < 1e-6:
             return 0.0
-        return float((v1 + v2 + v3) / (3.0 * horiz))
+        return float((A + B) / (2.0 * C))
+
+    def mouth_aspect_ratio_from_landmarks(self, landmarks):
+        mouth = landmarks[self.MOUTH_START : self.MOUTH_END + 1]
+        return self.mouth_aspect_ratio(mouth)
 
     def mouth_relative_open(self, landmarks):
         """Vertical mouth opening normalized by nose-bridge → chin distance."""
         open_px = dist.euclidean(landmarks[51], landmarks[57])
         face_scale = dist.euclidean(landmarks[27], landmarks[8])
         if face_scale < 1e-6:
-            # Fallback: jaw width
             face_scale = dist.euclidean(landmarks[3], landmarks[13])
         if face_scale < 1e-6:
             return 0.0
         return float(open_px / face_scale)
 
     def is_yawn(self, landmarks, mar=None):
-        """
-        Yawn when outer-lip MAR reaches the configured threshold.
-
-        A tiny relative-open sanity floor rejects landmark glitches (MAR high
-        but mouth not actually open). The configured mouth_rel_open_thresh is
-        used as that soft floor (clamped), not a second hard AND gate.
-        """
+        """Archive yawn: MAR above threshold (no second gate)."""
         if mar is None:
-            mar = self.mouth_aspect_ratio(landmarks)
-        mar_th = float(self.MOUTH_AR_THRESH)
-        if mar < mar_th:
-            return False
-        rel = self.mouth_relative_open(landmarks)
-        # Soft floor only — do not require the full configured rel as a second gate
-        soft_floor = max(0.04, min(0.10, float(self.MOUTH_REL_OPEN_THRESH) * 0.5))
-        return bool(rel >= soft_floor)
+            mar = self.mouth_aspect_ratio_from_landmarks(landmarks)
+        return bool(mar > float(self.MOUTH_AR_THRESH))
 
     def _metrics_from_landmarks(self, landmarks):
         left_eye = landmarks[self.LEFT_EYE_START : self.LEFT_EYE_END + 1]
         right_eye = landmarks[self.RIGHT_EYE_START : self.RIGHT_EYE_END + 1]
         ear = (self.eye_aspect_ratio(left_eye) + self.eye_aspect_ratio(right_eye)) / 2.0
-        mar = self.mouth_aspect_ratio(landmarks)
+        mar = self.mouth_aspect_ratio_from_landmarks(landmarks)
         yawn = self.is_yawn(landmarks, mar=mar)
         if ear < self.EYE_AR_THRESH * 0.8:
             fatigue_level = 4
@@ -531,61 +521,72 @@ class DlibDetector:
         - eyes-on-brows → crop top
         refine_rect modes:
           off   — base (+ one light crop if quality bad)
-          light — geometry crops only (no HOG); for EAR hot path
-          full  — HOG snap + extra mouth/eye retries (detect overlay)
+          light — geometry crops only (no HOG)
+          full  — HOG snap near YOLO (preferred base) + geometry retries
         """
         if self.predictor is None:
             return None
 
         mode = self._normalize_refine(refine_rect)
+        # (quality, landmarks, from_hog, rect)
         candidates = []
 
-        def _try(rect):
+        def _try(rect, from_hog: bool = False):
             if rect is None:
                 return
             shape = self.predictor(gray, rect)
             lm = self._shape_to_landmarks(shape)
-            candidates.append((self._landmark_quality(lm), lm))
+            candidates.append(
+                (self._landmark_quality(lm), lm, bool(from_hog), rect)
+            )
 
-        base = self._bbox_to_rect(face_bbox, image_shape)
-        _try(base)
-
+        yolo_rect = self._bbox_to_rect(face_bbox, image_shape)
+        hog_rect = None
         if mode == "full":
-            hog = self._hog_rect_near_yolo(gray, face_bbox, image_shape)
-            if hog is not None:
-                _try(hog)
+            hog_rect = self._hog_rect_near_yolo(gray, face_bbox, image_shape)
 
-        # Start from best so far for targeted fixes
+        # Prefer HOG-aligned rect as primary base (archive-like pairing)
+        if hog_rect is not None:
+            _try(hog_rect, from_hog=True)
+        _try(yolo_rect, from_hog=False)
+
         if not candidates:
             return None
-        candidates.sort(key=lambda t: t[0], reverse=True)
-        best_score, best_lm = candidates[0]
-        best_rect = base
 
-        if best_score < 2 and base is not None and mode != "off":
-            # Mouth too low → drop neck
-            if self._mouth_collapsed_to_chin(best_lm):
-                r = self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.14)
-                _try(r)
-                if mode in ("light", "full"):
-                    _try(self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.22))
-            # Eyes too high → drop forehead
-            if self._eyes_collapsed_to_brows(best_lm):
-                r = self._rect_crop_top(best_rect, image_shape, crop_frac=0.12)
-                _try(r)
-                if mode in ("light", "full"):
-                    _try(self._rect_crop_top(best_rect, image_shape, crop_frac=0.20))
+        # Sort: higher quality first; tie-break prefer HOG
+        candidates.sort(key=lambda t: (t[0], 1 if t[2] else 0), reverse=True)
+        best_score, best_lm, best_from_hog, best_rect = candidates[0]
 
-            candidates.sort(key=lambda t: t[0], reverse=True)
-            best_score, best_lm = candidates[0]
-        elif best_score < 2 and base is not None and mode == "off":
-            # Minimal single crop (legacy False path)
+        # Geometry retries use HOG rect as base when available
+        crop_base = hog_rect if hog_rect is not None else yolo_rect
+
+        if best_score < 2 and crop_base is not None and mode != "off":
             if self._mouth_collapsed_to_chin(best_lm):
-                _try(self._rect_crop_bottom(best_rect, image_shape, crop_frac=0.14))
+                r = self._rect_crop_bottom(crop_base, image_shape, crop_frac=0.14)
+                _try(r, from_hog=best_from_hog)
+                if mode in ("light", "full"):
+                    _try(
+                        self._rect_crop_bottom(crop_base, image_shape, crop_frac=0.22),
+                        from_hog=best_from_hog,
+                    )
             if self._eyes_collapsed_to_brows(best_lm):
-                _try(self._rect_crop_top(best_rect, image_shape, crop_frac=0.12))
-            candidates.sort(key=lambda t: t[0], reverse=True)
-            best_score, best_lm = candidates[0]
+                r = self._rect_crop_top(crop_base, image_shape, crop_frac=0.12)
+                _try(r, from_hog=best_from_hog)
+                if mode in ("light", "full"):
+                    _try(
+                        self._rect_crop_top(crop_base, image_shape, crop_frac=0.20),
+                        from_hog=best_from_hog,
+                    )
+
+            candidates.sort(key=lambda t: (t[0], 1 if t[2] else 0), reverse=True)
+            best_score, best_lm, best_from_hog, best_rect = candidates[0]
+        elif best_score < 2 and yolo_rect is not None and mode == "off":
+            if self._mouth_collapsed_to_chin(best_lm):
+                _try(self._rect_crop_bottom(yolo_rect, image_shape, crop_frac=0.14))
+            if self._eyes_collapsed_to_brows(best_lm):
+                _try(self._rect_crop_top(yolo_rect, image_shape, crop_frac=0.12))
+            candidates.sort(key=lambda t: (t[0], 1 if t[2] else 0), reverse=True)
+            best_score, best_lm, best_from_hog, best_rect = candidates[0]
 
         metrics = self._metrics_from_landmarks(best_lm)
         metrics["bbox"] = [int(v) for v in face_bbox]
@@ -593,6 +594,7 @@ class DlibDetector:
         metrics["pose_ok"] = bool(
             best_score >= 0 and self._pose_frontal_ok(best_lm)
         )
+        metrics["from_hog"] = bool(best_from_hog)
         return metrics
 
     def detect_fatigue_multi(
@@ -714,8 +716,8 @@ class DlibDetector:
                 results["landmarks"] = primary["landmarks"]
                 results["pose_ok"] = bool(primary.get("pose_ok", True))
                 results["landmark_quality"] = primary.get("landmark_quality")
-        except Exception as e:  # noqa: BLE001
-            print(f"多人疲劳检测异常: {e}")
+        except Exception:  # noqa: BLE001
+            logger.exception("多人疲劳检测异常")
             results["eye_aspect_ratio"] = None
             results["yawn_detected"] = False
             results["fatigue_level"] = 0
@@ -737,25 +739,15 @@ class DlibDetector:
         union = area_a + area_b - inter
         return float(inter) / float(union) if union > 0 else 0.0
 
-    def detect_fatigue(self, image, face_bbox=None):
+    def detect_fatigue(self, image, face_bbox=None, yolo_face_bbox=None):
         """
-        Prefer external YOLO face_bbox for 68-point prediction when available.
-        HOG is only used when no valid external box is provided.
-        """
-        if face_bbox is not None:
-            multi = self.detect_fatigue_multi(
-                image, face_bboxes=[face_bbox], primary_bbox=face_bbox
-            )
-            return {
-                "faces_detected": multi.get("faces_detected") or 0,
-                "eye_aspect_ratio": multi.get("eye_aspect_ratio"),
-                "mouth_aspect_ratio": multi.get("mouth_aspect_ratio"),
-                "yawn_detected": bool(multi.get("yawn_detected")),
-                "fatigue_level": int(multi.get("fatigue_level") or 0),
-                "landmarks": multi.get("landmarks"),
-                "faces": multi.get("faces") or [],
-            }
+        Archive-faithful fatigue on a *clean* BGR frame (no YOLO draw).
 
+        1) dlib HOG (upsample 0, retry 1) + 68pt on first face
+        2) If HOG misses but YOLO supplied a face box, predict on that rect
+        No Haar eye fallback (that produced a fake constant EAR=0.30).
+        """
+        fallback = yolo_face_bbox if yolo_face_bbox is not None else face_bbox
         results = {
             "faces_detected": 0,
             "eye_aspect_ratio": None,
@@ -768,40 +760,51 @@ class DlibDetector:
 
         try:
             with self._lock:
+                if self.predictor is None:
+                    return results
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                 faces = list(self.detector(gray, 0))
-                results["faces_detected"] = len(faces)
+                if not faces:
+                    faces = list(self.detector(gray, 1))
 
-                if len(faces) > 0 and self.predictor is not None:
-                    shape = self.predictor(gray, faces[0])
-                    landmarks = np.zeros((68, 2), dtype=int)
-                    for i in range(0, 68):
-                        landmarks[i] = (shape.part(i).x, shape.part(i).y)
-                    self._analyze_landmarks(landmarks, results)
-                    results["faces"] = [
-                        {
-                            **self._metrics_from_landmarks(landmarks),
-                            "bbox": [
-                                int(faces[0].left()),
-                                int(faces[0].top()),
-                                int(faces[0].right()),
-                                int(faces[0].bottom()),
-                            ],
-                            "is_primary": True,
-                        }
-                    ]
-                elif hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data"):
-                    cascade_path = cv2.data.haarcascades + "haarcascade_eye.xml"
-                    eye_cascade = cv2.CascadeClassifier(cascade_path)
-                    eyes = eye_cascade.detectMultiScale(gray, 1.3, 5)
-                    if len(eyes) > 0:
-                        results["eye_aspect_ratio"] = 0.3
-                        results["fatigue_level"] = 0
-        except Exception as e:  # noqa: BLE001
-            print(f"疲劳检测异常: {e}")
+                rect = None
+                used_yolo_fallback = False
+                if faces:
+                    rect = faces[0]
+                    results["faces_detected"] = len(faces)
+                elif fallback is not None:
+                    rect = self._bbox_to_rect(fallback, image.shape)
+                    if rect is not None:
+                        results["faces_detected"] = 1
+                        used_yolo_fallback = True
+
+                if rect is None:
+                    return results
+
+                shape = self.predictor(gray, rect)
+                landmarks = np.zeros((68, 2), dtype=int)
+                for i in range(68):
+                    landmarks[i] = (shape.part(i).x, shape.part(i).y)
+                self._analyze_landmarks(landmarks, results)
+                results["used_yolo_fallback"] = used_yolo_fallback
+                results["faces"] = [
+                    {
+                        **self._metrics_from_landmarks(landmarks),
+                        "bbox": [
+                            int(rect.left()),
+                            int(rect.top()),
+                            int(rect.right()),
+                            int(rect.bottom()),
+                        ],
+                        "is_primary": True,
+                    }
+                ]
+        except Exception:  # noqa: BLE001
+            logger.exception("疲劳检测异常")
             results["eye_aspect_ratio"] = None
             results["yawn_detected"] = False
             results["fatigue_level"] = 0
+            results["landmarks"] = None
 
         return results
 

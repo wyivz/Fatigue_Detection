@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""One-click performance presets for CPU industrial PCs vs GPU workstations."""
+"""One-click performance presets — defaults biased toward archive-like quality."""
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
@@ -31,6 +31,8 @@ PRESET_KEYS = (
     "yolo_iou_thresh",
     "yolo_imgsz",
     "yolo_detect_max_width",
+    "mvs_stream_max_width",
+    "mvs_stream_max_height",
     "yolo_spatial_filter",
     "yolo_near_face_ratio",
     "detection_interval",
@@ -42,6 +44,11 @@ PRESET_KEYS = (
     "compute_ear_threads",
     "ear_busy_stretch_pct",
     "mono_camera_mode",
+    "dlib_refine_mode",
+    "dlib_landmark_mode",
+    "fatigue_level_mode",
+    "yawn_confirm_ms",
+    "mouth_ar_thresh",
 )
 
 # Plain-language behavior modes (write existing confirm/conf keys)
@@ -58,105 +65,119 @@ BEHAVIOR_MODE_KEYS = (
 )
 
 
-def _base_cpu_smooth() -> Dict[str, str]:
+def _archive_common() -> Dict[str, str]:
+    """Shared knobs matching archive: HOG landmarks + instant EAR/MAR."""
     return {
+        "yolo_spatial_filter": "false",
+        "yolo_near_face_ratio": "2.0",
+        "behavior_confirm_frames": "1",
+        "behavior_window_frames": "1",
+        "behavior_sensitivity": "loose",
+        "mono_camera_mode": "false",
+        # Archive: frontal HOG on frame (after YOLO draw), not YOLO-box predictor
+        "dlib_landmark_mode": "hog",
+        "dlib_refine_mode": "off",
+        "fatigue_level_mode": "instant",
+        "yawn_confirm_ms": "0",
+        "mouth_ar_thresh": "0.6",
+        "ear_busy_stretch_pct": "100",
+    }
+
+
+def _base_cpu_smooth() -> Dict[str, str]:
+    cfg = {
         "performance_preset": "cpu_smooth",
         "device": "cpu",
         "cuda_half": "false",
-        "yolo_conf_thresh": "0.35",
-        "yolo_conf_smoke": "0.35",
-        "yolo_conf_phone": "0.35",
-        "yolo_conf_water": "0.35",
-        "yolo_conf_face": "0.40",
+        "yolo_conf_thresh": "0.50",
+        "yolo_conf_smoke": "0.45",
+        "yolo_conf_phone": "0.45",
+        "yolo_conf_water": "0.45",
+        "yolo_conf_face": "0.45",
         "yolo_iou_thresh": "0.5",
-        "yolo_imgsz": "512",
-        "yolo_detect_max_width": "800",
-        "yolo_spatial_filter": "true",
-        "yolo_near_face_ratio": "1.5",
-        "detection_interval": "600",
-        "ear_sample_interval_ms": "120",
-        "behavior_confirm_frames": "2",
-        "behavior_window_frames": "5",
-        "behavior_sensitivity": "normal",
-        "compute_yolo_threads": "0",
-        "compute_ear_threads": "0",
-        "ear_busy_stretch_pct": "150",
-        "mono_camera_mode": "false",
+        "yolo_imgsz": "640",
+        # Uniform scale (not ROI crop): HOG needs ~webcam face size
+        "yolo_detect_max_width": "960",
+        "mvs_stream_max_width": "640",
+        "mvs_stream_max_height": "0",
+        # Async persist + no wasted intermediate draw (see archive_pipeline) let
+        # this run noticeably tighter than the old 1000ms without starving I/O.
+        "detection_interval": "800",
+        "ear_sample_interval_ms": "100",
+        "compute_yolo_threads": "4",
+        "compute_ear_threads": "2",
     }
+    cfg.update(_archive_common())
+    return cfg
 
 
 def _base_balanced(use_cuda: bool) -> Dict[str, str]:
-    d = {
+    cfg = {
         "performance_preset": "balanced",
         "device": "cuda:0" if use_cuda else "cpu",
         "cuda_half": "true" if use_cuda else "false",
-        "yolo_conf_thresh": "0.30",
-        "yolo_conf_smoke": "0.28",
-        "yolo_conf_phone": "0.30",
-        "yolo_conf_water": "0.30",
-        "yolo_conf_face": "0.35",
+        "yolo_conf_thresh": "0.50",
+        "yolo_conf_smoke": "0.45",
+        "yolo_conf_phone": "0.45",
+        "yolo_conf_water": "0.45",
+        "yolo_conf_face": "0.45",
         "yolo_iou_thresh": "0.5",
         "yolo_imgsz": "640",
         "yolo_detect_max_width": "960",
-        "yolo_spatial_filter": "true",
-        "yolo_near_face_ratio": "1.5",
-        "detection_interval": "500",
+        "mvs_stream_max_width": "640",
+        "mvs_stream_max_height": "0",
+        # Archive template default was 500ms; async persist + trimmed per-frame
+        # copies close most of the previous overhead-driven gap.
+        "detection_interval": "700" if not use_cuda else "500",
         "ear_sample_interval_ms": "100",
-        "behavior_confirm_frames": "2",
-        "behavior_window_frames": "5",
-        "behavior_sensitivity": "normal",
-        "compute_yolo_threads": "0",
-        "compute_ear_threads": "0",
-        "ear_busy_stretch_pct": "150",
-        "mono_camera_mode": "false",
+        "compute_yolo_threads": "4" if not use_cuda else "2",
+        "compute_ear_threads": "2",
     }
-    return d
+    cfg.update(_archive_common())
+    return cfg
 
 
 def _base_gpu_quality() -> Dict[str, str]:
-    return {
+    cfg = {
         "performance_preset": "gpu_quality",
         "device": "cuda:0",
         "cuda_half": "true",
-        "yolo_conf_thresh": "0.25",
-        "yolo_conf_smoke": "0.22",
-        "yolo_conf_phone": "0.25",
-        "yolo_conf_water": "0.25",
-        "yolo_conf_face": "0.35",
+        "yolo_conf_thresh": "0.45",
+        "yolo_conf_smoke": "0.40",
+        "yolo_conf_phone": "0.40",
+        "yolo_conf_water": "0.40",
+        "yolo_conf_face": "0.40",
         "yolo_iou_thresh": "0.5",
-        "yolo_imgsz": "960",
+        "yolo_imgsz": "640",
         "yolo_detect_max_width": "1280",
-        "yolo_spatial_filter": "true",
-        "yolo_near_face_ratio": "1.5",
-        "detection_interval": "300",
+        "mvs_stream_max_width": "960",
+        "mvs_stream_max_height": "0",
+        "detection_interval": "400",
         "ear_sample_interval_ms": "80",
-        "behavior_confirm_frames": "2",
-        "behavior_window_frames": "5",
-        "behavior_sensitivity": "normal",
-        "compute_yolo_threads": "0",
-        "compute_ear_threads": "0",
-        "ear_busy_stretch_pct": "120",
-        "mono_camera_mode": "false",
+        "compute_yolo_threads": "2",
+        "compute_ear_threads": "4",
     }
+    cfg.update(_archive_common())
+    return cfg
 
 
 PRESET_META = {
     "cpu_smooth": {
         "title": "工控 CPU · 流畅",
-        "subtitle": "推荐无独显的工业电脑",
-        "hint": "优先不卡顿；降低送检分辨率。彩色相机请保持黑白增强关闭",
+        "subtitle": "算力紧张时使用",
+        "hint": "归档同帧：YOLO→HOG；等比≤960 / 间隔 0.8s，异步归档减轻卡顿",
         "icon": "fa-microchip",
     },
     "balanced": {
         "title": "均衡（推荐）",
-        "subtitle": "多数彩色现场默认选择",
-        "hint": "速度与检出率折中；有 GPU 时自动用 GPU。彩色默认请选此项",
+        "subtitle": "本机 CPU / 多数工作站",
+        "hint": "归档逻辑：HOG 68 点 + 即时/PERCLOS 疲劳；等比≤960；间隔 0.5-0.7s",
         "icon": "fa-balance-scale",
     },
     "gpu_quality": {
         "title": "GPU · 高精度",
         "subtitle": "需 NVIDIA 显卡 + CUDA 版 PyTorch",
-        "hint": "更高分辨率与更短检测间隔，适合算力充足的工控/工控机",
+        "hint": "CUDA YOLO + 归档 HOG；等比≤1280；间隔 0.4s",
         "icon": "fa-bolt",
     },
 }
@@ -169,25 +190,23 @@ def build_behavior_mode(
     """
     Plain-language behavior sensitivity → confirm M/N + conf floors.
 
-    Modes (locked values from optimization plan):
-      normal  均衡：2/5
-      strict  少误报：3/6，行为类 conf +0.05
-      loose   少漏报：2/4，推理 conf 略降
+    loose (default): archive instant 1/1, no spatial filter
+    normal: 2/5
+    strict: 3/6 + spatial
     """
-    mid = (mode_id or "normal").strip().lower()
+    mid = (mode_id or "loose").strip().lower()
     if mid in ("strict", "少误报"):
         mid = "strict"
-    elif mid in ("loose", "少漏报"):
-        mid = "loose"
-    else:
+    elif mid in ("normal", "均衡"):
         mid = "normal"
+    else:
+        mid = "loose"
 
     base = dict(base_conf or {})
-    # Fall back to balanced-like confs when caller has no current values
-    g = float(base.get("yolo_conf_thresh") or 0.30)
-    smoke = float(base.get("yolo_conf_smoke") or 0.28)
-    phone = float(base.get("yolo_conf_phone") or 0.30)
-    water = float(base.get("yolo_conf_water") or 0.30)
+    g = float(base.get("yolo_conf_thresh") or 0.40)
+    smoke = float(base.get("yolo_conf_smoke") or 0.35)
+    phone = float(base.get("yolo_conf_phone") or 0.35)
+    water = float(base.get("yolo_conf_water") or 0.35)
 
     def _c(v: float) -> str:
         return f"{max(0.15, min(0.95, v)):.2f}"
@@ -202,30 +221,30 @@ def build_behavior_mode(
             "yolo_conf_phone": _c(phone + 0.05),
             "yolo_conf_water": _c(water + 0.05),
             "yolo_spatial_filter": "true",
-            "yolo_near_face_ratio": "1.3",
+            "yolo_near_face_ratio": "1.5",
         }
-    if mid == "loose":
+    if mid == "normal":
         return {
-            "behavior_sensitivity": "loose",
+            "behavior_sensitivity": "normal",
             "behavior_confirm_frames": "2",
-            "behavior_window_frames": "4",
-            "yolo_conf_thresh": _c(g - 0.05),
-            "yolo_conf_smoke": _c(max(0.18, smoke - 0.05)),
-            "yolo_conf_phone": _c(max(0.18, phone - 0.05)),
-            "yolo_conf_water": _c(max(0.18, water - 0.05)),
-            "yolo_spatial_filter": "true",
-            "yolo_near_face_ratio": "1.8",
+            "behavior_window_frames": "5",
+            "yolo_conf_thresh": _c(g),
+            "yolo_conf_smoke": _c(smoke),
+            "yolo_conf_phone": _c(phone),
+            "yolo_conf_water": _c(water),
+            "yolo_spatial_filter": "false",
+            "yolo_near_face_ratio": "2.0",
         }
     return {
-        "behavior_sensitivity": "normal",
-        "behavior_confirm_frames": "2",
-        "behavior_window_frames": "5",
-        "yolo_conf_thresh": _c(g),
-        "yolo_conf_smoke": _c(smoke),
-        "yolo_conf_phone": _c(phone),
-        "yolo_conf_water": _c(water),
-        "yolo_spatial_filter": "true",
-        "yolo_near_face_ratio": "1.5",
+        "behavior_sensitivity": "loose",
+        "behavior_confirm_frames": "1",
+        "behavior_window_frames": "1",
+        "yolo_conf_thresh": _c(max(0.25, g - 0.05)),
+        "yolo_conf_smoke": _c(max(0.22, smoke - 0.05)),
+        "yolo_conf_phone": _c(max(0.22, phone - 0.05)),
+        "yolo_conf_water": _c(max(0.22, water - 0.05)),
+        "yolo_spatial_filter": "false",
+        "yolo_near_face_ratio": "2.0",
     }
 
 
@@ -238,7 +257,6 @@ def build_preset(preset_id: str, cuda_available: Optional[bool] = None) -> Dict[
     if pid == "gpu_quality":
         cfg = _base_gpu_quality()
         if not cuda_available:
-            # Soft-fallback so apply never bricks a CPU-only box
             cfg = _base_balanced(False)
             cfg["performance_preset"] = "balanced"
         return cfg

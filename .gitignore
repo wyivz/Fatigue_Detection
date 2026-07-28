@@ -32,6 +32,9 @@ fatigue_detection_system/media/results/*
 fatigue_detection_system/media/uploads/*
 !fatigue_detection_system/media/uploads/.gitkeep
 
+# Rotating app logs (detection/camera diagnostics)
+fatigue_detection_system/logs/
+
 # Training / duplicate weights
 runs/
 fatigue_detection_system/weights/*.bz2

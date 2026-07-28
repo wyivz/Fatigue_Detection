@@ -14,11 +14,15 @@
         overflow: hidden;
         box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
     }
-    
-    #video-stream {
+
+    #mvs-preview {
         width: 100%;
         height: auto;
-        display: block;
+        display: none;
+        background: #111;
+        min-height: 240px;
+        position: relative;
+        z-index: 1;
     }
     
     #canvas {
@@ -29,7 +33,17 @@
         height: 100%;
         display: none;
         object-fit: contain;
-        background: #000;
+        background: transparent;
+        pointer-events: none;
+        z-index: 2;
+    }
+
+    #video-stream {
+        width: 100%;
+        height: auto;
+        display: block;
+        visibility: visible;
+        z-index: 1;
     }
     
     #result-container {
@@ -233,10 +247,9 @@
                 </div>
                 <div class="card-body">
                     <p class="small text-muted mb-2" id="perf-config-hint">
-                        当前设定：EAR {{ ear_sample_interval_ms|default:100 }} ms /
-                        行为 {{ detection_interval|default:500 }} ms。
-                        脸部框/关键点跟随 EAR；行为框跟随检测间隔。
-                        电脑摄像头轮询请勿短于行为检测间隔，否则易卡顿。
+                        当前设定：检测间隔 {{ detection_interval|default:700 }} ms
+                        （同帧完成 YOLO + HOG + PERCLOS）。
+                        电脑摄像头轮询请勿短于检测间隔，否则易卡顿。
                     </p>
                     <div class="table-responsive">
                         <table class="table table-sm mb-0" id="perf-timing-table">
@@ -253,6 +266,12 @@
                             </tbody>
                         </table>
                     </div>
+                    <p class="small text-muted mt-2 mb-0" id="perf-diag-line">
+                        丢帧 <span id="diag-grab-errors">0</span> ·
+                        相机重连 <span id="diag-reconnects">0</span> ·
+                        归档待写 <span id="diag-persist-queued">0</span> ·
+                        归档丢弃 <span id="diag-persist-dropped">0</span>
+                    </p>
                 </div>
             </div>
         </div>
@@ -352,7 +371,7 @@
 
     // 会话ID
     const sessionId = {{ session.id }};
-    const detectionIntervalMs = {{ detection_interval|default:500 }};
+    const detectionIntervalMs = {{ detection_interval|default:1000 }};
     const earSampleIntervalMs = {{ ear_sample_interval_ms|default:100 }};
     const perclosAlertPct = {{ perclos_alert_pct|default:20 }};
     const enableVoice = {{ enable_voice|yesno:"true,false" }};
@@ -361,6 +380,7 @@
     // DOM元素
     const videoElement = document.getElementById('video-stream');
     const canvasElement = document.getElementById('canvas');
+    let captureCanvas = null;
     const startButton = document.getElementById('start-btn');
     const stopButton = document.getElementById('stop-btn');
     const cameraStatus = document.getElementById('camera-status');
@@ -430,15 +450,15 @@
         behaviorValues: []
     };
 
+    // Same-frame archive pipeline only emits these timing keys now (yolo/dlib
+    // inside process_image_archive, detect_loop around the MVS cycle). Rows
+    // for a separate EAR sampler / sync save-to-disk step were removed along
+    // with that dead code — showing an always-empty row is worse than no row.
     const PERF_ROWS = [
-        { key: 'ear', label: 'EAR 采样', cfg: earSampleIntervalMs },
-        { key: 'mono', label: 'Mono CLAHE', cfg: null },
         { key: 'yolo', label: 'YOLO 行为', cfg: detectionIntervalMs },
         { key: 'dlib', label: 'dlib 关键点', cfg: null },
-        { key: 'draw', label: '绘制标注', cfg: null },
-        { key: 'save', label: '存图写库', cfg: null },
         { key: 'total', label: '全流程', cfg: detectionIntervalMs },
-        { key: 'detect_loop', label: '检测环', cfg: detectionIntervalMs },
+        { key: 'detect_loop', label: '检测环(MVS)', cfg: detectionIntervalMs },
     ];
 
     let clientTimingAvg = {};
@@ -559,7 +579,22 @@
         });
         perfTimingBody.innerHTML = html || '<tr><td colspan="4" class="text-muted text-center">暂无数据</td></tr>';
     }
-    
+
+    // 诊断计数：丢帧 / 相机重连 / 归档队列（异步持久化）积压与丢弃
+    function updateDiagPanel(meta) {
+        if (!meta) return;
+        const setText = (id, val) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = (val == null ? '0' : val);
+        };
+        setText('diag-grab-errors', meta.grab_error_count);
+        setText('diag-reconnects', meta.reconnect_count);
+        if (meta.persist) {
+            setText('diag-persist-queued', meta.persist.queued);
+            setText('diag-persist-dropped', meta.persist.dropped);
+        }
+    }
+
     // 图表
     let statsChart = null;
     
@@ -876,24 +911,17 @@
                     if (hint) {
                         hint.textContent =
                             '调度: ' + (s.use_cuda ? ('CUDA ' + s.device) : 'CPU') +
-                            ' | YOLO线程 ' + s.yolo_threads + ' / EAR线程 ' + s.ear_threads +
-                            ' | 脸部 EAR {{ ear_sample_interval_ms|default:100 }} ms / 行为 {{ detection_interval|default:500 }} ms' +
+                            ' | YOLO线程 ' + s.yolo_threads +
+                            ' | 检测间隔 {{ detection_interval|default:700 }} ms（同帧 YOLO+HOG+PERCLOS）' +
                             (s.use_cuda && s.cuda_half ? ' | FP16' : '');
                     }
                 }
                 if (data.meta) {
                     const did = data.meta.detection_id;
-                    const behaviorChanged = (
-                        !!data.meta.smoking_detected || !!data.meta.phone_detected || !!data.meta.drinking_detected
-                    );
-                    // Persist frames (detection_id change) or confirmed behavior => full update
-                    if ((did != null && did !== lastDetectionId) || behaviorChanged) {
-                        if (did != null) lastDetectionId = did;
-                        updateDetectionResults(Object.assign({ status: 'success' }, data.meta));
-                    } else if (data.meta.eye_aspect_ratio !== undefined || data.meta.perclos !== undefined || data.meta.fatigue_level !== undefined) {
-                        updateDetectionResults(Object.assign({ status: 'success' }, data.meta, {
-                            _softUpdate: true
-                        }));
+                    // Always refresh overlay geometry + side panel from same archive meta
+                    updateDetectionResults(Object.assign({ status: 'success' }, data.meta));
+                    if (did != null && did !== lastDetectionId) {
+                        lastDetectionId = did;
                     }
                 }
             } catch (e) {
@@ -959,7 +987,7 @@
                     audio: false
                 });
                 videoElement.srcObject = stream;
-                canvasElement.style.display = 'none';
+                canvasElement.style.display = 'block';
                 const startResp = await $.post("{% url 'detection:start_detection' %}", {
                     session_id: sessionId,
                     source_type: 'browser'
@@ -1069,37 +1097,36 @@
             detectionAlert.className = 'alert alert-primary';
         }
         if (!videoElement.videoWidth || !videoElement.videoHeight) {
-            console.warn('视频尚未就绪，跳过本帧');
             return;
         }
-        
-        // 用离屏 canvas 抓帧，避免覆盖正在显示的检测结果画布尺寸逻辑混乱
-        const captureCanvas = document.createElement('canvas');
-        captureCanvas.width = videoElement.videoWidth;
-        captureCanvas.height = videoElement.videoHeight;
+
+        // Archive capture: full video frame → JPEG (same FOV/resolution as live)
+        const cw = videoElement.videoWidth;
+        const ch = videoElement.videoHeight;
+        if (!captureCanvas) captureCanvas = document.createElement('canvas');
+        if (captureCanvas.width !== cw || captureCanvas.height !== ch) {
+            captureCanvas.width = cw;
+            captureCanvas.height = ch;
+        }
         const context = captureCanvas.getContext('2d');
-        context.drawImage(videoElement, 0, 0, captureCanvas.width, captureCanvas.height);
+        context.drawImage(videoElement, 0, 0, cw, ch);
         const imageData = captureCanvas.toDataURL('image/jpeg', 0.85);
-        
-        // 请求参数
+
         const requestData = {
             session_id: sessionId,
             image_data: imageData,
             detect_fatigue: 'true',
             detect_behaviors: 'true'
         };
-        
-        console.log('发送检测请求，会话ID:', sessionId);
+
         isRequestInFlight = true;
-        
-        // 发送到服务器进行检测
+
         $.ajax({
             url: "{% url 'detection:get_result' %}",
             type: "POST",
             data: requestData,
             dataType: "json",
             success: function(result) {
-                console.log('收到检测结果响应:', result);
                 if (result.status === 'success') {
                     updateDetectionResults(result);
                 } else {
@@ -1109,7 +1136,6 @@
             },
             error: function(xhr, status, error) {
                 console.error('请求失败:', status, error);
-                console.log('错误详情:', xhr && xhr.responseText);
                 displayEmptyResults();
             },
             complete: function() {
@@ -1181,6 +1207,7 @@
         if (result.timing) {
             updateTimingPanel(result.timing);
         }
+        updateDiagPanel(result);
 
         const soft = !!result._softUpdate;
 
@@ -1486,22 +1513,120 @@
         </div>`;
         
         detectionDetails.innerHTML = detailsHTML;
-        
-        // 浏览器摄像头：可用结果图覆盖视频；工业相机预览走 MJPEG，不要用 canvas 盖住
-        if (result.image_data && activeSourceType !== 'mvs') {
-            const resultImage = new Image();
-            resultImage.onload = () => {
-                canvasElement.width = resultImage.width;
-                canvasElement.height = resultImage.height;
-                const context = canvasElement.getContext('2d');
-                context.drawImage(resultImage, 0, 0);
-                canvasElement.style.display = 'block';
-                videoElement.style.visibility = 'hidden';
-            };
-            resultImage.src = result.image_data;
-        } else if (activeSourceType === 'mvs') {
-            canvasElement.style.display = 'none';
+
+        // Live video + transparent overlay when landmarks exist; else archive JPEG fallback
+        drawLiveOverlay(result);
+        if (activeSourceType === 'browser' && result.image_data &&
+            !(result.landmarks && result.landmarks.length)) {
+            drawArchiveResultImage(result.image_data);
+        }
+    }
+
+    function drawArchiveResultImage(dataUrl) {
+        const img = new Image();
+        img.onload = function () {
+            const vw = videoElement.videoWidth || img.width;
+            const vh = videoElement.videoHeight || img.height;
+            if (!vw || !vh) return;
+            canvasElement.width = vw;
+            canvasElement.height = vh;
+            canvasElement.style.display = 'block';
+            const ctx = canvasElement.getContext('2d');
+            ctx.clearRect(0, 0, vw, vh);
+            ctx.drawImage(img, 0, 0, vw, vh);
+        };
+        img.src = dataUrl;
+    }
+
+    function drawLiveOverlay(result) {
+        const isMvs = activeSourceType === 'mvs';
+        const media = isMvs ? mvsPreviewImg : videoElement;
+        if (!media) return;
+
+        let vw = 0, vh = 0;
+        if (isMvs) {
+            vw = media.naturalWidth || media.clientWidth || 0;
+            vh = media.naturalHeight || media.clientHeight || 0;
+            canvasElement.style.display = 'block';
             if (mvsPreviewImg) mvsPreviewImg.style.display = 'block';
+            videoElement.style.display = 'none';
+        } else {
+            vw = videoElement.videoWidth || 0;
+            vh = videoElement.videoHeight || 0;
+            videoElement.style.visibility = 'visible';
+            videoElement.style.display = 'block';
+            canvasElement.style.display = 'block';
+            if (mvsPreviewImg) mvsPreviewImg.style.display = 'none';
+        }
+        if (!vw || !vh) return;
+
+        canvasElement.width = vw;
+        canvasElement.height = vh;
+        const ctx = canvasElement.getContext('2d');
+        ctx.clearRect(0, 0, vw, vh);
+
+        const srcW = (result.landmarks_size && result.landmarks_size[0])
+            || (result.image_size && result.image_size[0])
+            || vw;
+        const srcH = (result.landmarks_size && result.landmarks_size[1])
+            || (result.image_size && result.image_size[1])
+            || vh;
+        const sx = vw / Math.max(1, srcW);
+        const sy = vh / Math.max(1, srcH);
+
+        const colorMap = {
+            face: '#22c55e',
+            smoke: '#ef4444',
+            phone: '#3b82f6',
+            water: '#eab308'
+        };
+        (result.detections || []).forEach(function (det) {
+            const box = det.bbox || [];
+            if (box.length < 4) return;
+            const x1 = box[0] * sx, y1 = box[1] * sy;
+            const x2 = box[2] * sx, y2 = box[3] * sy;
+            ctx.strokeStyle = colorMap[det.class_name] || '#06b6d4';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+            const label = (det.class_name || '') + (det.confidence != null ? (' ' + Number(det.confidence).toFixed(2)) : '');
+            if (label) {
+                ctx.fillStyle = ctx.strokeStyle;
+                ctx.font = '12px sans-serif';
+                ctx.fillText(label, x1 + 2, Math.max(12, y1 - 4));
+            }
+        });
+
+        const lm = result.landmarks;
+        if (lm && lm.length) {
+            ctx.strokeStyle = '#22c55e';
+            ctx.fillStyle = '#22c55e';
+            ctx.lineWidth = 1;
+            const leftEyeIdx = [36, 37, 38, 39, 40, 41];
+            const rightEyeIdx = [42, 43, 44, 45, 46, 47];
+            const mouthIdx = [];
+            for (let i = 48; i <= 67; i++) mouthIdx.push(i);
+            function drawContour(idxs) {
+                ctx.beginPath();
+                for (let j = 0; j < idxs.length; j++) {
+                    const p = lm[idxs[j]];
+                    if (!p || p.length < 2) continue;
+                    const x = p[0] * sx, y = p[1] * sy;
+                    if (j === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.closePath();
+                ctx.stroke();
+            }
+            drawContour(leftEyeIdx);
+            drawContour(rightEyeIdx);
+            drawContour(mouthIdx);
+            for (let i = 0; i < lm.length; i++) {
+                const p = lm[i];
+                if (!p || p.length < 2) continue;
+                ctx.beginPath();
+                ctx.arc(p[0] * sx, p[1] * sy, 1.6, 0, Math.PI * 2);
+                ctx.fill();
+            }
         }
     }
     

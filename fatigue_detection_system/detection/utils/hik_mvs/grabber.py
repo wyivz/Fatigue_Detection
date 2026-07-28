@@ -2,6 +2,7 @@
 """Background GigE grab + detection (preview FPS decoupled from detect interval)."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,8 @@ import numpy as np
 from django.db import connection
 
 from .camera import HikCamera
+
+logger = logging.getLogger("detection.camera")
 
 _EMA_ALPHA = 0.2
 
@@ -28,49 +31,30 @@ class MvsGrabber:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._grab_thread: Optional[threading.Thread] = None
-        self._ear_thread: Optional[threading.Thread] = None
         self._detect_thread: Optional[threading.Thread] = None
         self._camera: Optional[HikCamera] = None
         self._session_id: Optional[int] = None
         self._user_id: Optional[int] = None
         self._interval_ms = 500
-        self._ear_interval_ms = 100
-        self._preview_max_width = 960
-        self._detect_max_width = 960
-        self._preview_jpeg_quality = 55
-        self._preview_min_interval_sec = 0.05  # ~20 FPS cap for MJPEG encode
+        self._preview_max_width = 640
+        self._preview_max_height = 0  # 0 = no height cap (width usually dominant)
+        self._dlib_refine_mode: str = "light"
+        self._preview_jpeg_quality = 50
+        self._preview_min_interval_sec = 0.08  # ~12 FPS preview encode
         self._latest_bgr: Optional[np.ndarray] = None
         self._latest_face_bbox: Optional[List[int]] = None
         self._latest_face_bboxes: List[List[int]] = []
         self._latest_faces_meta: List[Dict[str, Any]] = []
-        # EAR-only landmark cache (never used for preview drawing)
-        self._latest_landmarks = None
-        self._latest_landmarks_size: Optional[Tuple[int, int]] = None
-        self._latest_landmark_faces: List[Dict[str, Any]] = []
-        # Face box for EAR (detect-frame coords); EMA is for EAR stability only.
+        # Face box smoothing (detect-frame coords) across consecutive detect cycles.
         self._face_ema_bbox: Optional[List[float]] = None
         self._face_hold_until: float = 0.0
-        self._face_miss_hold_sec: float = 0.8
-        self._face_ema_alpha: float = 0.65
-        # Rigid overlay from last detect (box+landmarks from SAME frame). Grab
-        # composites this onto every new frame → smooth preview, no relative drift.
-        self._overlay_bbox: Optional[List[int]] = None
-        self._overlay_landmarks = None
-        self._overlay_detections: List[Dict[str, Any]] = []
-        self._overlay_wh: Optional[Tuple[int, int]] = None
-        self._overlay_at: float = 0.0
-        self._overlay_ttl_sec: float = 1.2
-        self._overlay_refine_every: int = 3  # full HOG refine every N detects
-        self._detect_overlay_count: int = 0
-        # EAR: periodic full realign + hold last good landmarks against skew glitches
-        self._ear_tick: int = 0
-        self._ear_full_every: int = 8
-        self._good_landmarks = None
-        self._good_landmarks_size: Optional[Tuple[int, int]] = None
-        self._good_landmarks_at: float = 0.0
-        self._good_landmarks_hold_sec: float = 0.6
+        self._face_miss_hold_sec: float = 0.45
+        self._face_ema_alpha: float = 0.75
         self._last_jpeg_encode_at: float = 0.0
         self._frame_seq = 0
+        # Diagnostics: consecutive/total grab failures this session (surfaced
+        # in latest_meta so the frontend perf panel can show camera health).
+        self._grab_error_count = 0
         self._detect_busy = False
         self._timing_avg: Dict[str, float] = {}
         self._last_fatigue_level = 0
@@ -102,11 +86,7 @@ class MvsGrabber:
         camera_ip: Optional[str] = None,
     ) -> None:
         from detection.models import SystemConfig
-        from detection.utils.fatigue_tracker import (
-            behavior_tracker,
-            fatigue_tracker,
-            load_fatigue_config,
-        )
+        from detection.utils.fatigue_tracker import behavior_tracker, fatigue_tracker
 
         with self._lock:
             if self.running:
@@ -119,31 +99,24 @@ class MvsGrabber:
             self._latest_face_bbox = None
             self._latest_face_bboxes = []
             self._latest_faces_meta = []
-            self._latest_landmarks = None
-            self._latest_landmarks_size = None
-            self._latest_landmark_faces = []
             self._face_ema_bbox = None
             self._face_hold_until = 0.0
-            self._overlay_bbox = None
-            self._overlay_landmarks = None
-            self._overlay_detections = []
-            self._overlay_wh = None
-            self._overlay_at = 0.0
-            self._detect_overlay_count = 0
-            self._ear_tick = 0
-            self._good_landmarks = None
-            self._good_landmarks_size = None
-            self._good_landmarks_at = 0.0
             self._last_jpeg_encode_at = 0.0
             self._frame_seq = 0
+            self._grab_error_count = 0
             self._timing_avg = {}
             self._session_id = session_id
             self._user_id = user_id
             self._interval_ms = max(50, int(interval_ms or 500))
 
             configs = {c.config_key: c.config_value for c in SystemConfig.objects.all()}
-            fcfg = load_fatigue_config(configs)
-            self._ear_interval_ms = max(50, int(fcfg["ear_sample_interval_ms"]))
+            mode = str(configs.get("dlib_refine_mode") or "light").strip().lower()
+            if mode in ("off", "0", "false", "none"):
+                self._dlib_refine_mode = "off"
+            elif mode == "full":
+                self._dlib_refine_mode = "full"
+            else:
+                self._dlib_refine_mode = "light"
             try:
                 from detection.utils.compute_scheduler import compute_scheduler
 
@@ -155,12 +128,21 @@ class MvsGrabber:
                 _ = plan
             except Exception:  # noqa: BLE001
                 pass
+            # Detect resolution: process_image_archive reads yolo_detect_max_width
+            # itself and applies a uniform max_side scale (FOV kept) — no local
+            # copy of that setting is needed here anymore.
+            # Preview may downscale for MJPEG bandwidth only (display scale, not FOV crop)
+            # Keep preview independent of detect scale so live stream stays light.
             try:
-                self._detect_max_width = max(640, int(float(configs.get("yolo_detect_max_width", 960))))
+                pw = int(float(configs.get("mvs_stream_max_width", 640) or 0))
+                self._preview_max_width = pw if pw > 0 else 640
             except (TypeError, ValueError):
-                self._detect_max_width = 960
-            # One-step preview resize: never larger than detect canvas
-            self._preview_max_width = min(int(self._preview_max_width), int(self._detect_max_width))
+                self._preview_max_width = 640
+            try:
+                ph = int(float(configs.get("mvs_stream_max_height", 0) or 0))
+                self._preview_max_height = max(0, ph)
+            except (TypeError, ValueError):
+                self._preview_max_height = 0
             self._last_fatigue_level = 0
             self._last_yawn = False
             self._event_save_cooldown_until = 0.0
@@ -189,6 +171,10 @@ class MvsGrabber:
 
                 if yolo_detector is not None:
                     yolo_detector._sticky_primary_bbox = None
+                    # Archive/realtime path keys sticky primary by session id; a
+                    # fresh session must not inherit a stale bbox left behind by
+                    # whichever session last used this detector singleton.
+                    yolo_detector._sticky_primary_by_session.pop(session_id, None)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -216,9 +202,6 @@ class MvsGrabber:
             self._grab_thread = threading.Thread(
                 target=self._grab_loop, name="mvs-grab", daemon=True
             )
-            self._ear_thread = threading.Thread(
-                target=self._ear_loop, name="mvs-ear", daemon=True
-            )
             self._detect_thread = threading.Thread(
                 target=self._detect_loop, name="mvs-detect", daemon=True
             )
@@ -226,7 +209,6 @@ class MvsGrabber:
                 target=self._warmup_models_worker, name="mvs-model-warm", daemon=True
             )
             self._grab_thread.start()
-            self._ear_thread.start()
             self._detect_thread.start()
             self._model_warm_thread.start()
 
@@ -236,8 +218,6 @@ class MvsGrabber:
         with self._lock:
             if self._grab_thread:
                 threads.append(self._grab_thread)
-            if self._ear_thread:
-                threads.append(self._ear_thread)
             if self._detect_thread:
                 threads.append(self._detect_thread)
             if self._model_warm_thread:
@@ -254,7 +234,6 @@ class MvsGrabber:
                 self._camera = None
             self.running = False
             self._grab_thread = None
-            self._ear_thread = None
             self._detect_thread = None
             self._model_warm_thread = None
             self._detect_busy = False
@@ -264,16 +243,8 @@ class MvsGrabber:
             self._latest_face_bbox = None
             self._latest_face_bboxes = []
             self._latest_faces_meta = []
-            self._latest_landmarks = None
-            self._latest_landmarks_size = None
-            self._latest_landmark_faces = []
             self._face_ema_bbox = None
             self._face_hold_until = 0.0
-            self._overlay_bbox = None
-            self._overlay_landmarks = None
-            self._overlay_detections = []
-            self._overlay_wh = None
-            self._overlay_at = 0.0
             session_id = self._session_id
             self._session_id = None
         if session_id is not None:
@@ -342,6 +313,9 @@ class MvsGrabber:
             meta["warmup_early_exit"] = True
             meta["exposure_ready"] = True
             meta["models_warmed"] = True
+            # Drop cold-start spikes from EMA so UI averages are meaningful
+            self._timing_avg = {}
+            meta["timing"] = {}
             self.latest_meta = meta
 
     def _warmup_models_worker(self) -> None:
@@ -452,18 +426,30 @@ class MvsGrabber:
                 pass
 
     def _resize_for_preview(self, frame: np.ndarray) -> np.ndarray:
-        return self._resize_max_width(frame, self._preview_max_width)
-
-    def _resize_for_detect(self, frame: np.ndarray) -> np.ndarray:
-        return self._resize_max_width(frame, self._detect_max_width)
+        return self._resize_max_dims(
+            frame, self._preview_max_width, self._preview_max_height
+        )
 
     @staticmethod
-    def _resize_max_width(frame: np.ndarray, max_w: int) -> np.ndarray:
+    def _resize_max_dims(frame: np.ndarray, max_w: int, max_h: int) -> np.ndarray:
+        """Uniform downscale so both width<=max_w and height<=max_h (FOV kept).
+
+        Independent of detect-resolution (which process_image_archive scales
+        via yolo_detect_max_width) so a high-resolution GigE camera's MJPEG
+        *preview* bandwidth can be capped for smooth browser playback without
+        touching the resolution actually fed to YOLO/dlib.
+        """
         h, w = frame.shape[:2]
-        if w <= max_w:
+        scale = 1.0
+        if max_w and int(max_w) > 0 and w > int(max_w):
+            scale = min(scale, float(max_w) / float(w))
+        if max_h and int(max_h) > 0 and h > int(max_h):
+            scale = min(scale, float(max_h) / float(h))
+        if scale >= 1.0:
             return frame
-        nh = int(h * (max_w / float(w)))
-        return cv2.resize(frame, (max_w, nh), interpolation=cv2.INTER_AREA)
+        nw = max(1, int(round(w * scale)))
+        nh = max(1, int(round(h * scale)))
+        return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
 
     @staticmethod
     def _ema_bbox(prev: Optional[List[float]], new_box: List[int], alpha: float) -> List[float]:
@@ -565,261 +551,9 @@ class MvsGrabber:
             return 0.0
         return inter / union
 
-    def _refresh_face_overlay_from_ear(
-        self,
-        landmarks,
-        sample_wh: Tuple[int, int],
-        min_iou: float = 0.35,
-    ) -> bool:
-        """
-        Update face box + landmarks from EAR (high rate). Keeps YOLO behavior
-        detections untouched. Returns True if overlay was updated.
-
-        min_iou default raised to reject occasional whole-face skew jumps.
-        """
-        if landmarks is None or sample_wh is None:
-            return False
-        try:
-            sw, sh = int(sample_wh[0]), int(sample_wh[1])
-        except (TypeError, ValueError, IndexError):
-            return False
-        if sw <= 0 or sh <= 0:
-            return False
-
-        lm_box = self._bbox_from_landmarks(landmarks)
-        if lm_box is None:
-            return False
-        lm_box = self._clip_bbox(lm_box, sw, sh)
-        lm_copy = np.asarray(landmarks).copy()
-
-        with self._lock:
-            owh = self._overlay_wh
-            # Size must match existing overlay canvas (avoid cross-resolution float)
-            if owh is not None and (int(owh[0]) != sw or int(owh[1]) != sh):
-                return False
-            prev = self._overlay_bbox
-            if prev is not None and float(min_iou) > 0:
-                if self._bbox_iou(prev, lm_box) < float(min_iou):
-                    # Likely jump-face / bad predict — wait for next YOLO lock
-                    return False
-            self._overlay_bbox = lm_box
-            self._overlay_landmarks = lm_copy
-            if owh is None:
-                self._overlay_wh = (sw, sh)
-            self._overlay_at = time.time()
-            self._latest_landmarks = lm_copy
-            self._latest_landmarks_size = (sw, sh)
-            # Do NOT feed landmark hull back into YOLO/EAR face seed — that
-            # expands the dlib rect over time ("lock then grow").
-        return True
-
-    def _accept_ear_landmarks(self, dlib_detector, lm, dlib_results) -> Tuple[bool, Any]:
-        """
-        Decide whether new EAR landmarks are trustworthy vs last good set.
-        Returns (accepted, landmarks_for_overlay).
-        """
-        if lm is None:
-            return False, None
-        reliable = True
-        if dlib_results.get("pose_ok") is False:
-            reliable = False
-        try:
-            q = dlib_results.get("landmark_quality")
-            if q is not None and int(q) < 0:
-                reliable = False
-        except (TypeError, ValueError):
-            pass
-
-        with self._lock:
-            prev = self._good_landmarks
-            prev_at = float(self._good_landmarks_at or 0.0)
-            hold = float(self._good_landmarks_hold_sec)
-
-        if prev is not None and dlib_detector is not None:
-            try:
-                if not dlib_detector.landmarks_stable_vs_prev(lm, prev):
-                    reliable = False
-            except Exception:  # noqa: BLE001
-                pass
-
-        if reliable:
-            with self._lock:
-                self._good_landmarks = np.asarray(lm).copy()
-                self._good_landmarks_at = time.time()
-            return True, lm
-
-        # Hold last good briefly instead of flashing a skewed face
-        if prev is not None and (time.time() - prev_at) <= hold:
-            return False, prev
-        return False, None
-
-    def _compute_detect_overlay(
-        self,
-        det_frame: np.ndarray,
-        face_bbox: Optional[List[int]],
-        detections: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Build overlay packet. Prefer fresh EAR landmarks (reuse) to avoid a
-        second full dlib refine on every YOLO tick; run full refine every N.
-        """
-        try:
-            from detection.views import dlib_detector
-        except Exception:  # noqa: BLE001
-            dlib_detector = None
-
-        dh, dw = det_frame.shape[:2]
-        primary: Optional[List[int]] = None
-        if face_bbox is not None:
-            try:
-                primary = self._clip_bbox([int(v) for v in face_bbox], dw, dh)
-            except (TypeError, ValueError):
-                primary = None
-
-        self._detect_overlay_count = int(self._detect_overlay_count or 0) + 1
-        do_full = (self._detect_overlay_count % max(1, int(self._overlay_refine_every))) == 0
-
-        lm = None
-        reused = False
-        # Reuse EAR landmarks when fresh and same canvas size
-        with self._lock:
-            age = time.time() - float(self._overlay_at or 0.0)
-            ear_lm = self._latest_landmarks
-            ear_wh = self._latest_landmarks_size
-            if (
-                not do_full
-                and ear_lm is not None
-                and ear_wh is not None
-                and int(ear_wh[0]) == dw
-                and int(ear_wh[1]) == dh
-                and age < float(self._overlay_ttl_sec)
-            ):
-                lm = np.asarray(ear_lm).copy()
-                reused = True
-
-        if lm is None and primary is not None and dlib_detector is not None:
-            try:
-                dlib_res = dlib_detector.detect_fatigue_multi(
-                    det_frame,
-                    face_bboxes=[primary],
-                    primary_bbox=primary,
-                    allow_hog=False,
-                    refine_rect=True if do_full else "light",
-                )
-                lm = dlib_res.get("landmarks")
-            except Exception:  # noqa: BLE001
-                lm = None
-
-        draw_box = primary
-        if lm is not None:
-            lm_box = self._bbox_from_landmarks(lm)
-            if lm_box is not None:
-                draw_box = self._clip_bbox(lm_box, dw, dh)
-
-        return {
-            "bbox": draw_box,
-            "landmarks": None if lm is None else np.asarray(lm).copy(),
-            "detections": list(detections or []),
-            "wh": (dw, dh),
-            "yolo_bbox": primary,
-            "landmarks_reused": bool(reused),
-        }
-
-    def _store_overlay(self, packet: Dict[str, Any]) -> None:
-        with self._lock:
-            self._overlay_bbox = packet.get("bbox")
-            self._overlay_landmarks = packet.get("landmarks")
-            self._overlay_detections = list(packet.get("detections") or [])
-            self._overlay_wh = packet.get("wh")
-            self._overlay_at = time.time()
-            lm = packet.get("landmarks")
-            if lm is not None and packet.get("wh"):
-                self._latest_landmarks = lm
-                self._latest_landmarks_size = packet.get("wh")
-
-    def _draw_overlay_on_canvas(self, canvas: np.ndarray) -> np.ndarray:
-        """Draw last overlay onto preview canvas (uniform scale from detect coords)."""
-        try:
-            from detection.views import dlib_detector
-        except Exception:  # noqa: BLE001
-            dlib_detector = None
-
-        ch, cw = canvas.shape[:2]
-        with self._lock:
-            age = time.time() - float(self._overlay_at or 0.0)
-            if float(self._overlay_at or 0.0) <= 0.0 or age > float(self._overlay_ttl_sec):
-                return canvas
-            owh = self._overlay_wh
-            bbox = None if self._overlay_bbox is None else list(self._overlay_bbox)
-            lm = None if self._overlay_landmarks is None else self._overlay_landmarks
-            dets = list(self._overlay_detections or [])
-
-        sx = sy = 1.0
-        lm_size = None
-        if owh is not None:
-            try:
-                ow, oh = int(owh[0]), int(owh[1])
-                if ow > 0 and oh > 0:
-                    sx = cw / float(ow)
-                    sy = ch / float(oh)
-                    lm_size = (ow, oh)
-            except (TypeError, ValueError):
-                sx = sy = 1.0
-
-        if bbox is not None:
-            try:
-                x1 = int(round(float(bbox[0]) * sx))
-                y1 = int(round(float(bbox[1]) * sy))
-                x2 = int(round(float(bbox[2]) * sx))
-                y2 = int(round(float(bbox[3]) * sy))
-                x1, y1, x2, y2 = self._clip_bbox([x1, y1, x2, y2], cw, ch)
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 220, 0), 2)
-            except Exception:  # noqa: BLE001
-                pass
-
-        if dlib_detector is not None and lm is not None:
-            try:
-                # Contours only — skip 68 circles for preview FPS
-                dlib_detector.draw_landmarks(
-                    canvas,
-                    lm,
-                    landmarks_size=lm_size if lm_size is not None else (cw, ch),
-                    color=(0, 255, 0),
-                    draw_points=False,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
-        for det in dets:
-            try:
-                db = det.get("bbox")
-                if not db:
-                    continue
-                cid = int(det.get("class_id", -1))
-                if cid == 0:
-                    continue
-                x1 = int(round(float(db[0]) * sx))
-                y1 = int(round(float(db[1]) * sy))
-                x2 = int(round(float(db[2]) * sx))
-                y2 = int(round(float(db[3]) * sy))
-                x1, y1, x2, y2 = self._clip_bbox([x1, y1, x2, y2], cw, ch)
-                color = {
-                    1: (0, 165, 255),
-                    2: (0, 0, 255),
-                    3: (255, 128, 0),
-                }.get(cid, (200, 200, 0))
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-            except Exception:  # noqa: BLE001
-                continue
-        return canvas
-
     def _encode_preview_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
-        """Single-resize preview encode (~20 FPS friendly)."""
+        """Live preview stream only — YOLO/dlib drawn on frontend canvas."""
         preview = self._resize_for_preview(frame)
-        try:
-            preview = self._draw_overlay_on_canvas(preview)
-        except Exception:  # noqa: BLE001
-            pass
         ok, buf = cv2.imencode(
             ".jpg",
             preview,
@@ -973,6 +707,13 @@ class MvsGrabber:
                 msg = str(exc)
                 with self._lock:
                     self.error = msg
+                    self._grab_error_count += 1
+                    grab_errs = self._grab_error_count
+                    meta = dict(self.latest_meta or {})
+                    meta["grab_error_count"] = grab_errs
+                    self.latest_meta = meta
+                if grab_errs <= 3 or grab_errs % 20 == 0:
+                    logger.warning("grab frame failed (total=%d): %s", grab_errs, msg)
                 # Sustained GigE NODATA → bump SCPD / shrink ROI / restart stream
                 if "0x80000007" in msg or "NODATA" in msg.upper():
                     nodata_streak += 1
@@ -988,8 +729,12 @@ class MvsGrabber:
                                     "工业相机取流中断，已自动恢复(SCPD/ROI)。"
                                     "若仍黑屏请关闭 MVS 客户端独占预览。"
                                 )
+                                meta["reconnect_count"] = getattr(
+                                    self._camera, "_reconnect_count", None
+                                )
                                 self.latest_meta = meta
                         except Exception as rec_exc:  # noqa: BLE001
+                            logger.exception("stream recover failed")
                             with self._lock:
                                 self.error = "%s | recover: %s" % (msg, rec_exc)
                 else:
@@ -997,277 +742,14 @@ class MvsGrabber:
                 if self._stop.wait(0.05):
                     break
 
-    def _ear_loop(self) -> None:
-        """High-rate EAR sampling using shared YOLO face bbox when available."""
-        from detection.views import dlib_detector
-        from detection.utils.compute_scheduler import compute_scheduler
-        from detection.utils.fatigue_tracker import fatigue_tracker
-
-        last_seq = -1
-        while not self._stop.is_set():
-            loop_start = time.perf_counter()
-            with self._lock:
-                frame = None if self._latest_bgr is None else self._latest_bgr.copy()
-                seq = self._frame_seq
-                session_id = self._session_id
-                ear_ms = self._ear_interval_ms
-                face_bbox = (
-                    None if self._latest_face_bbox is None else list(self._latest_face_bbox)
-                )
-                # Stick to primary only — secondary YOLO faces cause landmark "jumps"
-                face_bboxes = [list(face_bbox)] if face_bbox is not None else []
-                detect_busy = bool(self._detect_busy)
-                in_warmup = time.time() < float(self._warmup_until or 0.0)
-
-            # Cooperative scheduling: EAR always runs; on CPU stretch/yield while YOLO busy.
-            # On CUDA, YOLO is on GPU so EAR keeps full rate (no skip).
-            ear_ms = compute_scheduler.ear_interval_ms(ear_ms, detect_busy)
-            pause = compute_scheduler.ear_busy_pause_sec(detect_busy)
-            if pause > 0 and self._stop.wait(pause):
-                break
-
-            if frame is None or session_id is None or seq == last_seq:
-                if self._stop.wait(0.02):
-                    break
-                continue
-
-            last_seq = seq
-            try:
-                # One-shot post-warmup clear (moved out of status() to avoid poll side effects)
-                if (not in_warmup) and (not self._warmup_ui_cleared):
-                    with self._lock:
-                        if not self._warmup_ui_cleared:
-                            self._warmup_ui_cleared = True
-                            self._last_fatigue_level = 0
-                            self._last_yawn = False
-                            self._pending_fatigue_event = False
-                    try:
-                        from detection.utils.fatigue_tracker import (
-                            behavior_tracker,
-                            fatigue_tracker as _ft,
-                        )
-
-                        _ft.reset(session_id)
-                        behavior_tracker.reset(session_id)
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                if dlib_detector is not None:
-                    with compute_scheduler.ear_context():
-                        # SAME canvas as YOLO / preview overlay — no full↔detect remapping
-                        sample = self._resize_for_detect(frame)
-                        try:
-                            from detection.utils.mono_preprocess import (
-                                enhance_for_mono,
-                                load_mono_config,
-                            )
-
-                            if load_mono_config().get("enabled"):
-                                sample = enhance_for_mono(sample)
-                        except Exception:  # noqa: BLE001
-                            pass
-
-                        sh, sw = sample.shape[:2]
-                        # face_bbox already stored in detect coordinates
-                        scaled_boxes = [list(b) for b in face_bboxes if b is not None]
-                        scaled_primary = list(face_bbox) if face_bbox is not None else None
-                        if not scaled_boxes and scaled_primary is not None:
-                            scaled_boxes = [scaled_primary]
-
-                        t_ear = time.perf_counter()
-                        if not scaled_boxes:
-                            dlib_results = {
-                                "faces_detected": 0,
-                                "eye_aspect_ratio": None,
-                                "mouth_aspect_ratio": None,
-                                "yawn_detected": False,
-                                "fatigue_level": 0,
-                                "landmarks": None,
-                                "faces": [],
-                            }
-                            ear_cost = (time.perf_counter() - t_ear) * 1000.0
-                            with self._lock:
-                                self._latest_landmarks = None
-                                self._latest_landmarks_size = None
-                                self._latest_landmark_faces = []
-                                self._good_landmarks = None
-                                self._good_landmarks_size = None
-                                self._good_landmarks_at = 0.0
-                        else:
-                            self._ear_tick = int(self._ear_tick or 0) + 1
-                            do_full = (
-                                self._ear_tick % max(1, int(self._ear_full_every or 8))
-                            ) == 0
-                            refine = "full" if do_full else "light"
-                            dlib_results = dlib_detector.detect_fatigue_multi(
-                                sample,
-                                face_bboxes=scaled_boxes,
-                                primary_bbox=scaled_primary,
-                                allow_hog=False,
-                                refine_rect=refine,
-                            )
-                            # Light result looks skewed → one HOG realign retry
-                            lm_try = dlib_results.get("landmarks")
-                            need_retry = False
-                            if refine == "light" and lm_try is not None:
-                                if dlib_results.get("pose_ok") is False:
-                                    need_retry = True
-                                else:
-                                    try:
-                                        q = dlib_results.get("landmark_quality")
-                                        if q is not None and int(q) < 0:
-                                            need_retry = True
-                                    except (TypeError, ValueError):
-                                        pass
-                                    with self._lock:
-                                        prev_g = self._good_landmarks
-                                    if (
-                                        not need_retry
-                                        and prev_g is not None
-                                        and not dlib_detector.landmarks_stable_vs_prev(
-                                            lm_try, prev_g
-                                        )
-                                    ):
-                                        need_retry = True
-                            if need_retry:
-                                dlib_results = dlib_detector.detect_fatigue_multi(
-                                    sample,
-                                    face_bboxes=scaled_boxes,
-                                    primary_bbox=scaled_primary,
-                                    allow_hog=False,
-                                    refine_rect="full",
-                                )
-                            ear_cost = (time.perf_counter() - t_ear) * 1000.0
-
-                    # Warmup: run models for cache, but do not feed trackers / UI state
-                    if in_warmup:
-                        with self._lock:
-                            meta = dict(self.latest_meta)
-                            timing = dict(meta.get("timing") or {})
-                            timing.update(self._merge_timing({"ear_ms": ear_cost}))
-                            meta["timing"] = timing
-                            meta["scheduler"] = compute_scheduler.snapshot()
-                            meta["warming_up"] = True
-                            self.latest_meta = meta
-                    else:
-                        faces_n = int(dlib_results.get("faces_detected") or 0)
-                        if faces_n <= 0 and scaled_boxes:
-                            faces_n = 1 if dlib_results.get("landmarks") is not None else 0
-
-                        # Keep landmarks in DETECT space — same as YOLO boxes / overlay canvas
-                        lm = dlib_results.get("landmarks")
-                        face_entries = list(dlib_results.get("faces") or [])
-                        lm_size = (int(sw), int(sh)) if lm is not None else None
-
-                        accepted, lm_draw = self._accept_ear_landmarks(
-                            dlib_detector, lm, dlib_results
-                        )
-                        reliable = bool(accepted)
-                        if lm_draw is not None:
-                            lm_size = (int(sw), int(sh))
-                        elif lm is None:
-                            # Brief miss: keep last good for overlay if still in hold
-                            with self._lock:
-                                g = self._good_landmarks
-                                gat = float(self._good_landmarks_at or 0.0)
-                                hold = float(self._good_landmarks_hold_sec)
-                            if g is not None and (time.time() - gat) <= hold:
-                                lm_draw = g
-                                lm_size = (int(sw), int(sh))
-                            else:
-                                with self._lock:
-                                    self._latest_landmarks = None
-                                    self._latest_landmarks_size = None
-                                    self._latest_landmark_faces = []
-
-                        # High-rate face overlay: only push accepted or held-good points
-                        if lm_draw is not None and lm_size is not None:
-                            try:
-                                self._refresh_face_overlay_from_ear(
-                                    lm_draw, lm_size, min_iou=0.35 if accepted else 0.0
-                                )
-                            except Exception:  # noqa: BLE001
-                                pass
-
-                        # Tracker: raw metrics only when landmarks accepted (else no closed-eye push)
-                        snap = fatigue_tracker.update(
-                            session_id,
-                            ear=dlib_results.get("eye_aspect_ratio"),
-                            yawn_detected=bool(dlib_results.get("yawn_detected"))
-                            if accepted
-                            else False,
-                            faces_detected=faces_n if lm is not None or accepted else 0,
-                            landmarks=lm_draw if lm_draw is not None else lm,
-                            landmarks_size=lm_size,
-                            faces=face_entries if accepted else [],
-                            landmark_reliable=reliable,
-                        )
-
-                        faces_meta = []
-                        for ent in face_entries:
-                            faces_meta.append(
-                                {
-                                    "bbox": ent.get("bbox"),
-                                    "ear": ent.get("eye_aspect_ratio"),
-                                    "mar": ent.get("mouth_aspect_ratio"),
-                                    "yawn": bool(ent.get("yawn_detected")),
-                                    "is_primary": bool(ent.get("is_primary")),
-                                }
-                            )
-
-                        level = int(snap.fatigue_level)
-                        yawn = bool(snap.yawn_detected)
-                        with self._lock:
-                            prev_level = self._last_fatigue_level
-                            prev_yawn = self._last_yawn
-                            rising_fatigue = level > prev_level and level >= 2
-                            rising_yawn = (not prev_yawn) and yawn
-                            if rising_fatigue or rising_yawn:
-                                self._pending_fatigue_event = True
-                            self._last_fatigue_level = level
-                            self._last_yawn = yawn
-                            self._latest_faces_meta = faces_meta
-                            self._latest_landmarks = lm
-                            self._latest_landmarks_size = lm_size
-                            self._latest_landmark_faces = face_entries
-
-                            meta = dict(self.latest_meta)
-                            timing = dict(meta.get("timing") or {})
-                            timing.update(self._merge_timing({"ear_ms": ear_cost}))
-                            meta["timing"] = timing
-                            meta.update(
-                                {
-                                    "eye_aspect_ratio": snap.eye_aspect_ratio,
-                                    "mouth_aspect_ratio": dlib_results.get("mouth_aspect_ratio"),
-                                    "mouth_rel_open": dlib_results.get("mouth_rel_open"),
-                                    "yawn_raw": bool(dlib_results.get("yawn_detected")),
-                                    "perclos": snap.perclos,
-                                    "eye_closed_ms": snap.eye_closed_ms,
-                                    "is_microsleep": snap.is_microsleep,
-                                    "fatigue_level": snap.fatigue_level,
-                                    "yawn_detected": snap.yawn_detected,
-                                    "has_landmarks": dlib_results.get("landmarks") is not None,
-                                    "face_count": faces_n,
-                                    "faces": faces_meta,
-                                    "fatigue_event": bool(rising_fatigue or rising_yawn),
-                                    "scheduler": compute_scheduler.snapshot(),
-                                }
-                            )
-                            self.latest_meta = meta
-            except Exception as exc:  # noqa: BLE001
-                with self._lock:
-                    self.error = str(exc)
-            # Avoid closing DB every EAR tick (ear loop does not use ORM anymore)
-
-            elapsed_ms = (time.perf_counter() - loop_start) * 1000.0
-            sleep_ms = max(0.0, ear_ms - elapsed_ms)
-            if sleep_ms > 0 and self._stop.wait(sleep_ms / 1000.0):
-                break
-
     def _detect_loop(self) -> None:
-        """Run YOLO at detection_interval; fatigue comes from EAR loop tracker snapshot."""
+        """Run YOLO + dlib at detection_interval (same-frame archive path);
+        fatigue/PERCLOS come from fatigue_tracker fed inside process_image_archive.
+        (A separate high-rate EAR sampling thread used to run alongside this
+        loop; it was retired in favor of the unified same-frame architecture —
+        see git history for `_ear_loop` if that design is ever revisited.)"""
         from detection.models import DetectionSession
-        from detection.views import persist_detection_snapshot, process_image
+        from detection.views import persist_detection_snapshot, process_image_archive
 
         last_seq = -1
         while not self._stop.is_set():
@@ -1295,7 +777,8 @@ class MvsGrabber:
                     with self._lock:
                         self.error = "Session not found"
                     break
-                det_frame = self._resize_for_detect(frame)
+                # Full frame — no detect crop
+                det_frame = frame
                 now = time.time()
                 with self._lock:
                     pending_event = bool(getattr(self, "_pending_fatigue_event", False))
@@ -1304,21 +787,18 @@ class MvsGrabber:
                     )
                     in_warmup = now < float(self._warmup_until or 0.0)
 
-                # Infer without JPEG/DB — main CPU delay source previously.
-                result = process_image(
+                result = process_image_archive(
                     det_frame,
                     session,
-                    detect_fatigue=False,
+                    detect_fatigue=True,
                     detect_behaviors=True,
                     include_image_data=False,
-                    persist=False,
                 )
                 behavior_hit = bool(
                     result.get("smoking_detected")
                     or result.get("phone_detected")
                     or result.get("drinking_detected")
                 )
-                # Do not write history during startup warmup window
                 face_bbox = result.get("face_bbox")
                 face_bboxes = result.get("face_bboxes") or []
                 try:
@@ -1328,30 +808,24 @@ class MvsGrabber:
                 except (TypeError, ValueError):
                     primary_draw = None
 
-                # One dlib pass on this det_frame → rigid overlay for grab + persist
+                lm = result.get("landmarks")
+                lm_arr = None
+                if lm is not None:
+                    try:
+                        lm_arr = np.asarray(lm, dtype=int)
+                    except Exception:  # noqa: BLE001
+                        lm_arr = None
                 overlay_packet: Dict[str, Any] = {
                     "bbox": primary_draw,
-                    "landmarks": None,
+                    "landmarks": lm_arr,
                     "detections": result.get("detections") or [],
                     "wh": (int(det_frame.shape[1]), int(det_frame.shape[0])),
                 }
-                try:
-                    overlay_packet = self._compute_detect_overlay(
-                        det_frame,
-                        primary_draw,
-                        detections=result.get("detections") or [],
-                    )
-                    self._store_overlay(overlay_packet)
-                except Exception:  # noqa: BLE001
-                    pass
 
                 if (not in_warmup) and (pending_event or behavior_hit or due_persist):
                     persist_result = dict(result)
                     persist_result["overlay_landmarks"] = overlay_packet.get("landmarks")
                     persist_result["overlay_landmarks_size"] = overlay_packet.get("wh")
-                    # Prefer landmark-locked box for any face draw metadata
-                    if overlay_packet.get("bbox") is not None:
-                        persist_result["face_bbox"] = overlay_packet.get("bbox")
                     result = persist_detection_snapshot(
                         det_frame, session, persist_result
                     )
@@ -1362,6 +836,8 @@ class MvsGrabber:
                 detect_loop_ms = (time.perf_counter() - loop_start) * 1000.0
                 timing_src = dict(result.get("timing") or {})
                 timing_src["detect_loop_ms"] = detect_loop_ms
+                if in_warmup:
+                    timing_src = {}
 
                 meta = {
                     "face_detected": result.get("face_detected"),
@@ -1381,6 +857,13 @@ class MvsGrabber:
                     "behavior_debug": result.get("behavior_debug") or {},
                     "confirm_progress": result.get("confirm_progress") or {},
                     "fatigue_event": False,
+                    "detections": result.get("detections") or [],
+                    "landmarks": result.get("landmarks"),
+                    "landmarks_size": result.get("landmarks_size")
+                    or [int(det_frame.shape[1]), int(det_frame.shape[0])],
+                    "image_size": result.get("image_size")
+                    or [int(det_frame.shape[1]), int(det_frame.shape[0])],
+                    "face_bbox": result.get("face_bbox"),
                 }
                 with self._lock:
                     dh, dw = det_frame.shape[:2]
@@ -1400,29 +883,7 @@ class MvsGrabber:
                         if k.startswith("ear"):
                             merged.setdefault(k, v)
                     meta["timing"] = merged
-                    # Keep EAR-loop faces list / fatigue metrics when fresher
-                    if prev.get("faces"):
-                        meta["faces"] = prev.get("faces")
-                    if prev.get("face_count") is not None and meta.get("face_count") is None:
-                        meta["face_count"] = prev.get("face_count")
-                    try:
-                        if int(prev.get("fatigue_level") or 0) >= int(meta.get("fatigue_level") or 0):
-                            for k in (
-                                "fatigue_level",
-                                "eye_aspect_ratio",
-                                "mouth_aspect_ratio",
-                                "perclos",
-                                "eye_closed_ms",
-                                "is_microsleep",
-                                "yawn_detected",
-                                "has_landmarks",
-                                "faces",
-                                "face_count",
-                            ):
-                                if k in prev and prev[k] is not None:
-                                    meta[k] = prev[k]
-                    except (TypeError, ValueError):
-                        pass
+                    # Archive same-frame owns fatigue + overlay geometry
                     try:
                         from detection.utils.compute_scheduler import compute_scheduler
 
@@ -1439,9 +900,17 @@ class MvsGrabber:
                         "models_warmed",
                         "exposure_calibrating",
                         "warmup_early_exit",
+                        "grab_error_count",
+                        "reconnect_count",
                     ):
                         if k in prev and k not in meta:
                             meta[k] = prev[k]
+                    try:
+                        from detection.utils.persist_worker import stats as _persist_stats
+
+                        meta["persist"] = _persist_stats()
+                    except Exception:  # noqa: BLE001
+                        pass
                     still_warming = time.time() < float(self._warmup_until or 0.0)
                     meta["warming_up"] = still_warming
                     meta["exposure_ready"] = bool(self._exposure_ready)
